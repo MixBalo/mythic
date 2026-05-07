@@ -3690,8 +3690,19 @@ done:
  * Wrapper for mmap() to map a file into a view, falling back to read if mmap fails.
  * virtual_mutex must be held by caller.
  */
+static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t start, size_t size,
+                                       off_t offset, unsigned int vprot, BOOL removable,
+                                       BOOL for_image );
+
 static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start, size_t size,
                                     off_t offset, unsigned int vprot, BOOL removable )
+{
+    return map_file_into_view_ex( view, fd, start, size, offset, vprot, removable, TRUE );
+}
+
+static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t start, size_t size,
+                                       off_t offset, unsigned int vprot, BOOL removable,
+                                       BOOL for_image )
 {
     char *map_addr, *host_addr;
     size_t map_size, host_size;
@@ -3708,12 +3719,19 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
         /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
          * but they are on Linux so we take advantage of it */
 #if defined(__linux__) || defined(WINE_IOS)
-        /* iOS: must use MAP_PRIVATE + keep PROT_WRITE so subsequent
-         * NtProtectVirtualMemory calls (e.g. for IAT writes in .rdata) work.
-         * MAP_SHARED file mappings on iOS reject mprotect upgrades with
-         * EINVAL, breaking Wine's PE loader assumption that read-only
-         * sections can be temporarily flipped writable. */
-        flags |= MAP_PRIVATE;
+        /* iOS: PE-image read-only sections need MAP_PRIVATE so Wine's PE
+         * loader can mprotect them writable temporarily for IAT writes
+         * (MAP_SHARED rejects mprotect upgrades with EINVAL on iOS). The
+         * `for_image` parameter distinguishes those callers from
+         * SEC_COMMIT shared sections (e.g. \KernelObjects\__wine_session)
+         * which MUST be MAP_SHARED so the client sees server writes. */
+        if (for_image)
+            flags |= MAP_PRIVATE;  /* PE image — Wine's PE loader needs mprotect-upgrades */
+        else
+        {
+            flags |= MAP_SHARED;   /* shared section — coherent with wineserver */
+            prot &= ~PROT_WRITE;
+        }
 #else
         flags |= MAP_SHARED;
         prot &= ~PROT_WRITE;
@@ -5006,7 +5024,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     if (res) goto done;
 
     TRACE( "handle=%p size=%lx offset=%s\n", handle, size, wine_dbgstr_longlong(offset.QuadPart) );
-    res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
+    /* iOS: SEC_COMMIT shared sections (e.g. \KernelObjects\__wine_session) need
+     * MAP_SHARED so the client view is coherent with wineserver writes. The
+     * for_image=FALSE override tells map_file_into_view_ex to take the shared
+     * path (default for_image=TRUE preserves PE-image MAP_PRIVATE behavior). */
+    res = map_file_into_view_ex( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close, FALSE );
     if (res == STATUS_SUCCESS)
     {
         /* file mappings must always be accessible */

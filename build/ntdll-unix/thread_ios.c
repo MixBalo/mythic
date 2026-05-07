@@ -1127,6 +1127,23 @@ static void start_thread( TEB *teb )
     thread_data->syscall_trace = TRACE_ON(syscall);
     thread_data->pthread_id = pthread_self();
     pthread_setspecific( teb_key, teb );
+    /* iOS: also store TEB in the patcher's TLS slot 275 (offset 0x898 from
+     * TPIDRRO_EL0 & ~7) so the x18 trampolines (mrs TPIDRRO_EL0; ldr TEB)
+     * work on this newly-created thread. Without this, FEX/Wine worker
+     * threads (e.g. DXMT command-buffer threads, NtCreateThreadEx threads)
+     * read TEB=0 from TSD 275 and crash on the first guest x18 reference.
+     *
+     * pthread_setspecific(ios_teb_tls_key, ...) won't help — the key may not
+     * map to slot 275. Mirror what loader_ios.c does for the main thread:
+     * write directly to slot 275 via TPIDRRO_EL0. */
+    {
+        extern pthread_key_t ios_teb_tls_key;
+        uintptr_t tsd_base;
+        pthread_setspecific( ios_teb_tls_key, teb );
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        *(void **)(tsd_base + 275 * 8) = teb;
+    }
     server_init_thread( thread_data->start, &suspend );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
 }
