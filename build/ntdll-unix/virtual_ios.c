@@ -119,8 +119,12 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
 #ifdef WINE_IOS
 /* JIT pool address translation table.
  * Maps PE code section addresses → JIT pool RX addresses.
- * Used by signal_arm64_ios.c to redirect entry points. */
-#define IOS_JIT_MAX_MAPPINGS 16
+ * Used by signal_arm64_ios.c to redirect entry points.
+ * Bumped from 16 → 64 to fit games with many DLLs (Thumper loads 22+ unique
+ * images; cube ~12-15). Silent overflow at 16 was costing us hours of
+ * debugging — late modules' addresses fell through ios_jit_translate_addr
+ * unchanged, leaking unix-mapped (non-executable) addresses to BLR. */
+#define IOS_JIT_MAX_MAPPINGS 64
 struct ios_jit_mapping {
     void *pe_base;      /* Original PE image base address (unix mapping) */
     void *jit_base;     /* JIT pool RX address */
@@ -202,7 +206,27 @@ void *ios_jit_get_trampoline(int slot)
 
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
-    if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS) return;
+    int i;
+
+    /* Dedupe by pe_base: every PROT_EXEC section of an image triggers
+     * mprotect_exec → which copies the WHOLE image and calls this. Without
+     * this check we'd record N entries for a single DLL (one per exec
+     * section) and the first match in ios_jit_translate_addr would still
+     * win, but the table fills up uselessly. Skip duplicates silently. */
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        if (ios_jit_mappings[i].pe_base == pe_base) return;
+    }
+
+    if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
+    {
+        /* Hard-ERR (was silent return) — overflow leaks unix addresses through
+         * ios_jit_translate_addr unchanged, breaking dispatch. Bump
+         * IOS_JIT_MAX_MAPPINGS instead of suffering this silently. */
+        ERR("iOS JIT: mapping table FULL (%d slots) — DLL pe_base=%p jit_base=%p WILL FAIL TO TRANSLATE\n",
+            IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
+        return;
+    }
     ios_jit_mappings[ios_jit_mapping_count].pe_base = pe_base;
     ios_jit_mappings[ios_jit_mapping_count].jit_base = jit_base;
     ios_jit_mappings[ios_jit_mapping_count].size = size;
@@ -6885,6 +6909,27 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
             *ret = jit_rx;
             *size_ptr = alloc_size;
+            /* iOS-Mythic: pre-fill the buffer with NOPs (0xd503201f) via the RW
+             * alias. FEX's emitter writes instructions one-at-a-time via
+             * memcpy(WritePtr, &Word, 4); on iOS the underlying STR fault is
+             * caught by our Mach handler. If the handler ever silently misses
+             * a write encoding, the slot retains its prior content — which on
+             * a freshly mapped JIT-pool tail is uninitialized memory that may
+             * decode as INVALID instructions, causing ILL when execution falls
+             * through. NOP-prefilling guarantees fall-through safety:
+             * any failed-write slot decodes as a NOP, not garbage.
+             *
+             * This obsoletes the dispatcher SpillStaticRegs runtime patch in
+             * xtajit64.dll (which only patched two known sites with hardcoded
+             * encodings). Now the dispatcher emit lands either correctly or
+             * as a NOP — either way the CPU doesn't ILL, and SpillStaticRegs
+             * just spills fewer regs than expected at worst. */
+            {
+                volatile uint32_t *rw_words = (volatile uint32_t *)jit_rw;
+                size_t nwords = alloc_size / sizeof(uint32_t);
+                for (size_t i = 0; i < nwords; i++) rw_words[i] = 0xd503201fu;  /* NOP */
+            }
+
             /* iOS-Mythic: do NOT call set_arm64ec_range here. FEX's CodeBuffer
              * holds compiled-from-x86 host ARM64 blocks, not ARM64EC PE code.
              * Marking it as EC causes the dispatcher's loop-top EC bitmap
@@ -6893,7 +6938,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * RIP coincidentally lands here, producing UDF #0 faults.
              * Entry into the CodeBuffer is via FEX's own dispatcher BR, not via
              * arm64x_check_call, so EC marking is unneeded. */
-            ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p (NOT marked EC: FEX block cache)\n",
+            ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p NOP-prefilled\n",
                 alloc_size, jit_rx, jit_rw);
             return STATUS_SUCCESS;
         }
