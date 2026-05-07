@@ -815,6 +815,19 @@ HWND get_desktop_window(void)
     }
     SERVER_END_REQ;
 
+    /* iOS: skip the explorer.exe launch path entirely. CreateProcess for
+     * arbitrary builtins isn't wired up, and the launch always fails with
+     * c0000135, taking down the whole process. If the server didn't return
+     * a top_window above (e.g. shared_session not yet initialized for the
+     * very first builtin-class register), just leave top_window=0 and let
+     * the next call try again. */
+    if (!thread_info->top_window)
+    {
+        ERR_(win)( "iOS: skipping explorer.exe launch; top_window stays 0\n" );
+        return UlongToHandle( thread_info->top_window );
+    }
+
+#if 0  /* upstream explorer.exe launch path — disabled on iOS */
     if (!thread_info->top_window)
     {
         static const WCHAR appnameW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s',
@@ -897,6 +910,7 @@ HWND get_desktop_window(void)
         }
         SERVER_END_REQ;
     }
+#endif  /* upstream explorer.exe launch path */
 
     if (!thread_info->top_window) ERR_(win)( "failed to create desktop window\n" );
     else user_driver->pSetDesktopWindow( UlongToHandle( thread_info->top_window ));
