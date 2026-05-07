@@ -2114,9 +2114,20 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
 
 
 /*************************************************************************
- *		init_startup_info
+ *		init_startup_info  (renamed unix_init_startup_info on iOS)
+ *
+ * iOS-only rename: win32u/window.c also defines init_startup_info() (a
+ * different, much smaller function called from win32u's init_user). On a
+ * normal Wine build the two live in different .so files and don't conflict.
+ * Statically linking everything into Mythic.dylib makes the symbols collide,
+ * and the linker silently picks ONE of them — when it picks ours, win32u's
+ * init_user → init_startup_info ends up calling build_initial_params() with
+ * stale/NULL main_argv and crashes inside get_full_path → strlen(NULL).
+ *
+ * Fix: rename our copy and update the only caller (loader_ios.c). Leave
+ * win32u/window.c's definition untouched so init_user finds the right one.
  */
-void init_startup_info(void)
+void unix_init_startup_info(void)
 {
     WCHAR *src, *dst, *env;
     void *module = NULL;

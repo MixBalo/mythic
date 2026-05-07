@@ -1035,6 +1035,7 @@ static NTSTATUS open_main_image_so_file( const char *name, UNICODE_STRING *nt_na
 }
 
 extern NTSTATUS unwind_builtin_dll( void *args );
+extern void unix_init_startup_info(void); /* env_ios.c — renamed from init_startup_info to avoid linker collision with win32u/window.c */
 
 #else /* SO_DLLS_SUPPORTED */
 
@@ -2086,7 +2087,7 @@ static void start_main_thread(void)
     WINE_IOS_LOG("init_files...");
     init_files();
     WINE_IOS_LOG("init_startup_info...");
-    init_startup_info();
+    unix_init_startup_info();
     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
     set_load_order_app_name( main_wargv[0] );
     WINE_IOS_LOG("init_thread_stack...");
@@ -2519,7 +2520,7 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         startup_info_size = server_init_process_child( child_fd_socket );
 
         /* init_startup_info — reads startup info from wineserver, loads the child's PE */
-        init_startup_info();
+        unix_init_startup_info();
         dprintf(STDERR_FILENO, "[Wine child] PE loaded: Machine=0x%x TransferAddress=%p ImageBase=%p\n",
                 main_image_info.Machine, main_image_info.TransferAddress, peb->ImageBaseAddress);
 
