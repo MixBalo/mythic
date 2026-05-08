@@ -223,12 +223,79 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
 
+                Button("Run Thumper (D3D11 / win10)") {
+                    // Game lives at Documents/wine/drive_c/Program Files/Thumper/
+                    // (push via scripts/deploy-thumper.sh during development;
+                    // bundled as resource for distribution later).
+                    setenv("MYTHIC_EXE",
+                           "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.pink)
+
                 Button("Run x64 Hello (FEX/ARM64EC)") {
                     setenv("MYTHIC_EXE", "hello-x64.exe", 1)
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
+
+                Button("Run x64 fib(30) (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "fib-x64.exe", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 fib2 (64-bit math) (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "fib2-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 fib3(25) via argv (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "fib3-x64.exe", 1)
+                    setenv("MYTHIC_ARGS", "25", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 heap test (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "heap-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 fileio test (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "fileio-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 fileio test --keep (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "fileio-x64.exe", 1)
+                    setenv("MYTHIC_ARGS", "--keep", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run x64 cube (FEX/ARM64EC + DXMT)") {
+                    setenv("MYTHIC_EXE", "cube-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
 
                 Button("Test JIT") {
                     runJITTest()
@@ -476,7 +543,9 @@ struct ContentView: View {
 
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Allocate JIT pool (BRK suspends entire process)
-            let poolSizeMB = 128
+            // 128 MB was enough for cube but Thumper exhausts it (more PE
+            // copies + larger FEX block cache). 256 MB gives headroom.
+            let poolSizeMB = 256
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

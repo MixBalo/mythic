@@ -90,7 +90,7 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll,trace+win,trace+user32,trace+syscall", 1);
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall", 1);
 
         // Phase 3D investigation: re-enabled. Investigation C concluded
         // wineserver dispatch is fine; the `ws_log drops at high rate`
@@ -98,6 +98,21 @@ static void *wine_process_thread(void *arg) {
         // get_desktop_window's returned HWND fails get_user_object lookup
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
+
+        /* iOS-Mythic: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
+         * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which
+         * replicates FEX's HandleUnalignedAccess (Arm64.cpp:2072) so iOS
+         * EXC_BAD_ACCESS faults get the same in-place LDAR→LDR+DMB_LD
+         * recovery FEX does for Windows EXCEPTION_DATATYPE_MISALIGNMENT. */
+
+        /* iOS-Mythic: a tiny stub steamclient64.dll is shipped in the game
+         * directory (built from /tmp/steamclient_stub/stub.c). It exports
+         * just VR_InitInternal (returns NULL) — that's the only function
+         * CODEX64.dll imports from steamclient64. The real steamclient64.dll
+         * (heavily packed, RWX self-modifying, unwind info v5) was
+         * blowing up Wine's loader; the stub lets CODEX bind imports and
+         * proceed without OpenVR support. Note: no WINEDLLOVERRIDES needed
+         * — we just shipped a different file at the same path. */
 
         LOG("WINEPREFIX=%{public}s", g_prefix_path);
 
@@ -128,10 +143,17 @@ static void *wine_process_thread(void *arg) {
         // Set MYTHIC_EXE=hello-x64.exe in env to launch the ARM64EC test path.
         const char *mythic_exe = getenv("MYTHIC_EXE");
         if (!mythic_exe || !*mythic_exe) mythic_exe = "cube.exe";
-        // Heuristic: filenames containing "x64" use the arm64ec-windows bundle
-        // (which has the ARM64EC hybrid system DLLs that interop with x86_64
-        // guest code). Everything else uses the existing aarch64-windows bundle.
-        BOOL use_arm64ec = (strstr(mythic_exe, "x64") != NULL);
+        // Heuristic: x86_64 guest exes (cube-x64, hello-x64, real games like
+        // Thumper) need the arm64ec-windows bundle (ARM64EC hybrid system
+        // DLLs that interop with FEX-translated x86_64 code). ARM64-native
+        // tests (cube.exe) use the aarch64-windows bundle.
+        // MYTHIC_USE_ARM64EC=1 forces the arm64ec path explicitly.
+        // Otherwise: detect "x64" in the exe name (cube-x64, fib-x64, etc.)
+        // OR a Win32 full path (real game launches typically need ARM64EC).
+        const char *force_ec = getenv("MYTHIC_USE_ARM64EC");
+        BOOL use_arm64ec = (force_ec && *force_ec == '1') ||
+                           (strstr(mythic_exe, "x64") != NULL) ||
+                           (strchr(mythic_exe, '\\') != NULL);
         const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
         LOG("Target exe: %{public}s (bundle=%{public}s)", mythic_exe, bundle_subdir);
         dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", mythic_exe, bundle_subdir);
@@ -158,14 +180,82 @@ static void *wine_process_thread(void *arg) {
             }
             LOG("Symlinked %d DLLs from %{public}s to %{public}s", linked, bundle_subdir, sys32Dir.UTF8String);
             dprintf(STDERR_FILENO, "[WineProc] Symlinked %d DLLs from %s -> sys32\n", linked, bundle_subdir);
+
+            // Layer Microsoft's real VC++ Runtime DLLs ON TOP of the ARM64EC
+            // bundle (only for x86_64 guests). These overwrite Wine's stub
+            // builtins — Wine then loads the real MS x86_64 implementation
+            // (via FEX) instead of its partial ARM64EC reimplementation.
+            //
+            // Same pattern Proton/Winlator use: drop in the real concrt140 /
+            // msvcp140 / vcruntime140 binaries from VC_redist.x64.exe so games
+            // that exercise the full C++ runtime (parallel_for, atomic_wait,
+            // <filesystem>, etc.) don't trip __wine_unimplemented stubs.
+            if (use_arm64ec) {
+                NSString *vcrtSource = [bundlePath stringByAppendingPathComponent:@"x86_64-vcruntime"];
+                NSArray *vcrtDlls = [fm contentsOfDirectoryAtPath:vcrtSource error:nil];
+                int vcrtLinked = 0, vcrtSkipped = 0;
+                for (NSString *dll in vcrtDlls) {
+                    /* Keep vcruntime140.dll as the ARM64EC builtin: its
+                     * __C_specific_handler is invoked by Wine's SEH dispatch,
+                     * and routing that through FEX corrupts x86 RSP (SEH
+                     * dispatcher's exit-thunk arg setup is broken). With the
+                     * native arm64ec vcruntime140, Wine calls the handler
+                     * directly in ARM64 — no FEX bridging on the exception
+                     * path. Other vcruntime/msvcp/concrt DLLs still overlay. */
+                    if ([[dll lowercaseString] isEqualToString:@"vcruntime140.dll"]) {
+                        vcrtSkipped++;
+                        continue;
+                    }
+                    NSString *src = [vcrtSource stringByAppendingPathComponent:dll];
+                    NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
+                    [fm removeItemAtPath:dst error:nil];
+                    if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                        vcrtLinked++;
+                }
+                LOG("Symlinked %d MS VC++ Runtime DLLs (x86_64 native) over arm64ec builtins, skipped %d", vcrtLinked, vcrtSkipped);
+                dprintf(STDERR_FILENO, "[WineProc] Symlinked %d MS VC++ Runtime DLLs over arm64ec builtins (skipped %d for native EC SEH)\n", vcrtLinked, vcrtSkipped);
+            }
         }
 
-        // Build the C:\windows\system32\<exe> path for Wine's PE loader.
-        char exe_path[256];
-        snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", mythic_exe);
-        char *argv[] = { "wine", exe_path, NULL };
-        int argc = 2;
+        // Build the launch path for Wine's PE loader.
+        // If MYTHIC_EXE contains a backslash or starts with a drive letter
+        // (e.g. "C:\\Program Files\\Thumper\\THUMPER_win10.exe"), use it
+        // as-is. Otherwise treat it as a bare exe name in system32 (legacy
+        // path used by cube/fib/hello tests).
+        char exe_path[512];
+        if (strchr(mythic_exe, '\\') || (mythic_exe[0] && mythic_exe[1] == ':')) {
+            snprintf(exe_path, sizeof(exe_path), "%s", mythic_exe);
+        } else {
+            snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", mythic_exe);
+        }
+
+        // Optional MYTHIC_ARGS env var: space-separated args appended to argv.
+        // Tokenized in-place; max 16 extra tokens.
+        static char args_buf[1024];
+        char *extra_argv[16] = {0};
+        int extra_argc = 0;
+        const char *mythic_args = getenv("MYTHIC_ARGS");
+        if (mythic_args && *mythic_args) {
+            strncpy(args_buf, mythic_args, sizeof(args_buf) - 1);
+            args_buf[sizeof(args_buf) - 1] = 0;
+            char *saveptr = NULL;
+            for (char *tok = strtok_r(args_buf, " ", &saveptr);
+                 tok && extra_argc < 16;
+                 tok = strtok_r(NULL, " ", &saveptr)) {
+                extra_argv[extra_argc++] = tok;
+            }
+        }
+
+        char *argv[24];
+        int argc = 0;
+        argv[argc++] = "wine";
+        argv[argc++] = exe_path;
+        for (int i = 0; i < extra_argc; i++) argv[argc++] = extra_argv[i];
+        argv[argc] = NULL;
         dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
+        for (int i = 0; i < extra_argc; i++) {
+            dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
+        }
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();

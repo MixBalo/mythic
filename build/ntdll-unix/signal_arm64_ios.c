@@ -525,6 +525,25 @@ static void *ios_mach_exception_thread( void *arg )
                     int patched = 0;
                     int adjust_pc = 0;
 
+                    /* iOS-Mythic: gate the LDAR/STLR rewrite on the access
+                     * being ACTUALLY unaligned for its size. The Mach
+                     * EXC_BAD_ACCESS we catch here also covers plain guest
+                     * NULL-derefs (addr=0x0, 0x8, ...). Those are aligned and
+                     * must be raised as a normal SEGV — rewriting an LDAR/
+                     * STLR there only delays the same fault and corrupts the
+                     * exception path. Size encoded in insn[31:30]:
+                     *   00=byte (always aligned), 01=halfword, 10=word, 11=dword. */
+                    {
+                        uint32_t access_size_lg2 = (insn >> 30) & 0x3;
+                        uint64_t align_mask = (access_size_lg2 == 0) ? 0
+                                            : ((1ULL << access_size_lg2) - 1);
+                        if (align_mask && ((uint64_t)fault_addr & align_mask) == 0) {
+                            /* Aligned — this is a genuine SEGV/BUS, not an
+                             * unaligned-atomic-needs-backpatch case. Skip. */
+                            goto skip_unaligned_backpatch;
+                        }
+                    }
+
                     if ((insn & LDAXR_MASK) == LDAR_INST ||
                         (insn & LDAXR_MASK) == LDAPR_INST)
                     {
@@ -594,6 +613,7 @@ static void *ios_mach_exception_thread( void *arg )
                                     adjust_pc ? "STLR/STLUR" : "LDAR/LDAPR/LDAPUR");
                         handled = 1;
                     }
+                skip_unaligned_backpatch: ;
                 }
             }
 
