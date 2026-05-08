@@ -570,8 +570,12 @@ struct ContentView: View {
 
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns
+            // For real games this never returns (message loop runs forever), so
+            // the cap is what matters. Bumped from 20s → 120s so larger games
+            // have time to finish DllMain / static init / D3D11Create before we
+            // detach the debugger and lose the BRK-based JIT path.
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 20.0  // safety cap
+            let maxWait = 120.0  // safety cap
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)

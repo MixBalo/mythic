@@ -99,6 +99,15 @@ static void *wine_process_thread(void *arg) {
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
 
+        /* NOTE: setenv() here does NOT propagate to Wine's GetEnvironmentVariableW.
+         * Wine builds its PEB ProcessParameters->Environment block from the
+         * unix env at startup (build_initial_environment in unix/env.c), but
+         * only forwards specific known prefixes (WINE*, DXVK_*, etc.) by
+         * default. Adding new keys for game-specific Steam vars would need a
+         * code change in Wine's env builder. Tried SteamAppPath / SteamGameId /
+         * SteamAppId here and confirmed it doesn't reach the game side; left
+         * the comment so future-me doesn't try this twice. */
+
         /* iOS-Mythic: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
          * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which
          * replicates FEX's HandleUnalignedAccess (Arm64.cpp:2072) so iOS
