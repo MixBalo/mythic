@@ -1164,6 +1164,66 @@ static void *ios_mach_exception_thread( void *arg )
                                 "[x86_stk] live_rsp=0x%llx out of range — RSP not yet established\n",
                                 (unsigned long long)live_rsp);
                         }
+
+                        /* Dump [RBX..RBX+0x30] for stack-local objects: lets us
+                         * see the full vector/struct state when the fault is on
+                         * a `mov rax, [rcx]` chained from `mov rcx, [rbx]`. */
+                        if (live_rbx >= 0x10000 && live_rbx < 0xfffffff000000000ULL)
+                        {
+                            uint64_t obj[7];
+                            mach_vm_size_t got2 = 0;
+                            kern_return_t kr2 = mach_vm_read_overwrite(
+                                mach_task_self(),
+                                (mach_vm_address_t)live_rbx,
+                                sizeof(obj),
+                                (mach_vm_address_t)obj, &got2);
+                            if (kr2 == KERN_SUCCESS && got2 >= sizeof(obj))
+                                dprintf(STDERR_FILENO,
+                                    "[x86_obj] @RBX+0..+0x30: %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                                    (unsigned long long)obj[0],
+                                    (unsigned long long)obj[1],
+                                    (unsigned long long)obj[2],
+                                    (unsigned long long)obj[3],
+                                    (unsigned long long)obj[4],
+                                    (unsigned long long)obj[5],
+                                    (unsigned long long)obj[6]);
+                        }
+
+                        /* Walk FEX's callret stack to recover the guest call chain.
+                         * Each entry is 16 bytes: [0..7]=guest return RIP, [8..15]=host
+                         * return PC. callret_sp points at the most-recently-pushed
+                         * entry; entries grow DOWN (push pre-decrements by 0x10). */
+                        if (state_cret >= 0x10000 && state_cret < 0xfffffff000000000ULL)
+                        {
+                            uint64_t cr[16]; /* up to 8 entries */
+                            mach_vm_size_t got3 = 0;
+                            kern_return_t kr3 = mach_vm_read_overwrite(
+                                mach_task_self(),
+                                (mach_vm_address_t)state_cret,
+                                sizeof(cr),
+                                (mach_vm_address_t)cr, &got3);
+                            if (kr3 == KERN_SUCCESS && got3 >= sizeof(cr))
+                            {
+                                dprintf(STDERR_FILENO,
+                                    "[x86_callret] guest call chain (most recent first):\n"
+                                    "  [0] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [1] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [2] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [3] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [4] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [5] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [6] retRIP=0x%llx hostPC=0x%llx\n"
+                                    "  [7] retRIP=0x%llx hostPC=0x%llx\n",
+                                    (unsigned long long)cr[0],  (unsigned long long)cr[1],
+                                    (unsigned long long)cr[2],  (unsigned long long)cr[3],
+                                    (unsigned long long)cr[4],  (unsigned long long)cr[5],
+                                    (unsigned long long)cr[6],  (unsigned long long)cr[7],
+                                    (unsigned long long)cr[8],  (unsigned long long)cr[9],
+                                    (unsigned long long)cr[10], (unsigned long long)cr[11],
+                                    (unsigned long long)cr[12], (unsigned long long)cr[13],
+                                    (unsigned long long)cr[14], (unsigned long long)cr[15]);
+                            }
+                        }
                     }
                 }
             }
