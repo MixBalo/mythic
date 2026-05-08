@@ -1071,8 +1071,10 @@ static void *ios_mach_exception_thread( void *arg )
                      * ARM regs x23/x25/x26 and only get spilled at SpillStaticRegs
                      * call sites — which most of __dyn_tls_init's path never hits).
                      * So the LIVE x86 register values are in state.__x[] of the
-                     * faulted thread. FEX static map under ARM64EC:
-                     *   x23 = RSP, x25 = RSI, x26 = RDI, x6 = RAX (per milestone).
+                     * faulted thread. ARM64EC SRA:
+                     *   RAX=x8, RCX=x0 (pair0); RDX=x1, RBX=x27 (pair1);
+                     *   RSP=x23, RBP=x29 (pair2); RSI=x25, RDI=x26 (pair3);
+                     *   R8=x2, R9=x3, R10=x4, R11=x5; R12=x19, R13=x20, R14=x21, R15=x22.
                      * State pointer is reachable via TEB+0x1788 -> CPUArea+0x30.   */
                     if (cnt <= 3)
                     {
@@ -1087,16 +1089,35 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                         uint64_t state_rip = fex_state ? ((uint64_t*)fex_state)[0x18 / 8] : 0;
                         uint64_t state_cret = fex_state ? ((uint64_t*)fex_state)[0xb0 / 8] : 0;
+                        /* gs_cached is at CPUState offset 0x3e0 (after gregs,
+                         * L1*, callret_sp, avx_high, xmm union, segment idxes,
+                         * mxcsr, es/cs/ss/ds_cached). */
+                        uint64_t state_gs = fex_state ? ((uint64_t*)fex_state)[0x3e0 / 8] : 0;
+                        uint64_t teb_tls = teb_out ? *(uint64_t*)(teb_out + 0x58) : 0;
+                        uint64_t gs_plus_58 = 0;
+                        if (state_gs >= 0x10000 && state_gs < 0xfffffff000000000ULL)
+                            gs_plus_58 = *(uint64_t*)(state_gs + 0x58);
+                        dprintf(STDERR_FILENO,
+                            "[x86_seg] State.gs_cached=0x%llx TEB=0x%llx TEB[0x58]=0x%llx *(gs_cached+0x58)=0x%llx\n",
+                            (unsigned long long)state_gs,
+                            (unsigned long long)teb_out,
+                            (unsigned long long)teb_tls,
+                            (unsigned long long)gs_plus_58);
 
-                        /* LIVE x86 regs from host ARM thread state. */
+                        /* LIVE x86 regs from host ARM thread state (ARM64EC SRA). */
+                        uint64_t live_rax = state.__x[8];
+                        uint64_t live_rcx = state.__x[0];
+                        uint64_t live_rdx = state.__x[1];
+                        uint64_t live_rbx = state.__x[27];
                         uint64_t live_rsp = state.__x[23];
                         uint64_t live_rsi = state.__x[25];
                         uint64_t live_rdi = state.__x[26];
-                        uint64_t live_rax = state.__x[6];
                         dprintf(STDERR_FILENO,
-                            "[x86_live] RSP=0x%llx RSI=0x%llx RDI=0x%llx RAX=0x%llx | State.RIP=0x%llx callret_sp=0x%llx\n",
+                            "[x86_live] RAX=0x%llx RCX=0x%llx RDX=0x%llx RBX=0x%llx RSP=0x%llx RSI=0x%llx RDI=0x%llx | State.RIP=0x%llx callret_sp=0x%llx\n",
+                            (unsigned long long)live_rax, (unsigned long long)live_rcx,
+                            (unsigned long long)live_rdx, (unsigned long long)live_rbx,
                             (unsigned long long)live_rsp, (unsigned long long)live_rsi,
-                            (unsigned long long)live_rdi, (unsigned long long)live_rax,
+                            (unsigned long long)live_rdi,
                             (unsigned long long)state_rip, (unsigned long long)state_cret);
 
                         if (live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
