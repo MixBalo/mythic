@@ -1350,6 +1350,18 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
                        off_t offset )
 {
 #ifdef WINE_IOS
+    /* iOS: still respect WINEDLLOVERRIDES=name= (LO_DISABLED) so users can
+     * refuse to load specific DLLs (e.g. steamclient64 — packed unpacker
+     * blows up Wine's loader). The original short-circuit below skips the
+     * builtin .so search; we keep that, just gate it on the override. */
+    {
+        enum loadorder lo = get_load_order( nt_name );
+        if (lo == LO_DISABLED)
+        {
+            TRACE( "iOS: %s disabled by WINEDLLOVERRIDES\n", debugstr_us(nt_name) );
+            return STATUS_DLL_NOT_FOUND;
+        }
+    }
     /* On iOS, all PE DLLs are in the prefix (system32 symlinks to bundle).
      * Skip the builtin .so search — it causes mmap failures on iOS and
      * corrupts file descriptors.  Just tell the caller to use the PE file. */
@@ -1707,6 +1719,30 @@ static void load_ntdll_functions( HMODULE module )
     else *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
 
 #ifdef WINE_IOS
+    /* iOS: install JIT-translation hook into PE-side ntdll's
+     * arm64ec_redirect_ptr. Without this, every IAT entry / redirected
+     * entry-point holds a unix .text address, which iOS denies execute.
+     * After the hook is set, redirect_ptr returns JIT-pool aliases. */
+    {
+        extern void *ios_jit_translate_addr(void *addr);
+        extern void ios_jit_sync_write(void *addr, size_t size);
+        /* Use dprintf to fd 2 (mythic-log) to bypass any ERR-channel filter. */
+        dprintf( 2, "XLATE-HOOK enter: module=%p exports=%p\n",
+                 module, exports );
+        void **p_xlate = (void **)find_named_export( module, exports,
+                                                     "p_ios_jit_translate_addr" );
+        dprintf( 2, "XLATE-HOOK after find: p_xlate=%p is_arm64ec=%d\n",
+                 p_xlate, is_arm64ec() );
+        if (p_xlate)
+        {
+            *p_xlate = (void *)ios_jit_translate_addr;
+            dprintf( 2, "XLATE-HOOK installed p_ios_jit_translate_addr=%p at %p\n",
+                     ios_jit_translate_addr, p_xlate );
+            ios_jit_sync_write( p_xlate, sizeof(void*) );
+        }
+        else dprintf( 2, "XLATE-HOOK p_ios_jit_translate_addr export NOT FOUND\n" );
+    }
+
     /* Sync dispatcher pointers to JIT pool .data copy.
      * PE code in JIT pool reads from JIT .data (relocated addresses),
      * but we just wrote the dispatchers to original .data above. */

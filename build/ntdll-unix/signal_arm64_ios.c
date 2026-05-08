@@ -479,6 +479,124 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* 3.5. FEX unaligned LDAR/LDAPR/STLR backpatch.
+             *
+             * x86 has TSO ordering. FEX's MemoryOps lowers x86 TSO loads/stores
+             * to ARM64 LDAPR/STLR (alignment-strict). Some x86 binaries do
+             * legal *unaligned* loads (e.g. steamclient64.dll's packed
+             * unpacker: `movl (%rsi),%ebx` with rsi unaligned) — those fault
+             * on the LDAPR. FEX's HandleUnalignedAccess (Arm64.cpp:2072)
+             * already knows how to recover by atomically rewriting the
+             * instruction to LDR+DMB_LD (or DMB+STR for STLR). It only fires
+             * on Windows EXCEPTION_DATATYPE_MISALIGNMENT — on iOS the Mach
+             * handler sees EXC_BAD_ACCESS first.
+             *
+             * Replicate the FEX backpatch here so iOS gets the same recovery.
+             * Encoding constants from FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp. */
+            if (!handled)
+            {
+                extern void *ios_jit_rx_base_global;
+                extern void *ios_jit_rw_base_global;
+                extern size_t ios_jit_pool_size_global;
+                uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+                uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+                size_t sz = ios_jit_pool_size_global;
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+
+                if (rx && rw && sz && fault_pc >= rx && fault_pc < rx + sz)
+                {
+                    uintptr_t rw_pc = rw + (fault_pc - rx);
+                    uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
+
+                    static const uint32_t LDAXR_MASK  = 0x3FFFFC00u;
+                    static const uint32_t LDAR_INST   = 0x08DFFC00u;
+                    static const uint32_t LDAPR_INST  = 0x38BFC000u;
+                    static const uint32_t STLR_INST   = 0x089FFC00u;
+                    static const uint32_t RCPC2_MASK  = 0x3FE00C00u;
+                    static const uint32_t LDAPUR_INST = 0x19400000u;
+                    static const uint32_t STLUR_INST  = 0x19000000u;
+                    static const uint32_t LDR_INST    = 0x387F6800u; /* LDR (imm), unsigned-offset 0 */
+                    static const uint32_t STR_INST    = 0x383F6800u;
+                    static const uint32_t LDUR_INST   = 0x38400000u;
+                    static const uint32_t STUR_INST   = 0x38000000u;
+                    static const uint32_t DMB         = 0xD5033BBFu; /* dmb ish */
+                    static const uint32_t DMB_LD      = 0xD5033DBFu; /* dmb ishld */
+
+                    int patched = 0;
+                    int adjust_pc = 0;
+
+                    if ((insn & LDAXR_MASK) == LDAR_INST ||
+                        (insn & LDAXR_MASK) == LDAPR_INST)
+                    {
+                        /* LDAR/LDAPR → LDR + DMB_LD. Replace instruction in
+                         * place with the regular LDR; FEX reserves the next
+                         * slot for the half-barrier. */
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t new_ldr = LDR_INST | (Size << 30) | (Rn << 5) | Rt;
+                        __atomic_store_n((volatile uint32_t *)(rw_pc + 4), DMB_LD, __ATOMIC_RELEASE);
+                        __atomic_store_n((volatile uint32_t *)rw_pc,         new_ldr, __ATOMIC_RELEASE);
+                        sys_icache_invalidate((void *)fault_pc, 8);
+                        patched = 1;
+                    }
+                    else if ((insn & LDAXR_MASK) == STLR_INST)
+                    {
+                        /* STLR → DMB + STR. Half-barrier overwrites the slot
+                         * before the STLR; PC backs up by 4. */
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t new_str = STR_INST | (Size << 30) | (Rn << 5) | Rt;
+                        __atomic_store_n((volatile uint32_t *)(rw_pc - 4), DMB, __ATOMIC_RELEASE);
+                        __atomic_store_n((volatile uint32_t *)rw_pc,       new_str, __ATOMIC_RELEASE);
+                        sys_icache_invalidate((void *)(fault_pc - 4), 8);
+                        adjust_pc = -4;
+                        patched = 1;
+                    }
+                    else if ((insn & RCPC2_MASK) == LDAPUR_INST)
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t new_ldur = LDUR_INST | (Size << 30) | (Rn << 5) | Rt
+                                           | (insn & (0x1FFu << 12));
+                        __atomic_store_n((volatile uint32_t *)(rw_pc + 4), DMB_LD,   __ATOMIC_RELEASE);
+                        __atomic_store_n((volatile uint32_t *)rw_pc,         new_ldur, __ATOMIC_RELEASE);
+                        sys_icache_invalidate((void *)fault_pc, 8);
+                        patched = 1;
+                    }
+                    else if ((insn & RCPC2_MASK) == STLUR_INST)
+                    {
+                        uint32_t Size = (insn >> 30) & 0x3;
+                        uint32_t Rn = (insn >> 5) & 0x1F;
+                        uint32_t Rt = insn & 0x1F;
+                        uint32_t new_stur = STUR_INST | (Size << 30) | (Rn << 5) | Rt
+                                           | (insn & (0x1FFu << 12));
+                        __atomic_store_n((volatile uint32_t *)(rw_pc - 4), DMB,      __ATOMIC_RELEASE);
+                        __atomic_store_n((volatile uint32_t *)rw_pc,         new_stur, __ATOMIC_RELEASE);
+                        sys_icache_invalidate((void *)(fault_pc - 4), 8);
+                        adjust_pc = -4;
+                        patched = 1;
+                    }
+
+                    if (patched)
+                    {
+                        if (adjust_pc)
+                            __darwin_arm_thread_state64_set_pc_fptr(state, (void *)(fault_pc + adjust_pc));
+                        static volatile int ub_count = 0;
+                        int n = __sync_add_and_fetch(&ub_count, 1);
+                        if (n <= 5 || (n % 100) == 0)
+                            dprintf(STDERR_FILENO,
+                                    "[mach_exc] UNALIGNED-BACKPATCH #%d pc=0x%llx insn=0x%08x addr=0x%llx kind=%s\n",
+                                    n, (unsigned long long)fault_pc, insn,
+                                    (unsigned long long)fault_addr,
+                                    adjust_pc ? "STLR/STLUR" : "LDAR/LDAPR/LDAPUR");
+                        handled = 1;
+                    }
+                }
+            }
+
             /* 4. Emulate stores to JIT-pool RX aliases by redirecting them
              * to the corresponding JIT-pool RW alias address. iOS dual-map
              * blocks W on the RX side even with vm_protect+VM_PROT_COPY,
@@ -580,6 +698,43 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         int rt = insn & 0x1f;
                         *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STLR (Store-Release Register, 64-bit):
+                     *   1100 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0xc89ffc00)
+                     * Used by FEX's HandleUnalignedAccess backpatch
+                     * (`std::atomic_ref<uint32_t>(PC).store(..., release)` → STLR).
+                     * Without this we infinite-loop on unaligned atomic faults
+                     * because FEX can't patch its own JIT block on iOS RX-only memory. */
+                    else if ((insn & 0xfffffc00) == 0xc89ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint64_t *)rw_addr, state.__x[rt], __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLR (Store-Release Register, 32-bit):
+                     *   1000 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x889ffc00)
+                     * Same use case — FEX's backpatch is a 32-bit instruction store. */
+                    else if ((insn & 0xfffffc00) == 0x889ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint32_t *)rw_addr, (uint32_t)state.__x[rt], __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLRH (Store-Release 16-bit):
+                     *   0100 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x489ffc00) */
+                    else if ((insn & 0xfffffc00) == 0x489ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint16_t *)rw_addr, (uint16_t)state.__x[rt], __ATOMIC_RELEASE);
+                        emulated = 1;
+                    }
+                    /* STLRB (Store-Release 8-bit):
+                     *   0000 1000 1001 1111 1111 11nn nnnt tttt   (mask 0xfffffc00, val 0x089ffc00) */
+                    else if ((insn & 0xfffffc00) == 0x089ffc00)
+                    {
+                        int rt = insn & 0x1f;
+                        __atomic_store_n((uint8_t *)rw_addr, (uint8_t)state.__x[rt], __ATOMIC_RELEASE);
                         emulated = 1;
                     }
                     /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
@@ -714,6 +869,28 @@ static void *ios_mach_exception_thread( void *arg )
                                 state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
                             }
                         }
+                    }
+                    /* GPR STR (immediate, unsigned offset, 64-bit X-reg):
+                     *   1111 1001 00 imm12 Rn Rt   (base 0xf9000000, mask 0xffc00000)
+                     * Hits for `str xN, [xM, #imm]` and `str xN, [xM]` —
+                     * what the C compiler emits for `*ptr = uint64_value`.
+                     * Wine's PE loader / ARM64EC compiler-generated code triggers this
+                     * when initializing data in a page that's been mprotect'd RX-only
+                     * on iOS. fault_addr already includes the imm12 offset. */
+                    else if ((insn & 0xffc00000) == 0xf9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* GPR STR (immediate, unsigned offset, 32-bit W-reg):
+                     *   1011 1001 00 imm12 Rn Rt   (base 0xb9000000, mask 0xffc00000)
+                     * `*ptr32 = uint32_value` analogue. */
+                    else if ((insn & 0xffc00000) == 0xb9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        emulated = 1;
                     }
                     /* SIMD/FP STR (immediate, unsigned offset, D-reg): 11 111 1 01 00 imm12 Rn Rt */
                     else if ((insn & 0xffc00000) == 0xfd000000)
