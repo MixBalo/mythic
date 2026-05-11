@@ -1110,14 +1110,29 @@ static void *ios_mach_exception_thread( void *arg )
                         uint64_t live_rdx = state.__x[1];
                         uint64_t live_rbx = state.__x[27];
                         uint64_t live_rsp = state.__x[23];
+                        uint64_t live_rbp = state.__x[29];
                         uint64_t live_rsi = state.__x[25];
                         uint64_t live_rdi = state.__x[26];
+                        uint64_t live_r8  = state.__x[2];
+                        uint64_t live_r9  = state.__x[3];
+                        uint64_t live_r10 = state.__x[4];
+                        uint64_t live_r11 = state.__x[5];
+                        uint64_t live_r12 = state.__x[19];
+                        uint64_t live_r13 = state.__x[20];
+                        uint64_t live_r14 = state.__x[21];
+                        uint64_t live_r15 = state.__x[22];
                         dprintf(STDERR_FILENO,
-                            "[x86_live] RAX=0x%llx RCX=0x%llx RDX=0x%llx RBX=0x%llx RSP=0x%llx RSI=0x%llx RDI=0x%llx | State.RIP=0x%llx callret_sp=0x%llx\n",
+                            "[x86_live] RAX=0x%llx RCX=0x%llx RDX=0x%llx RBX=0x%llx RSP=0x%llx RBP=0x%llx RSI=0x%llx RDI=0x%llx\n"
+                            "[x86_live]  R8=0x%llx  R9=0x%llx R10=0x%llx R11=0x%llx R12=0x%llx R13=0x%llx R14=0x%llx R15=0x%llx\n"
+                            "[x86_live] State.RIP=0x%llx callret_sp=0x%llx\n",
                             (unsigned long long)live_rax, (unsigned long long)live_rcx,
                             (unsigned long long)live_rdx, (unsigned long long)live_rbx,
-                            (unsigned long long)live_rsp, (unsigned long long)live_rsi,
-                            (unsigned long long)live_rdi,
+                            (unsigned long long)live_rsp, (unsigned long long)live_rbp,
+                            (unsigned long long)live_rsi, (unsigned long long)live_rdi,
+                            (unsigned long long)live_r8,  (unsigned long long)live_r9,
+                            (unsigned long long)live_r10, (unsigned long long)live_r11,
+                            (unsigned long long)live_r12, (unsigned long long)live_r13,
+                            (unsigned long long)live_r14, (unsigned long long)live_r15,
                             (unsigned long long)state_rip, (unsigned long long)state_cret);
 
                         if (live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
@@ -1180,6 +1195,33 @@ static void *ios_mach_exception_thread( void *arg )
                             if (kr2 == KERN_SUCCESS && got2 >= sizeof(obj))
                                 dprintf(STDERR_FILENO,
                                     "[x86_obj] @RBX+0..+0x30: %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                                    (unsigned long long)obj[0],
+                                    (unsigned long long)obj[1],
+                                    (unsigned long long)obj[2],
+                                    (unsigned long long)obj[3],
+                                    (unsigned long long)obj[4],
+                                    (unsigned long long)obj[5],
+                                    (unsigned long long)obj[6]);
+                        }
+
+                        /* Also dump [RCX..RCX+0x30] — when the fault is in a
+                         * helper that took (rcx=this, ...) and `this` got
+                         * clobbered by intermediate moves, the original `this`
+                         * lives in RBX. But RCX itself often points to a
+                         * destination buffer or an object whose state we want
+                         * to inspect. */
+                        if (live_rcx >= 0x10000 && live_rcx < 0xfffffff000000000ULL)
+                        {
+                            uint64_t obj[7];
+                            mach_vm_size_t got_c = 0;
+                            kern_return_t kr_c = mach_vm_read_overwrite(
+                                mach_task_self(),
+                                (mach_vm_address_t)live_rcx,
+                                sizeof(obj),
+                                (mach_vm_address_t)obj, &got_c);
+                            if (kr_c == KERN_SUCCESS && got_c >= sizeof(obj))
+                                dprintf(STDERR_FILENO,
+                                    "[x86_dst] @RCX+0..+0x30: %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
                                     (unsigned long long)obj[0],
                                     (unsigned long long)obj[1],
                                     (unsigned long long)obj[2],
