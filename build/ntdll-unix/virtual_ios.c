@@ -204,6 +204,13 @@ void *ios_jit_get_trampoline(int slot)
     return NULL;
 }
 
+/* Callback registered by xtajit64 (via unix_ios_push_jit_aliases unix-call)
+ * so future ios_jit_add_mapping calls automatically push aliases to FEX
+ * too. Without this, late-loaded DLLs (e.g. dlopen after process init)
+ * would have unregistered alias ranges and FEX would emit NoExecOp for
+ * code in their copies. */
+static void (*ios_jit_alias_pushback_cb)(unsigned long long, unsigned long long, unsigned long long) = NULL;
+
 void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i;
@@ -237,6 +244,40 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
     ios_jit_mappings[ios_jit_mapping_count].reloc_rva = 0;
     ios_jit_mappings[ios_jit_mapping_count].reloc_size = 0;
     ios_jit_mapping_count++;
+
+    /* If xtajit64 has already registered its alias-mapping push callback
+     * (via the unix_ios_push_jit_aliases unix-call), forward this new
+     * mapping to it too. Early mappings (added before xtajit64 loads) are
+     * picked up by the iteration in unix_ios_push_jit_aliases. */
+    if (ios_jit_alias_pushback_cb)
+        ios_jit_alias_pushback_cb((unsigned long long)(uintptr_t)pe_base,
+                                  (unsigned long long)(uintptr_t)jit_base,
+                                  (unsigned long long)size);
+}
+
+/* unix_ios_push_jit_aliases handler. Called from PE-side ntdll's
+ * arm64ec_process_init_dispatchers after binding xtajit64's
+ * BTCpu64IosAddAliasMapping. Stores the callback, then pushes all
+ * currently-registered iOS JIT aliases through it. Future ios_jit_add_mapping
+ * calls also push through the stored callback (see above). */
+struct ios_push_jit_aliases_args {
+    void (*callback)(unsigned long long, unsigned long long, unsigned long long);
+};
+
+NTSTATUS unixcall_ios_push_jit_aliases(void *args)
+{
+    struct ios_push_jit_aliases_args *params = args;
+    int i;
+    if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
+    ios_jit_alias_pushback_cb = params->callback;
+    /* Drain current table to the callback. */
+    for (i = 0; i < ios_jit_mapping_count; i++)
+        params->callback((unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base,
+                         (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
+                         (unsigned long long)ios_jit_mappings[i].size);
+    ERR("unixcall_ios_push_jit_aliases: registered callback + drained %d mappings\n",
+        ios_jit_mapping_count);
+    return STATUS_SUCCESS;
 }
 
 /* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous

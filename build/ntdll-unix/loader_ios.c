@@ -1085,6 +1085,8 @@ static NTSTATUS ios_wrap_unix_call(int index, void *args, unixlib_entry_t real_f
     return real_func(args);
 }
 
+extern NTSTATUS unixcall_ios_push_jit_aliases(void *args);  /* virtual_ios.c */
+
 static NTSTATUS ios_wrap_0(void *a) { return ios_wrap_unix_call(0, a, load_so_dll); }
 static NTSTATUS ios_wrap_1(void *a) { return ios_wrap_unix_call(1, a, unwind_builtin_dll); }
 static NTSTATUS ios_wrap_2(void *a) { return ios_wrap_unix_call(2, a, unixcall_wine_dbg_write); }
@@ -1093,11 +1095,13 @@ static NTSTATUS ios_wrap_4(void *a) { return ios_wrap_unix_call(4, a, unixcall_w
 static NTSTATUS ios_wrap_5(void *a) { return ios_wrap_unix_call(5, a, unixcall_wine_server_handle_to_fd); }
 static NTSTATUS ios_wrap_6(void *a) { return ios_wrap_unix_call(6, a, unixcall_wine_spawnvp); }
 static NTSTATUS ios_wrap_7(void *a) { return ios_wrap_unix_call(7, a, system_time_precise); }
+static NTSTATUS ios_wrap_8(void *a) { return ios_wrap_unix_call(8, a, unixcall_ios_push_jit_aliases); }
 
 static const unixlib_entry_t unix_call_funcs[] =
 {
     ios_wrap_0, ios_wrap_1, ios_wrap_2, ios_wrap_3,
     ios_wrap_4, ios_wrap_5, ios_wrap_6, ios_wrap_7,
+    ios_wrap_8,
 };
 #else
 static const unixlib_entry_t unix_call_funcs[] =
@@ -1110,6 +1114,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_wine_server_handle_to_fd,
     unixcall_wine_spawnvp,
     system_time_precise,
+    unixcall_ios_push_jit_aliases,
 };
 #endif
 
@@ -1129,6 +1134,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     wow64_wine_server_handle_to_fd,
     wow64_wine_spawnvp,
     system_time_precise,
+    unixcall_ios_push_jit_aliases,  /* iOS only — wow64 case unreachable */
 };
 
 #endif  /* _WIN64 */
