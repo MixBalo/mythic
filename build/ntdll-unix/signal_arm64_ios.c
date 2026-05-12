@@ -1085,18 +1085,32 @@ static void *ios_mach_exception_thread( void *arg )
                      *   RSP=x23, RBP=x29 (pair2); RSI=x25, RDI=x26 (pair3);
                      *   R8=x2, R9=x3, R10=x4, R11=x5; R12=x19, R13=x20, R14=x21, R15=x22.
                      * State pointer is reachable via TEB+0x1788 -> CPUArea+0x30.   */
-                    if (cnt <= 3)
+                    /* Read State.RIP unconditionally so we can decide whether
+                     * this fault is "interesting" (i.e., in known Thumper DXGI
+                     * dispatch range 0x140079xxx-0x14007axxx). Dump full state
+                     * for first 3 faults OR any interesting RIP. */
+                    uintptr_t teb_out_pre = 0;
+                    void *tramp_out_pre = NULL;
+                    ios_lookup_thread(thread, &teb_out_pre, &tramp_out_pre);
+                    void *fex_state_pre = NULL;
+                    if (teb_out_pre)
                     {
-                        uintptr_t teb_out = 0;
-                        void *tramp_out = NULL;
-                        ios_lookup_thread(thread, &teb_out, &tramp_out);
-                        void *fex_state = NULL;
-                        if (teb_out)
-                        {
-                            void *cpuarea = *(void**)(teb_out + 0x1788);
-                            if (cpuarea) fex_state = *(void**)((char*)cpuarea + 0x30);
-                        }
-                        uint64_t state_rip = fex_state ? ((uint64_t*)fex_state)[0x18 / 8] : 0;
+                        void *cpuarea = *(void**)(teb_out_pre + 0x1788);
+                        if (cpuarea) fex_state_pre = *(void**)((char*)cpuarea + 0x30);
+                    }
+                    uint64_t state_rip_pre = fex_state_pre ?
+                        ((uint64_t*)fex_state_pre)[0x18 / 8] : 0;
+                    int interesting_rip = (state_rip_pre >= 0x140079000 &&
+                                           state_rip_pre <  0x14007b000) ||
+                                          (state_rip_pre >= 0x1400e0000 &&
+                                           state_rip_pre <  0x1400e1000);
+                    if (cnt <= 3 || interesting_rip)
+                    {
+                        uintptr_t teb_out = teb_out_pre;
+                        void *tramp_out = tramp_out_pre;
+                        (void)tramp_out;
+                        void *fex_state = fex_state_pre;
+                        uint64_t state_rip = state_rip_pre;
                         uint64_t state_cret = fex_state ? ((uint64_t*)fex_state)[0xb0 / 8] : 0;
                         /* gs_cached is at CPUState offset 0x3e0 (after gregs,
                          * L1*, callret_sp, avx_high, xmm union, segment idxes,
