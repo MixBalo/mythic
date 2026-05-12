@@ -90,7 +90,7 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall", 1);
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
 
         // Phase 3D investigation: re-enabled. Investigation C concluded
         // wineserver dispatch is fine; the `ws_log drops at high rate`
@@ -99,14 +99,16 @@ static void *wine_process_thread(void *arg) {
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
 
-        /* NOTE: setenv() here does NOT propagate to Wine's GetEnvironmentVariableW.
-         * Wine builds its PEB ProcessParameters->Environment block from the
-         * unix env at startup (build_initial_environment in unix/env.c), but
-         * only forwards specific known prefixes (WINE*, DXVK_*, etc.) by
-         * default. Adding new keys for game-specific Steam vars would need a
-         * code change in Wine's env builder. Tried SteamAppPath / SteamGameId /
-         * SteamAppId here and confirmed it doesn't reach the game side; left
-         * the comment so future-me doesn't try this twice. */
+        /* Steam game vars — Thumper queries SteamAppPath dozens of times in init
+         * and uses it as base path for asset loading. Prior comment claimed
+         * setenv didn't propagate to Wine's GetEnvironmentVariableW, but reading
+         * env.c::get_initial_environment shows non-WINE/non-special vars DO
+         * pass through (line 915 fall-through). Re-trying this empirically. */
+        setenv("SteamAppPath", "C:\\Program Files\\Thumper", 1);
+        setenv("SteamGameId", "356400", 1);  // Thumper's Steam app ID
+        setenv("SteamAppId",  "356400", 1);
+        LOG("setenv check: SteamAppPath=%{public}s SteamGameId=%{public}s",
+            getenv("SteamAppPath"), getenv("SteamGameId"));
 
         /* iOS-Mythic: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
          * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which

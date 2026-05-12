@@ -893,6 +893,11 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
     {
         char *str = *e;
 
+        /* iOS DIAGNOSTIC: log env vars containing "Steam" or known Thumper-relevant keys */
+        if (STARTS_WITH(str, "Steam") || STARTS_WITH(str, "SteamAppPath") ||
+            STARTS_WITH(str, "SteamGameId") || STARTS_WITH(str, "SteamAppId"))
+            fprintf(stderr, "[iOS env] processing: %s\n", str);
+
         /* skip Unix special variables and use the Wine variants instead */
         if (STARTS_WITH( str, "WINE" ))
         {
@@ -903,8 +908,16 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
                 exit(0);
             }
         }
-        else if (is_ignored_env_var( str )) continue;
-        else if (host_var_exists( str )) continue;
+        else if (is_ignored_env_var( str ))
+        {
+            if (STARTS_WITH(str, "Steam")) fprintf(stderr, "[iOS env] IGNORED: %s\n", str);
+            continue;
+        }
+        else if (host_var_exists( str ))
+        {
+            if (STARTS_WITH(str, "Steam")) fprintf(stderr, "[iOS env] HOST_EXISTS skip: %s\n", str);
+            continue;
+        }
         else if (is_special_env_var( str )) /* prefix it with WINE_HOST_ */
         {
             static const WCHAR hostW[] = {'W','I','N','E','_','H','O','S','T','_'};
@@ -913,6 +926,8 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
         }
 
         ptr += ntdll_umbstowcs( str, strlen(str) + 1, ptr, end - ptr );
+        if (STARTS_WITH(str, "Steam"))
+            fprintf(stderr, "[iOS env] INCLUDED: %s\n", str);
     }
     *pos = ptr - env;
     return env;
