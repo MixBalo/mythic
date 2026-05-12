@@ -1254,6 +1254,68 @@ static void *ios_mach_exception_thread( void *arg )
                                     (unsigned long long)obj[6]);
                         }
 
+                        /* Thumper-debug: also dump the static singleton slot
+                         * at 0x140290a60+0x428. This is the "0x1400793d0
+                         * caller" that the DXGI dispatch wrapper reads from.
+                         * If it's the static placeholder 0x1401825a8, Thumper
+                         * never initialized the real renderer wrapper at this
+                         * slot. If it's something else, we need to see what. */
+                        {
+                            uint64_t static_slot = 0;
+                            mach_vm_size_t got_ss = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)0x140290e88ULL, /* 0x140290a60+0x428 */
+                                    sizeof(static_slot),
+                                    (mach_vm_address_t)&static_slot, &got_ss)
+                                == KERN_SUCCESS && got_ss == sizeof(static_slot))
+                            {
+                                dprintf(STDERR_FILENO,
+                                    "[x86_thumper] [0x140290a60+0x428]=0x%llx",
+                                    (unsigned long long)static_slot);
+                                /* Walk the chain: renderer object → vtable → vtable[30] */
+                                if (static_slot >= 0x10000 && static_slot < 0xfffffff000000000ULL)
+                                {
+                                    uint64_t vtable_ptr = 0;
+                                    mach_vm_size_t got_v = 0;
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)static_slot,
+                                            sizeof(vtable_ptr),
+                                            (mach_vm_address_t)&vtable_ptr, &got_v)
+                                        == KERN_SUCCESS && got_v == sizeof(vtable_ptr))
+                                    {
+                                        dprintf(STDERR_FILENO, "  vtable=*[slot]=0x%llx",
+                                            (unsigned long long)vtable_ptr);
+                                        if (vtable_ptr >= 0x10000 && vtable_ptr < 0xfffffff000000000ULL)
+                                        {
+                                            /* Read full vtable slots [0..7] and [30] */
+                                            uint64_t vt_entries[32];
+                                            mach_vm_size_t got_ve = 0;
+                                            if (mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)vtable_ptr,
+                                                    sizeof(vt_entries),
+                                                    (mach_vm_address_t)vt_entries, &got_ve)
+                                                == KERN_SUCCESS && got_ve == sizeof(vt_entries))
+                                            {
+                                                dprintf(STDERR_FILENO,
+                                                    "\n[x86_thumper]   vtable[0..3]: %016llx %016llx %016llx %016llx",
+                                                    (unsigned long long)vt_entries[0],
+                                                    (unsigned long long)vt_entries[1],
+                                                    (unsigned long long)vt_entries[2],
+                                                    (unsigned long long)vt_entries[3]);
+                                                dprintf(STDERR_FILENO,
+                                                    "\n[x86_thumper]   vtable[28..31] (target=[30]): %016llx %016llx ★%016llx %016llx",
+                                                    (unsigned long long)vt_entries[28],
+                                                    (unsigned long long)vt_entries[29],
+                                                    (unsigned long long)vt_entries[30],
+                                                    (unsigned long long)vt_entries[31]);
+                                            }
+                                        }
+                                    }
+                                }
+                                dprintf(STDERR_FILENO, "\n");
+                            }
+                        }
+
                         /* Thumper-debug: when fault chain involves the renderer
                          * wrapper at guest RIP 0x140079390 (vtable[30] dispatch),
                          * dump the indirection chain [rcx+0x428] → [rax] → [r10+0xf0].
