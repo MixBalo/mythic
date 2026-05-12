@@ -297,6 +297,14 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
 
+                Button("Run x64 CheckMSAA isolation test (Thumper vtable[30])") {
+                    setenv("MYTHIC_EXE", "dxchkmsaa-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+
                 Button("Test JIT") {
                     runJITTest()
                 }
