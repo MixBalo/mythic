@@ -268,6 +268,51 @@ static void *wine_process_thread(void *arg) {
             dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
         }
 
+        /* iOS-Mythic: chdir to the unix path that maps to the exe's Wine
+         * directory BEFORE __wine_main. Wine inherits the iOS app sandbox
+         * cwd, which becomes a `unix\private\var\mobile\...\Documents\wine\`
+         * Wine path — and Thumper's relative cache opens (e.g.,
+         * "cache/721e72f7.pc") then resolve to doubled paths that don't
+         * exist. Per GPT diagnosis 2026-05-12. Only chdir for full-path EXE
+         * launches; bare-name launches (cube, hello-x64) use C:\windows\system32. */
+        if (strchr(mythic_exe, '\\') || (mythic_exe[0] && mythic_exe[1] == ':')) {
+            /* Convert "C:\Program Files\Thumper\X.exe" → unix path */
+            char unix_dir[1024];
+            const char *drive_c = "drive_c";
+            const char *after_drive = mythic_exe + 3; /* skip "C:\" */
+            char *last_sep = strrchr(mythic_exe, '\\');
+            if (last_sep && last_sep > mythic_exe + 3) {
+                /* Get "Program Files\Thumper" from "C:\Program Files\Thumper\X.exe" */
+                size_t dir_len = (size_t)(last_sep - after_drive);
+                char windir[512];
+                memcpy(windir, after_drive, dir_len);
+                windir[dir_len] = 0;
+                /* Translate backslashes to forward slashes */
+                for (char *p = windir; *p; p++) if (*p == '\\') *p = '/';
+                snprintf(unix_dir, sizeof(unix_dir), "%s/%s/%s",
+                         g_prefix_path, drive_c, windir);
+                int rc = chdir(unix_dir);
+                setenv("PWD", unix_dir, 1);
+                /* Also set the iOS-specific override so env_ios.c's
+                 * get_initial_directory bypasses unix_to_nt_file_name (which
+                 * fails to resolve drive_c via dosdevices on iOS). */
+                char wine_cwd[768];
+                /* Strip trailing exe name from mythic_exe to get the dir part */
+                {
+                    const char *exe = mythic_exe;
+                    size_t dir_len = (size_t)(last_sep - exe);
+                    if (dir_len < sizeof(wine_cwd) - 2) {
+                        memcpy(wine_cwd, exe, dir_len);
+                        wine_cwd[dir_len] = '\\';
+                        wine_cwd[dir_len + 1] = 0;
+                        setenv("MYTHIC_INITIAL_CWD", wine_cwd, 1);
+                    }
+                }
+                dprintf(STDERR_FILENO, "[WineProc] chdir(%s) = %d errno=%d, PWD + MYTHIC_INITIAL_CWD=%s\n",
+                        unix_dir, rc, rc ? errno : 0, wine_cwd);
+            }
+        }
+
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();
         wine_ios_exit_initialized = 1;

@@ -1471,6 +1471,30 @@ static WCHAR *get_initial_directory(void)
     int size;
     WCHAR *ret = NULL;
 
+    /* iOS-Mythic override: MYTHIC_INITIAL_CWD env var lets the bridge
+     * specify the initial NT path directly (e.g. "C:\\Program Files\\Thumper\\")
+     * when iOS unix_to_nt_file_name can't resolve drive_c via dosdevices. */
+    {
+        const char *mythic_cwd = getenv("MYTHIC_INITIAL_CWD");
+        if (mythic_cwd && *mythic_cwd)
+        {
+            size_t len = strlen(mythic_cwd);
+            ret = malloc((len + 8) * sizeof(WCHAR));
+            /* Format: \??\<path>[\] */
+            ret[0] = '\\'; ret[1] = '?'; ret[2] = '?'; ret[3] = '\\';
+            for (size_t i = 0; i < len; i++) ret[4 + i] = mythic_cwd[i];
+            ret[4 + len] = 0;
+            /* ensure trailing backslash */
+            if (len && ret[4 + len - 1] != '\\')
+            {
+                ret[4 + len] = '\\';
+                ret[4 + len + 1] = 0;
+            }
+            os_log(OS_LOG_DEFAULT, "[Wine] get_initial_directory: MYTHIC_INITIAL_CWD override = %s", mythic_cwd);
+            return ret;
+        }
+    }
+
     /* try to get it from the Unix cwd */
 
     for (size = 1024; ; size *= 2)
