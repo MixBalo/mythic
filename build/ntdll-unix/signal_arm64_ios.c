@@ -979,9 +979,18 @@ static void *ios_mach_exception_thread( void *arg )
                 /* Rate-limit: log first 5 unhandled faults then every 100th */
                 static volatile int unhandled_count = 0;
                 int cnt = __sync_add_and_fetch(&unhandled_count, 1);
-                if (cnt <= 5 || (cnt % 100) == 0)
+                /* iOS-Mythic: ALWAYS dump for "terminal-looking" faults
+                 * — fault PC outside any plausible mapped region (low addr
+                 * < 0x100000000 OR in dyld_shared_cache range 0x3xxxx00000+).
+                 * Path-init memcpy faults happen at JIT-pool PCs and burn
+                 * the cnt<=5 budget; without this terminal crashes were
+                 * never dumped. */
+                uint64_t fault_pc_check = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                int terminal_pc = (fault_pc_check < 0x100000000ULL ||
+                                   (fault_pc_check >> 32) >= 0x300);
+                if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)
                 {
-                    uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                    uint64_t fault_pc = fault_pc_check;
                     dprintf(STDERR_FILENO, "[mach_exc] UNHANDLED #%d pc=%p addr=%p x18=%p type=%d lr=%p sp=%p x16=%p x17=%p\n",
                         cnt, (void*)(uintptr_t)fault_pc, (void*)fault_addr,
                         (void*)(uintptr_t)state.__x[18], req->exception,
@@ -1229,6 +1238,54 @@ static void *ios_mach_exception_thread( void *arg )
                                     (unsigned long long)obj[4],
                                     (unsigned long long)obj[5],
                                     (unsigned long long)obj[6]);
+                        }
+
+                        /* Thumper-debug: when fault chain involves the renderer
+                         * wrapper at guest RIP 0x140079390 (vtable[30] dispatch),
+                         * dump the indirection chain [rcx+0x428] → [rax] → [r10+0xf0].
+                         * Helps identify when [rcx+0x428] is the wrong type
+                         * (vtable instead of object, etc.) per GPT diagnosis. */
+                        if (live_rcx >= 0x10000 && live_rcx < 0xfffffff000000000ULL)
+                        {
+                            mach_vm_address_t f1_addr = (mach_vm_address_t)(live_rcx + 0x428);
+                            uint64_t f1 = 0;
+                            mach_vm_size_t got_f1 = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(), f1_addr,
+                                    sizeof(f1), (mach_vm_address_t)&f1, &got_f1)
+                                == KERN_SUCCESS && got_f1 == sizeof(f1))
+                            {
+                                dprintf(STDERR_FILENO, "[x86_dispatch] [RCX+0x428]=0x%llx",
+                                    (unsigned long long)f1);
+                                if (f1 >= 0x10000 && f1 < 0xfffffff000000000ULL)
+                                {
+                                    uint64_t f2 = 0;
+                                    mach_vm_size_t got_f2 = 0;
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)f1, sizeof(f2),
+                                            (mach_vm_address_t)&f2, &got_f2)
+                                        == KERN_SUCCESS && got_f2 == sizeof(f2))
+                                    {
+                                        dprintf(STDERR_FILENO, " [[+0x428]]=0x%llx",
+                                            (unsigned long long)f2);
+                                        if (f2 >= 0x10000 && f2 < 0xfffffff000000000ULL)
+                                        {
+                                            uint64_t slot30 = 0;
+                                            mach_vm_size_t got_s = 0;
+                                            if (mach_vm_read_overwrite(mach_task_self(),
+                                                    (mach_vm_address_t)(f2 + 0xf0),
+                                                    sizeof(slot30),
+                                                    (mach_vm_address_t)&slot30, &got_s)
+                                                == KERN_SUCCESS && got_s == sizeof(slot30))
+                                            {
+                                                dprintf(STDERR_FILENO,
+                                                    " [+0xf0]=0x%llx (would-be vtable[30])",
+                                                    (unsigned long long)slot30);
+                                            }
+                                        }
+                                    }
+                                }
+                                dprintf(STDERR_FILENO, "\n");
+                            }
                         }
 
                         /* Walk FEX's callret stack to recover the guest call chain.
