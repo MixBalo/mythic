@@ -26,6 +26,8 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <unistd.h>  /* iOS-Mythic: dprintf for BADMODE diagnostic */
+#include <stdio.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -4447,9 +4449,53 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
     TRACE( "%s %p %p %#x %p\n", debugstr_us(devname), devmode, hwnd, flags, lparam );
     TRACE( "flags=%s\n", _CDS_flags(flags) );
 
+    /* iOS-Mythic: pre-emptive dprintf so we see the call even on early returns. */
+    {
+        char devname_buf[128] = "<null>";
+        if (devname && devname->Buffer && devname->Length)
+        {
+            size_t copy = devname->Length / 2;
+            if (copy > 127) copy = 127;
+            for (size_t i = 0; i < copy; i++)
+                devname_buf[i] = (char)(devname->Buffer[i] & 0x7f);
+            devname_buf[copy] = 0;
+        }
+        else if (devname && devname->Length == 0) snprintf(devname_buf, sizeof(devname_buf), "<empty>");
+        dprintf(STDERR_FILENO,
+            "[iOS NtUserChangeDisplaySettings ENTRY] devname='%s' devmode=%p hwnd=%p flags=%#x\n",
+            devname_buf, devmode, hwnd, (unsigned)flags);
+        if (devmode)
+            dprintf(STDERR_FILENO,
+                "[iOS NtUserChangeDisplaySettings ENTRY]   mode: %lux%lu @%luHz bpp=%lu fields=%#x\n",
+                (unsigned long)devmode->dmPelsWidth,
+                (unsigned long)devmode->dmPelsHeight,
+                (unsigned long)devmode->dmDisplayFrequency,
+                (unsigned long)devmode->dmBitsPerPel,
+                (unsigned)devmode->dmFields);
+    }
+
     if ((!devname || !devname->Length) && !devmode) return apply_display_settings( NULL, NULL, hwnd, flags, lparam );
 
-    if (!(source = find_source( devname ))) return DISP_CHANGE_BADPARAM;
+    /* iOS-Mythic: Wine's iOS port has no primary display source registered
+     * (default_update_display_devices isn't called because nulldrv claims
+     * to handle UpdateDisplayDevices). Thumper passes devname="" + devmode
+     * + CDS_TEST to validate the mode. With no source, find_source returns
+     * NULL → BADPARAM → game crashes downstream. For CDS_TEST mode, just
+     * pretend the mode is supported. This is the same shape as Wine's
+     * SUCCESSFUL return when CDS_TEST is set further down. */
+    if ((!devname || !devname->Length) && devmode)
+    {
+        dprintf(STDERR_FILENO,
+            "[iOS NtUserChangeDisplaySettings] empty devname (flags=%#x): returning SUCCESSFUL for headless\n",
+            (unsigned)flags);
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+
+    if (!(source = find_source( devname )))
+    {
+        dprintf(STDERR_FILENO, "[iOS NtUserChangeDisplaySettings] find_source FAILED → BADPARAM\n");
+        return DISP_CHANGE_BADPARAM;
+    }
 
     if (!source_get_full_mode( source, devmode, &full_mode )) ret = DISP_CHANGE_BADMODE;
     else if ((flags & CDS_UPDATEREGISTRY) && !source_set_registry_settings( source, &full_mode )) ret = DISP_CHANGE_NOTUPDATED;
@@ -4457,6 +4503,21 @@ LONG WINAPI NtUserChangeDisplaySettings( UNICODE_STRING *devname, DEVMODEW *devm
     else ret = apply_display_settings( source, &full_mode, hwnd, flags, lparam );
     source_release( source );
 
+    /* iOS-Mythic 2026-05-13: dump the requested mode/result via dprintf (Wine's
+     * ERR() doesn't reliably reach our stderr-capture log on iOS). */
+    if (ret && devmode)
+    {
+        dprintf(STDERR_FILENO,
+             "[iOS NtUserChangeDisplaySettings] devname-ptr=%p req=%lux%lu @%luHz bpp=%lu fields=%#x flags=%#x ret=%d\n",
+             devname,
+             (unsigned long)devmode->dmPelsWidth,
+             (unsigned long)devmode->dmPelsHeight,
+             (unsigned long)devmode->dmDisplayFrequency,
+             (unsigned long)devmode->dmBitsPerPel,
+             (unsigned int)devmode->dmFields,
+             (unsigned int)flags,
+             ret);
+    }
     if (ret) ERR( "Changing %s display settings returned %d.\n", debugstr_us(devname), ret );
     return ret;
 }
