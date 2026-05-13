@@ -579,13 +579,17 @@ struct ContentView: View {
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns
             // For real games this never returns (message loop runs forever), so
-            // the cap is what matters. Bumped to 30s — larger games' compile-heavy
-            // CRT/init phase usually finishes well within this. After detach, the
-            // dual-mapped JIT pool keeps existing blocks executable; only NEW
-            // BRK-based compiles fail. Tested at 120s and saw no additional
-            // progress vs 20s, so the cap isn't the gate.
+            // the cap is what matters. After detach, the dual-mapped JIT pool
+            // keeps existing blocks executable; only NEW BRK-based compiles
+            // fail.
+            //
+            // 2026-05-13 first-frame: Thumper splash renders at ~50s but JIT is
+            // STILL compiling new FMOD blocks 3M log lines later — audio init
+            // is huge (~14k unique RIPs in fmod64.dll alone). Bumped to 300s
+            // to let FMOD finish init before debugger detach; otherwise main
+            // game loop never engages because Present is gated on audio ready.
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 120.0  // safety cap (bumped from 30s — Thumper after WinRT fix continues compiling new code beyond the 30s mark)
+            let maxWait = 300.0  // safety cap (bumped from 120s — FMOD init compiles a LOT of x86 code)
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
