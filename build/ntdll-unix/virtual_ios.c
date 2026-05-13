@@ -7240,6 +7240,25 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
          * Over-syncing is OK: parent is always the source of truth. */
         ERR("iOS NtProtect-sync-check: base=%p sz=0x%lx old=0x%x new=0x%x\n",
             base, (unsigned long)size, old, new_prot);
+        /* iOS-Mythic 2026-05-13: bail out if the new protection makes the
+         * source region unreadable. The sync below memcpys from `base` into
+         * the JIT pool. When the caller is revoking read access (e.g.
+         * PAGE_NOACCESS=1, or any prot without READ bit), the source page
+         * becomes inaccessible and memcpy faults inside Apple's iOS shared
+         * cache (BUS at the SIMD LDP). Each fault is caught by SEH and the
+         * memcpy creeps forward 0x20 bytes per fault — 300s of progress for
+         * one stuck region. Thumper hit this on FMOD's PAGE_NOACCESS guard
+         * pages. No data to copy when the parent is unreadable anyway. */
+        {
+            unsigned read_bits = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                 PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                 PAGE_EXECUTE_WRITECOPY;
+            if (!(new_prot & read_bits))
+            {
+                ERR("iOS NtProtect-sync: SKIP (new_prot=0x%x has no READ bit)\n", new_prot);
+                return status;
+            }
+        }
         if (1)
         {
             int idx;
