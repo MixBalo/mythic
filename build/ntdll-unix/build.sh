@@ -48,6 +48,11 @@ compile_one() {
 
 echo "=== Building ntdll unix (iOS) ==="
 
+# iOS-Mythic 2026-05-13: silent audio driver — provides a null
+# IAudioClock that advances at real time so FMOD's audio-gated rhythm
+# logic in Thumper et al. advances past intro music.
+compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
 
@@ -92,6 +97,7 @@ fi
 echo ""
 echo "=== Building libntdll_unix.a ==="
 ar rcs "$OBJ_DIR/libntdll_unix.a" \
+    "$OBJ_DIR/audio_null_ios.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

@@ -1495,6 +1495,12 @@ static NTSTATUS ios_stub_unix_call(void *args) {
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
 
+/* iOS-Mythic 2026-05-13: null audio driver unix table. Implements the 37
+ * mmdevapi audio funcs to provide a fake "iOS Null" render endpoint with
+ * a real-time IAudioClock — enough for FMOD's rhythm-game timing engine
+ * to advance past audio-gated splash/intro sequences. See audio_null_ios.c */
+extern const void *audio_null_ios_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -1552,6 +1558,11 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)dxmt_winemetal_unix_call_funcs;
             WARN_(module)("iOS: module %p (%s) -> dxmt_winemetal_unix_call_funcs (%p)\n",
                           module, match, dxmt_winemetal_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && (strstr(match, "wineios.drv") || strstr(match, "winecoreaudio") || strstr(match, "winealsa") || strstr(match, "winepulse"))) {
+            *funcs = (const void *)audio_null_ios_unix_call_funcs;
+            ERR("iOS: module %p (%s) -> audio_null_ios_unix_call_funcs (%p)\n",
+                module, match, audio_null_ios_unix_call_funcs);
             status = STATUS_SUCCESS;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
@@ -8013,7 +8024,38 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                 const void *funcs;
                 void *handle;
 
-                if ((status = load_unixlib_by_name( name, &handle ))) return status;
+                if ((status = load_unixlib_by_name( name, &handle )))
+                {
+#ifdef WINE_IOS
+                    /* iOS-Mythic 2026-05-13: no .so files on iOS for audio
+                     * drivers; provide static unix tables for wineios.drv
+                     * (silent audio backend). Match by name; success path
+                     * returns a magic non-NULL handle so subsequent
+                     * MemoryWineUnloadUnixLib doesn't crash. */
+                    char ascii[64] = {0};
+                    unsigned int nlen = name->Length / sizeof(WCHAR);
+                    if (nlen > 0 && nlen < sizeof(ascii))
+                    {
+                        for (unsigned int i = 0; i < nlen; i++)
+                            ascii[i] = (char)(name->Buffer[i] & 0x7f);
+                        ascii[nlen] = 0;
+                        /* lowercase for substr matching */
+                        for (char *p = ascii; *p; p++)
+                            if (*p >= 'A' && *p <= 'Z') *p += 'a' - 'A';
+                        if (strstr(ascii, "wineios") || strstr(ascii, "winecoreaudio") ||
+                            strstr(ascii, "winealsa") || strstr(ascii, "winepulse") ||
+                            strstr(ascii, "wineoss"))
+                        {
+                            ERR("iOS: MemoryWineLoadUnixLibByName %s -> audio_null_ios stub table\n", ascii);
+                            res[0] = (UINT64)(UINT_PTR)1; /* magic non-NULL handle */
+                            res[1] = (UINT64)(UINT_PTR)audio_null_ios_unix_call_funcs;
+                            memcpy( buffer, res, min( len, sizeof(res) ));
+                            return STATUS_SUCCESS;
+                        }
+                    }
+#endif
+                    return status;
+                }
                 res[0] = (UINT_PTR)handle;
                 if (!(status = get_unixlib_funcs( handle, info_class == MemoryWineLoadUnixLibByNameWow64,
                                                   &funcs, &entry )))

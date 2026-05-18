@@ -1096,6 +1096,24 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                 (unsigned long long)g_wine_unix_call_count);
         }
     }
+    /* iOS-Mythic 2026-05-13: stack-cookie failures (STATUS_STACK_BUFFER_OVERRUN
+     * = 0xc0000409) terminate the whole process via __fastfail. On Thumper
+     * we hit these consistently in Thumper's own __report_gsfailure stub
+     * during deep init — root cause is probably FEX miscompiling stack
+     * frames with cookies. Rather than kill the process, kill only the
+     * faulting thread and let the rest of the process continue. Brutal
+     * survival hack; remove once the underlying FEX issue is fixed. */
+    if ((unsigned int)exit_code == 0xc0000409u &&
+        handle == (HANDLE)~(ULONG_PTR)0)  /* current-process pseudo-handle */
+    {
+        static volatile uint64_t g_cookie_skip_count = 0;
+        uint64_t n = ++g_cookie_skip_count;
+        ERR("iOS: STATUS_STACK_BUFFER_OVERRUN — converting process terminate to "
+            "thread terminate (count=%llu). Calling thread dies, game continues.\n",
+            (unsigned long long)n);
+        NtTerminateThread( GetCurrentThread(), exit_code );
+        /* if we somehow return, fall through */
+    }
     /* iOS: if process is already exiting and this is the self-terminate call,
      * go directly to exit_process. The server may return self=false because
      * it already processed the termination, causing an infinite loop. */
