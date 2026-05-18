@@ -988,6 +988,51 @@ static void *ios_mach_exception_thread( void *arg )
                 uint64_t fault_pc_check = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int terminal_pc = (fault_pc_check < 0x100000000ULL ||
                                    (fault_pc_check >> 32) >= 0x300);
+                /* iOS-Mythic 2026-05-15: compact per-fault line + first-seen
+                 * guest RIP tracker. The Thumper fault loop has 13K+ UNHANDLED
+                 * exceptions at JIT-pool PCs; the current cnt<=5 gate hides
+                 * which guest function(s) the loop runs over. Capture State.RIP
+                 * for every fault (cheap, ~80 bytes/line) so we can correlate
+                 * fault PC ranges with guest RIPs offline. */
+                {
+                    uintptr_t teb_q = 0; void *tramp_q = NULL;
+                    ios_lookup_thread(thread, &teb_q, &tramp_q);
+                    void *fex_state_q = NULL;
+                    if (teb_q)
+                    {
+                        void *cpuarea = *(void**)(teb_q + 0x1788);
+                        if (cpuarea) fex_state_q = *(void**)((char*)cpuarea + 0x30);
+                    }
+                    uint64_t state_rip_q = fex_state_q ?
+                        ((uint64_t*)fex_state_q)[0x18 / 8] : 0;
+                    /* First-seen tracker: 32-slot hash by RIP. */
+                    static volatile uint64_t seen_rip[32] = {0};
+                    static volatile uint32_t seen_count[32] = {0};
+                    int slot = (int)((state_rip_q >> 4) & 31);
+                    int first_seen = 0;
+                    if (seen_rip[slot] != state_rip_q)
+                    {
+                        /* Linear probe to find empty / matching slot */
+                        int s;
+                        for (s = 0; s < 32; s++)
+                        {
+                            int k = (slot + s) & 31;
+                            if (seen_rip[k] == state_rip_q) { slot = k; break; }
+                            if (seen_rip[k] == 0 &&
+                                __sync_bool_compare_and_swap(&seen_rip[k], 0, state_rip_q))
+                            { slot = k; first_seen = 1; break; }
+                        }
+                    }
+                    __sync_add_and_fetch(&seen_count[slot], 1);
+                    if (cnt <= 50 || first_seen || (cnt % 500) == 0)
+                    {
+                        dprintf(STDERR_FILENO,
+                            "[fault_rip] cnt=%d rip=0x%llx pc=0x%llx%s\n",
+                            cnt, (unsigned long long)state_rip_q,
+                            (unsigned long long)fault_pc_check,
+                            first_seen ? " [first]" : "");
+                    }
+                }
                 if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)
                 {
                     uint64_t fault_pc = fault_pc_check;
