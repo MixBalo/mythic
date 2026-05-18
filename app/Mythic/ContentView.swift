@@ -107,10 +107,14 @@ struct ContentView: View {
 
                 Divider()
 
-                // Metal render surface for DXMT output.
-                MythicMetalView()
-                    .frame(height: 240)
-                    .background(Color.black)
+                // Metal render surface for DXMT output, with FPS overlay top-right.
+                ZStack(alignment: .topTrailing) {
+                    MythicMetalView()
+                        .frame(height: 240)
+                        .background(Color.black)
+                    FPSOverlay()
+                        .padding(8)
+                }
 
                 Divider()
 
@@ -359,19 +363,44 @@ struct ContentView: View {
     }
 
     private var logConsole: some View {
-        List(logStore.entries.suffix(200)) { entry in
+        let entries = logStore.entries.sorted(by: { $0.lastTimestamp > $1.lastTimestamp })
+        return List(entries) { entry in
             HStack(alignment: .top, spacing: 8) {
+                // Timestamp of LAST occurrence
+                Text(timeString(entry.lastTimestamp))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(width: 64, alignment: .leading)
+                // Level chip
                 Text(entry.level.rawValue)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.system(.caption2, design: .monospaced))
                     .foregroundColor(colorForLevel(entry.level))
-                    .frame(width: 30)
-                Text(entry.message)
+                    .frame(width: 28, alignment: .leading)
+                // Last raw message (the most recent line that matched this signature)
+                Text(entry.lastRaw)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.primary)
+                    .lineLimit(2)
+                // Count badge (only if count > 1)
+                if entry.count > 1 {
+                    Text("×\(entry.count)")
+                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.2))
+                        .cornerRadius(4)
+                        .foregroundColor(.secondary)
+                }
             }
             .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
         }
         .listStyle(.plain)
+    }
+
+    private func timeString(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: date)
     }
 
     private var statusColor: Color {
@@ -589,7 +618,7 @@ struct ContentView: View {
             // to let FMOD finish init before debugger detach; otherwise main
             // game loop never engages because Present is gated on audio ready.
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 300.0  // safety cap (bumped from 120s — FMOD init compiles a LOT of x86 code)
+            let maxWait = 1200.0  // safety cap (bumped from 300s — Thumper's allocator-heavy init churns ~336K times across cache/config/resource tables; 5 min was cutting it off mid-init)
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)

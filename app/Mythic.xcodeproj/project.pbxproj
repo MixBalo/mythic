@@ -10,6 +10,9 @@
 		A1000001 /* MythicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002; };
 		A1000003 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003; };
+		A1000200 /* LogPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000200; };
+		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201; };
+		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202; };
 		A1000004 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004; };
 		A1000005 /* EntitlementChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000A; };
 		A1000006 /* FEXBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A200000B; };
@@ -49,6 +52,9 @@
 		A2000001 /* MythicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MythicApp.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A2000003 /* LogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogStore.swift; sourceTree = "<group>"; };
+		A2000200 /* LogPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogPattern.swift; sourceTree = "<group>"; };
+		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
+		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		A2000004 /* JITAllocator.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = JITAllocator.c; sourceTree = "<group>"; };
 		A2000005 /* JITAllocator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = JITAllocator.h; sourceTree = "<group>"; };
 		A2000006 /* Mythic-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Mythic-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -139,6 +145,9 @@
 				A2000001 /* MythicApp.swift */,
 				A2000002 /* ContentView.swift */,
 				A2000003 /* LogStore.swift */,
+				A2000200 /* LogPattern.swift */,
+				A2000201 /* LogTail.swift */,
+				A2000202 /* FPSOverlay.swift */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
 				A200000B /* FEXBridge.mm */,
@@ -277,6 +286,9 @@
 				A1000001 /* MythicApp.swift in Sources */,
 				A1000002 /* ContentView.swift in Sources */,
 				A1000003 /* LogStore.swift in Sources */,
+				A1000200 /* LogPattern.swift in Sources */,
+				A1000201 /* LogTail.swift in Sources */,
+				A1000202 /* FPSOverlay.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,

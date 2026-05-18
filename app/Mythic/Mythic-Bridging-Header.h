@@ -11,3 +11,7 @@ void wine_log_set_file(const char *path);
 // UI log callback (wine_log_ios.c) — forwards C logs to Swift UI
 typedef void (*wine_ui_log_callback_t)(const char *message);
 void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
+
+// DXMT present counter (winemetal_unix.c) — for SwiftUI FPS overlay
+#include <stdint.h>
+uint64_t mythic_get_present_count(void);
