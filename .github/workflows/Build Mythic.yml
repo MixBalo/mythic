@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 300   # LLVM-for-iOS build below is the long pole
 
     env:
@@ -16,46 +16,46 @@ jobs:
       LLVM_TAG: "llvmorg-15.0.7"
 
     steps:
-      - name: Checkout (with submodules)
+      - name: "Checkout (with submodules)"
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Select Xcode
+      - name: "Select Xcode"
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: Accept Xcode license / first launch
+      - name: "Accept Xcode license / first launch"
         run: |
           sudo xcodebuild -license accept
           sudo xcodebuild -runFirstLaunch
 
-      - name: Download Metal Toolchain component
+      - name: "Download Metal Toolchain component"
         # Needed by the dxmt-ios airconv build (AIR/metallib generation).
         # NOTE: on some hosted runners this can fail unattended without a
         # signed-in Apple ID -- if it does, this is the first thing to check.
         run: sudo xcodebuild -downloadComponent MetalToolchain
 
-      - name: Install build tools (ninja, meson, bison)
+      - name: "Install build tools (ninja, meson, bison)"
         run: brew install ninja meson bison
 
-      - name: Cache heavy toolchains (llvm-mingw + LLVM-for-iOS)
+      - name: "Cache heavy toolchains (llvm-mingw + LLVM-for-iOS)"
         id: cache-toolchains
         uses: actions/cache@v4
         with:
           path: toolchains
           key: mythic-toolchains-v1-${{ env.LLVM_MINGW_VERSION }}-${{ env.LLVM_TAG }}
 
-      - name: Download llvm-mingw (aarch64-w64-mingw32 cross toolchain)
+      - name: "Download llvm-mingw (aarch64-w64-mingw32 cross toolchain)"
         if: steps.cache-toolchains.outputs.cache-hit != 'true'
         run: |
           mkdir -p toolchains
           curl -L "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-macos-universal.tar.xz" \
             | tar -xJ -C toolchains/
 
-      - name: Fetch LLVM 15.0.7 source (llvm/ subtree only)
+      - name: "Fetch LLVM 15.0.7 source (llvm/ subtree only)"
         if: steps.cache-toolchains.outputs.cache-hit != 'true'
         run: |
           git clone --filter=blob:none --no-checkout --depth 1 --branch "$LLVM_TAG" \
@@ -68,14 +68,14 @@ jobs:
           sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
             llvm/cmake/modules/AddLLVM.cmake
 
-      - name: Build host llvm-tblgen (stage 1)
+      - name: "Build host llvm-tblgen (stage 1)"
         if: steps.cache-toolchains.outputs.cache-hit != 'true'
         run: |
           cmake -G Ninja -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build \
             -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD=AArch64
           cmake --build toolchains/llvm-host-build --target llvm-tblgen -- -j"$(sysctl -n hw.ncpu)"
 
-      - name: Build LLVM static libs for iOS-aarch64 (stage 2)
+      - name: "Build LLVM static libs for iOS-aarch64 (stage 2)"
         if: steps.cache-toolchains.outputs.cache-hit != 'true'
         run: |
           cmake -G Ninja -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build \
@@ -90,7 +90,7 @@ jobs:
             -DLLVM_TARGETS_TO_BUILD=AArch64
           cmake --build toolchains/llvm-ios-build -- -j"$(sysctl -n hw.ncpu)"
 
-      - name: Configure Wine for macOS host (build-macos)
+      - name: "Configure Wine for macOS host (build-macos)"
         # Generates wine/build-macos/include/config.h that build/ntdll-unix,
         # build/win32u-unix and build/wineserver all `-include`.
         # UNVERIFIED: exact configure flags aren't documented in-repo; if this
@@ -104,15 +104,15 @@ jobs:
             --without-cups --without-sane --without-gphoto --without-vulkan \
             --disable-tests
 
-      - name: Build winebuild tool
+      - name: "Build winebuild tool"
         run: |
           export PATH="/opt/homebrew/opt/bison/bin:/usr/local/opt/bison/bin:$PATH"
           make -C wine/build-macos/tools/winebuild -j"$(sysctl -n hw.ncpu)"
 
-      - name: Build libntdll_unix.a
+      - name: "Build libntdll_unix.a"
         run: ./build/ntdll-unix/build.sh
 
-      - name: Build libwin32u_unix.a
+      - name: "Build libwin32u_unix.a"
         run: ./build/win32u-unix/build.sh
 
       - name: Build libwineserver.a
@@ -123,7 +123,7 @@ jobs:
         # that base-archive build step is added/committed.
         run: ./build/wineserver/build.sh
 
-      - name: Build FEXCore static libs for iOS
+      - name: "Build FEXCore static libs for iOS"
         # UNVERIFIED: FEX/CMakeLists.txt supports CMAKE_SYSTEM_NAME=iOS but no
         # iOS toolchain invocation is committed anywhere in this repo or its
         # forked submodule history -- flags below are a best-effort reconstruction.
@@ -138,7 +138,7 @@ jobs:
             -DENABLE_LTO=FALSE -DENABLE_CCACHE=FALSE -DENABLE_OFFLINE_TELEMETRY=FALSE
           cmake --build FEX/build-ios -- -j"$(sysctl -n hw.ncpu)"
 
-      - name: Build DXMT (PE side: d3d11/dxgi/winemetal/d3d10core DLLs)
+      - name: "Build DXMT (PE side: d3d11/dxgi/winemetal/d3d10core DLLs)"
         run: |
           ln -sfn ../../toolchains research/dxmt/toolchains
           export MINGW_BIN="$PWD/toolchains/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-macos-universal/bin"
@@ -153,14 +153,14 @@ jobs:
              build-pe/src/winemetal/winemetal.dll build-pe/src/d3d10/d3d10core.dll \
              ../../app/Mythic/aarch64-windows/
 
-      - name: Build DXMT (unix side: libdxmt_combined.a)
+      - name: "Build DXMT (unix side: libdxmt_combined.a)"
         run: |
           ./build/dxmt-ios/build.sh
           xcrun -sdk iphoneos libtool -static -o build/dxmt-ios/libdxmt_combined.a \
             build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
           cp build/dxmt-ios/libdxmt_combined.a app/Mythic/
 
-      - name: Generate Xcode scheme
+      - name: "Generate Xcode scheme"
         # No shared scheme is committed (xcuserdata/xcshareddata are gitignored),
         # but `xcodebuild archive` requires one. Derived directly from the
         # Mythic target's UUID (A5000001) in project.pbxproj.
@@ -187,7 +187,7 @@ jobs:
           </Scheme>
           EOF
 
-      - name: Archive (unsigned)
+      - name: "Archive (unsigned)"
         run: |
           xcodebuild archive \
             -project app/Mythic.xcodeproj \
@@ -198,13 +198,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM=""
 
-      - name: Package unsigned IPA
+      - name: "Package unsigned IPA"
         run: |
           mkdir -p ipa/Payload
           cp -R build/Mythic.xcarchive/Products/Applications/Mythic.app ipa/Payload/
           cd ipa && zip -r ../Mythic-unsigned.ipa Payload
 
-      - name: Upload IPA
+      - name: "Upload IPA"
         uses: actions/upload-artifact@v4
         with:
           name: Mythic-unsigned-ipa
