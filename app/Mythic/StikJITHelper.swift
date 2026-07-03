@@ -94,13 +94,23 @@ enum StikJITHelper {
         // freeing them could let iOS reuse them and cause aliasing issues.
         var pinChunks: [vm_address_t] = []
         let chunkSize = 16 * 1024 * 1024  // 16 MB per chunk
-        let numChunks = 6                  // 96 MB total
-        for i in 0..<numChunks {
+        // Pin until the allocation frontier crosses the mode-A threshold
+        // (0x119000000) instead of a fixed 96MB. A fixed count loses the
+        // ASLR lottery whenever the base slide is low (observed 2026-07-03:
+        // 6 chunks ended at 0x118790000, pool landed 8.4MB short of the
+        // threshold and the run fast-failed). vm_allocate is zero-fill
+        // reserve-only, so extra chunks don't add resident footprint.
+        // The BAD POOL check below stays as the safety net for non-
+        // sequential placements.
+        let pinTarget: vm_address_t = 0x119000000
+        let maxChunks = 32                 // safety cap (512 MB of reservation)
+        for i in 0..<maxChunks {
             var addr: vm_address_t = 0
             let kr = vm_allocate(mach_task_self_, &addr, vm_size_t(chunkSize), VM_FLAGS_ANYWHERE)
             if kr == KERN_SUCCESS {
                 pinChunks.append(addr)
                 LogStore.shared.log(String(format: "JIT-pool pin chunk %d at 0x%lx (16MB)", i, Int(addr)))
+                if addr + vm_address_t(chunkSize) >= pinTarget { break }
             } else {
                 LogStore.shared.log("JIT-pool pin chunk \(i) FAILED kr=\(kr)", level: .error)
                 break

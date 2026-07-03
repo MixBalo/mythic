@@ -8,12 +8,54 @@ import os.log
 // Also captures touches and forwards them to winios.drv as mouse events.
 final class MetalBackedView: UIView {
     override class var layerClass: AnyClass { return CAMetalLayer.self }
+
+    // 2026-07-03: keep the ProMotion/LTPO panel refreshing while the game
+    // runs. Without any system-visible animation the panel idles down to
+    // ~1Hz, DXMT's presentDrawableAfterMinimumDuration paces against that
+    // dead display timeline (~1 present/s), and presented frames never
+    // reach glass — the intermittent "presents count on a black screen
+    // until a screenshot/touch forces a composite" failure. A live
+    // CADisplayLink with a pinned frame-rate range keeps the display
+    // timeline active; the callback intentionally does nothing.
+    private var displayLink: CADisplayLink?
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         self.isMultipleTouchEnabled = false
         self.isUserInteractionEnabled = true
     }
     required init?(coder: NSCoder) { super.init(coder: coder) }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            if displayLink == nil {
+                let link = CADisplayLink(target: self, selector: #selector(displayTick))
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+                LogStore.shared.log("DisplayLink active (30-120Hz pinned) — panel idle-refresh workaround")
+            }
+        } else {
+            displayLink?.invalidate()
+            displayLink = nil
+        }
+    }
+
+    @objc private func displayTick(_ link: CADisplayLink) {
+        // 2026-07-03: force the render server to re-composite this layer on
+        // every tick. Direct drawable presentations never flip on iOS 27 in
+        // this hosting configuration — user screenshots (forced composites)
+        // were the only thing making presented frames visible, roughly one
+        // queued presentation completing per composite. Nudging a benign
+        // animatable property server-side re-reads the layer's current
+        // contents each vsync — the in-app equivalent, continuously.
+        guard let l = self.layer as? CAMetalLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        l.opacity = (l.opacity >= 1.0) ? 0.9999 : 1.0
+        CATransaction.commit()
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -618,11 +660,32 @@ struct ContentView: View {
             // to let FMOD finish init before debugger detach; otherwise main
             // game loop never engages because Present is gated on audio ready.
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 1200.0  // safety cap (bumped from 300s — Thumper's allocator-heavy init churns ~336K times across cache/config/resource tables; 5 min was cutting it off mid-init)
+            // 2026-07-03 early detach: attached-mode runs the whole guest
+            // ~2x slower (measured 1.2s → 0.74s per present at detach) and
+            // on iOS 27 presented frames only reliably reach glass after
+            // detach. Post-detach is safe now: trap-mode JIT writes go via
+            // the Mach emulator (no debugger), pool pages are pre-executable
+            // (dual map), page0 runs once on the first thread, and a
+            // post-detach compile was observed working (real_compiles
+            // 7093→7094, no faults). So: detach once the game is actually
+            // presenting (present #2 = first post-splash frame) plus a
+            // settle window, instead of waiting out the full 1200s cap.
+            let maxWait = 1200.0  // hard safety cap (unchanged)
+            let settleAfterPresent2 = 60.0
+            var presentingSince: CFAbsoluteTime? = nil
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
-                if CFAbsoluteTimeGetCurrent() - pollStart > maxWait {
+                let now = CFAbsoluteTimeGetCurrent()
+                if presentingSince == nil && mythic_get_present_count() >= 2 {
+                    presentingSince = now
+                    logStore.log("Game is presenting (#2 reached) — early detach in \(Int(settleAfterPresent2))s")
+                }
+                if let t = presentingSince, now - t > settleAfterPresent2 {
+                    logStore.log("Early detach: game presenting and settled", level: .success)
+                    break
+                }
+                if now - pollStart > maxWait {
                     logStore.log("Wine still running after \(Int(maxWait))s, proceeding with detach", level: .error)
                     break
                 }

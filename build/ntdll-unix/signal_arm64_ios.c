@@ -3781,7 +3781,19 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
      * [x18+offset] reads real TEB data from our mapping.
      * If all mapping approaches fail, the Mach exception handler
      * is the last resort for x18 restoration. */
-    {
+    /* 2026-07-03: attempt the page0 chain ONCE PER PROCESS, not per thread.
+     * Page 0 is process-global (and can only hold one thread's TEB anyway),
+     * so re-running M1-M8 on every new thread only re-fails. Worse, the M8
+     * debugger BRK is FATAL on threads created after the debugger detaches:
+     * with no debugger, the BRK trap unwinds through a handler chain that
+     * (with x18=0 on a fresh thread) calls a raw non-executable ntdll PE
+     * address → undispatchable BUS → NtTerminateProcess. Observed killing
+     * Thumper's worker-thread spawn at ~2:30 (thread 0054, splash wall). */
+    static int ios_page0_attempted = 0;
+    if (ios_page0_attempted) {
+        ERR("page0: already attempted by first thread — skipping (Mach handler covers x18=0)\n");
+    } else {
+        ios_page0_attempted = 1;
         kern_return_t kr;
         int mapped = 0;
         uintptr_t teb_page = (uintptr_t)teb & ~0x3FFFULL;

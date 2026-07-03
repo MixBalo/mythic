@@ -2860,6 +2860,15 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     /* If mach_vm_region returned a region above scan,
                      * scan is unmapped — skip ahead to that region's start. */
                     if ((char *)qa > scan) break;
+                    /* Mapped but not readable (PROT_NONE reservation, or
+                     * exec-only JIT page): dereferencing faults even though
+                     * vm_region reports a region. A PE image is contiguously
+                     * readable, so a non-readable page means we've walked
+                     * below the image — stop the scan. (Seen 2026-07-03:
+                     * X64ReturnInstr's anon-RWX VA sat above a PROT_NONE
+                     * Wine reservation; the scan deref'd it, the resulting
+                     * UNHANDLED faults derailed the whole redirect.) */
+                    if (!(qinfo.protection & VM_PROT_READ)) break;
                 }
                 if (*(unsigned short *)scan == 0x5A4D)  /* MZ */
                 {

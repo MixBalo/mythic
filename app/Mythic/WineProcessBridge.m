@@ -13,6 +13,7 @@
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
 #include "PrefixExtractor.h"
+#include "FEXBridge.h"  // fex_get_jit_write_offset()
 
 // Thread-local globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
 // Each Wine "process" thread has its own jmpbuf so child processes can exit independently.
@@ -89,8 +90,34 @@ static void *wine_process_thread(void *arg) {
             LOG("WINEDLLPATH=%{public}s", bundlePath.UTF8String);
         }
 
-        // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
+        /* Wine trace channels.
+         *
+         * 2026-05-19 perf pivot: the verbose default (err+all, fixme+all,
+         * warn+module, warn+file, trace+process, trace+module, trace+loaddll,
+         * trace+loadorder, trace+win, trace+user32, trace+syscall, trace+file)
+         * was generating ~220 KB/sec of log writes — the dominant source of
+         * the 1.35s-per-frame menu rendering. trace+syscall + trace+file alone
+         * are likely 90%+ of the volume (every Nt* call writes 3-5 log lines).
+         *
+         * Default is now PERF: only err+all (so we still see real failures).
+         * For debugging, set MYTHIC_DEBUG_VERBOSE=1 in the environment to
+         * restore the full trace channel set. */
+        {
+            const char *verbose = getenv("MYTHIC_DEBUG_VERBOSE");
+            if (verbose && *verbose && *verbose != '0') {
+                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
+                LOG("WINEDEBUG = verbose (MYTHIC_DEBUG_VERBOSE set)");
+            } else {
+                /* err+all keeps real failure messages, but subtract err+virtual
+                 * because our iOS virtual_ios.c uses ERR() for informational
+                 * traces ("iOS vm_protect RW+COPY OK", "iOS JIT: pool size",
+                 * "iOS JIT: copied image"). Those produce thousands of lines
+                 * per boot. Real failures in virtual_ios.c use distinctive
+                 * FATAL/FAIL prefixes our app surfaces via other paths. */
+                setenv("WINEDEBUG", "err+all,err-virtual", 1);
+                LOG("WINEDEBUG = err+all,err-virtual (perf default — set MYTHIC_DEBUG_VERBOSE=1 for full trace)");
+            }
+        }
 
         // Phase 3D investigation: re-enabled. Investigation C concluded
         // wineserver dispatch is fine; the `ws_log drops at high rate`
@@ -109,6 +136,26 @@ static void *wine_process_thread(void *arg) {
         setenv("SteamAppId",  "356400", 1);
         LOG("setenv check: SteamAppPath=%{public}s SteamGameId=%{public}s",
             getenv("SteamAppPath"), getenv("SteamGameId"));
+
+        /* iOS-Mythic 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
+         * xtajit64.dll (its own FEXCore copy reads this via getenv in
+         * ProcessInit). Set HERE — beside SteamAppPath, the point where
+         * Wine snapshots the environment — so it forwards reliably; setting
+         * it in FEXBridge.mm::jit_pool_init was too early and did not reach
+         * Wine's GetEnvironmentVariableW. jit_pool_init has already run by
+         * now (fex_initialize is a prerequisite for launching the guest),
+         * so the offset is available. */
+        {
+            int64_t jit_off = fex_get_jit_write_offset();
+            if (jit_off != 0) {
+                char off_str[32];
+                snprintf(off_str, sizeof(off_str), "0x%llx", (unsigned long long)jit_off);
+                setenv("MYTHIC_JIT_WRITE_OFFSET", off_str, 1);
+                LOG("setenv MYTHIC_JIT_WRITE_OFFSET=%{public}s", off_str);
+            } else {
+                LOG("WARNING: fex_get_jit_write_offset() returned 0 — JIT pool not initialized?");
+            }
+        }
 
         /* iOS-Mythic: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
          * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which
@@ -214,6 +261,19 @@ static void *wine_process_thread(void *arg) {
                      * directly in ARM64 — no FEX bridging on the exception
                      * path. Other vcruntime/msvcp/concrt DLLs still overlay. */
                     if ([[dll lowercaseString] isEqualToString:@"vcruntime140.dll"]) {
+                        vcrtSkipped++;
+                        continue;
+                    }
+                    /* msvcp140.dll: same exemption as vcruntime140, found
+                     * 2026-07-03. The MS x86_64 msvcp140 throws a C++
+                     * exception during its own DllMain; the x86 throw-record
+                     * builder calls RtlPcToFileHeader cross-arch and the
+                     * exception-path exit thunk corrupts guest RSP — the
+                     * returned module base lands in the return-address slot
+                     * and RIP jumps to the MZ header (NoExec loop, no
+                     * splash). Keep the ARM64EC builtin so msvcp140's EH
+                     * runs natively, like vcruntime140. */
+                    if ([[dll lowercaseString] isEqualToString:@"msvcp140.dll"]) {
                         vcrtSkipped++;
                         continue;
                     }

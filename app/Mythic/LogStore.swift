@@ -25,8 +25,17 @@ final class LogStore: ObservableObject {
     private var pendingUpdates: [(index: Int, count: Int, lastRaw: String, lastTimestamp: Date)] = []
     private var flushTimer: Timer?
 
-    /// When true, UI flush is skipped (entries still tracked in storage).
-    var uiPaused = false
+    /// When true, UI flushes slowly (1.5s) instead of normally (200ms). Used
+    /// during Wine runtime so SwiftUI list churn doesn't drag frame pacing.
+    /// Tail reader keeps running either way — pending entries just batch up
+    /// longer before reaching @Published. Setting this restarts the timer.
+    var uiPaused = false {
+        didSet { if oldValue != uiPaused { rescheduleFlush() } }
+    }
+
+    // Flush intervals (seconds)
+    private let fastFlushInterval: TimeInterval = 0.2
+    private let slowFlushInterval: TimeInterval = 1.5
 
     // Cap on distinct entries kept in memory
     private let maxEntries = 200
@@ -55,12 +64,9 @@ final class LogStore: ObservableObject {
         // Clear log file on each launch (was the behavior before)
         try? "".write(to: logFileURL, atomically: true, encoding: .utf8)
 
-        // Start batch flush timer on main thread (200ms = responsive but not
-        // hammering SwiftUI)
+        // Start batch flush timer on main thread. Interval depends on uiPaused.
         DispatchQueue.main.async {
-            self.flushTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-                self?.flushPending()
-            }
+            self.rescheduleFlush()
         }
 
         // Tail the log file. Reads everything Wine + DXMT + FEX write via
@@ -143,9 +149,22 @@ final class LogStore: ObservableObject {
         return false
     }
 
-    /// Apply pending changes to @Published entries (main thread, every 200ms).
+    /// Reschedule flush timer with the appropriate interval for the current
+    /// uiPaused state. Always runs on main RunLoop.
+    private func rescheduleFlush() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.flushTimer?.invalidate()
+            let interval = self.uiPaused ? self.slowFlushInterval : self.fastFlushInterval
+            self.flushTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                self?.flushPending()
+            }
+        }
+    }
+
+    /// Apply pending changes to @Published entries (main thread).
+    /// Runs on main thread, interval determined by uiPaused.
     private func flushPending() {
-        guard !uiPaused else { return }
 
         stateLock.lock()
         let newBatch = pendingNew
@@ -187,7 +206,11 @@ final class LogStore: ObservableObject {
             }
         }
 
-        // Append new entries
+        // Append new entries. sigToIndex is read/written by handleRawLine on
+        // Wine threads, so every mutation of it here MUST hold stateLock —
+        // the unlocked writes corrupted the dictionary and threw an
+        // NSException on the wineserver thread (2026-07-03).
+        stateLock.lock()
         for entry in collapsedNew {
             entries.append(entry)
             let newIndex = entries.count - 1
@@ -210,6 +233,7 @@ final class LogStore: ObservableObject {
             sigToIndex.removeAll()
             for (i, e) in entries.enumerated() { sigToIndex[e.signature] = i }
         }
+        stateLock.unlock()
     }
 
     /// Manual clear (used by UI button)
