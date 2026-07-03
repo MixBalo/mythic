@@ -90,6 +90,29 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
                     hwnd, flags, x, y, ret);
     }
 }
+
+/* Keyboard sibling of winios_drv_post_key: packages an INPUT_KEYBOARD
+ * event. vk is a Windows virtual-key code (VK_RETURN=0x0D, VK_SPACE=0x20,
+ * VK_ESCAPE=0x1B, ...); flags is 0 for key-down, KEYEVENTF_KEYUP (0x2)
+ * for key-up. Scan code derived via the default layout so games reading
+ * scan codes (DirectInput-style) see something plausible. */
+void winios_drv_post_key(unsigned short vk, unsigned int flags)
+{
+    INPUT input = {0};
+    input.type           = INPUT_KEYBOARD;
+    input.ki.wVk         = vk;
+    input.ki.wScan       = 0;
+    input.ki.dwFlags     = flags;
+    input.ki.time        = 0;
+    input.ki.dwExtraInfo = 0;
+
+    BOOL ret = NtUserSendHardwareInput( NULL, 0, &input, 0 );
+    {
+        static unsigned cnt;
+        if (cnt++ < 40)
+            dprintf(2, "[winios] drv_post_key vk=0x%x flags=0x%x -> %d\n", vk, flags, ret);
+    }
+}
 #endif
 
 static INT nulldrv_AbortDoc( PHYSDEV dev )

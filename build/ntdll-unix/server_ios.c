@@ -2107,6 +2107,60 @@ void server_init_process_done(void)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                 dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ sample_thread(2); });
         }
+
+        /* iOS-Mythic 2026-07-03 sampling profiler for the 30 FPS hunt.
+         * Every prior frame-cost theory (L1 misses, drawable stalls, DXMT
+         * encode) was eliminated by measurement; this samples the game
+         * thread's PC at ~500Hz forever and prints a 256-byte-bucket
+         * histogram every 4096 samples (~10s). Buckets land in one of:
+         * JIT pool (guest blocks / dispatcher / module copies), app binary
+         * (unix side), or elsewhere — mapping the hot buckets tells us
+         * where the ~1.4s/frame actually goes. Counts halve at each print
+         * so the histogram tracks the current phase. */
+        {
+            pthread_t prof_pthread = pthread_self();
+            mach_port_t prof_thread = pthread_mach_thread_np(prof_pthread);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                enum { PROF_SLOTS = 512 };
+                static uint64_t prof_keys[PROF_SLOTS];
+                static uint32_t prof_counts[PROF_SLOTS];
+                uint64_t total = 0;
+                for (;;) {
+                    usleep(2000);
+                    if (thread_suspend(prof_thread) != KERN_SUCCESS) { usleep(200000); continue; }
+                    arm_thread_state64_t st;
+                    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                    kern_return_t kr = thread_get_state(prof_thread, ARM_THREAD_STATE64,
+                                                        (thread_state_t)&st, &cnt);
+                    thread_resume(prof_thread);
+                    if (kr != KERN_SUCCESS) continue;
+                    uint64_t key = arm_thread_state64_get_pc(st) >> 8;
+                    int i, free_i = -1;
+                    for (i = 0; i < PROF_SLOTS; i++) {
+                        if (prof_counts[i] && prof_keys[i] == key) { prof_counts[i]++; break; }
+                        if (!prof_counts[i] && free_i < 0) free_i = i;
+                    }
+                    if (i == PROF_SLOTS && free_i >= 0) { prof_keys[free_i] = key; prof_counts[free_i] = 1; }
+                    total++;
+                    if ((total % 4096) == 0) {
+                        /* top-10 by count (simple selection; 512 slots) */
+                        char line[512]; int len = 0;
+                        len += snprintf(line + len, sizeof(line) - len, "[PROF] n=%llu top:", (unsigned long long)total);
+                        for (int rank = 0; rank < 10 && len < (int)sizeof(line) - 40; rank++) {
+                            int best = -1; uint32_t bc = 0;
+                            for (i = 0; i < PROF_SLOTS; i++)
+                                if (prof_counts[i] > bc) { bc = prof_counts[i]; best = i; }
+                            if (best < 0 || bc == 0) break;
+                            len += snprintf(line + len, sizeof(line) - len, " 0x%llx00*%u",
+                                            (unsigned long long)prof_keys[best], bc);
+                            prof_counts[best] = 0; /* consumed; decay below repopulates */
+                        }
+                        dprintf(STDERR_FILENO, "%s\n", line);
+                        for (i = 0; i < PROF_SLOTS; i++) prof_counts[i] >>= 1;
+                    }
+                }
+            });
+        }
     }
 #endif
     signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );

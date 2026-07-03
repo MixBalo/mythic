@@ -37,6 +37,10 @@ void winios_post_touch_down(int x, int y);
 void winios_post_touch_move(int x, int y);
 void winios_post_touch_up(int x, int y);
 
+/* Key press bridge (VK codes: RETURN=0x0D SPACE=0x20 ESCAPE=0x1B).
+ * down=1 press, down=0 release. */
+void winios_post_key(int vk, int down);
+
 #ifdef __cplusplus
 }
 #endif

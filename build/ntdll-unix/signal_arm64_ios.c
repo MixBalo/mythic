@@ -347,6 +347,31 @@ static void *ios_mach_exception_thread( void *arg )
         thread_t thread = req->thread.name;
         int handled = 0;
 
+        /* 2026-07-03 storm probe: ~40K Mach exceptions PER PRESENT measured
+         * in the menu phase (~all of the 1.4s frame time at ~33us each).
+         * Sample every 4096th message: exception type + faulting PC + insn
+         * so the trap source is nameable from one run. */
+        if ((ios_exc_msg_count & 0xFFF) == 0)
+        {
+            arm_thread_state64_t pstate;
+            mach_msg_type_number_t pcount = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state( thread, ARM_THREAD_STATE64,
+                                  (thread_state_t)&pstate, &pcount ) == KERN_SUCCESS)
+            {
+                uint64_t ppc = arm_thread_state64_get_pc( pstate );
+                uint32_t pinsn = 0;
+                vm_size_t psz = sizeof(pinsn);
+                vm_read_overwrite( mach_task_self(), ppc, sizeof(pinsn),
+                                   (vm_address_t)&pinsn, &psz );
+                dprintf(STDERR_FILENO,
+                        "[EXC_SAMPLE] #%d exc=%d code0=0x%llx pc=0x%llx insn=0x%08x lr=0x%llx\n",
+                        ios_exc_msg_count, req->exception,
+                        (unsigned long long)(req->code_count > 1 ? req->code[1] : req->code[0]),
+                        (unsigned long long)ppc, pinsn,
+                        (unsigned long long)pstate.__lr);
+            }
+        }
+
         /* Look up per-thread TEB and trampoline for the faulting thread */
         uintptr_t thread_teb = 0;
         void *thread_trampoline = NULL;

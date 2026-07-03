@@ -104,11 +104,16 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #define MOUSEEVENTF_ABSOLUTE    0x8000
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
+extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
 
 #define WINIOS_RING_SIZE 256
+#define WINIOS_EV_MOUSE 0
+#define WINIOS_EV_KEY   1
+#define KEYEVENTF_KEYUP 0x0002
 typedef struct {
-    int x, y;
-    unsigned int flags;
+    unsigned int type;       /* WINIOS_EV_MOUSE / WINIOS_EV_KEY */
+    int x, y;                /* mouse: coords; key: x = virtual-key code */
+    unsigned int flags;      /* mouse: MOUSEEVENTF_*; key: KEYEVENTF_* */
 } winios_input_event_t;
 
 static struct {
@@ -118,11 +123,11 @@ static struct {
     pthread_mutex_t lock;
 } g_input_q = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-static void winios_q_push(int x, int y, unsigned int flags) {
+static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags) {
     pthread_mutex_lock(&g_input_q.lock);
     unsigned int next = (g_input_q.head + 1) % WINIOS_RING_SIZE;
     if (next != g_input_q.tail) {
-        g_input_q.buf[g_input_q.head] = (winios_input_event_t){x, y, flags};
+        g_input_q.buf[g_input_q.head] = (winios_input_event_t){type, x, y, flags};
         g_input_q.head = next;
     }
     /* If buffer is full we drop the oldest event by simply not advancing —
@@ -136,7 +141,7 @@ static void winios_q_push(int x, int y, unsigned int flags) {
  * what DXMT swapchains use. */
 void winios_post_touch_down(int x, int y) {
     fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
-    winios_q_push(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE);
+    winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE);
 }
 
 void winios_post_touch_move(int x, int y) {
@@ -144,12 +149,19 @@ void winios_post_touch_move(int x, int y) {
     if ((cnt++ % 30) == 0) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
-    winios_q_push(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE);
+    winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE);
 }
 
 void winios_post_touch_up(int x, int y) {
     fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
-    winios_q_push(x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE);
+    winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE);
+}
+
+/* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
+ * 0 for release. Queued like mouse events; drained in pProcessEvents. */
+void winios_post_key(int vk, int down) {
+    fprintf(stderr, "[winios] post_key vk=0x%x down=%d\n", vk, down); fflush(stderr);
+    winios_q_push_ev(WINIOS_EV_KEY, vk, 0, down ? 0 : KEYEVENTF_KEYUP);
 }
 
 BOOL winios_pProcessEvents(DWORD mask) {
@@ -169,8 +181,11 @@ BOOL winios_pProcessEvents(DWORD mask) {
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 
-        fprintf(stderr, "[winios] drain x=%d y=%d flags=0x%x\n", e.x, e.y, e.flags); fflush(stderr);
-        winios_drv_post_mouse(e.x, e.y, e.flags, 0, NULL);
+        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        if (e.type == WINIOS_EV_KEY)
+            winios_drv_post_key((unsigned short)e.x, e.flags);
+        else
+            winios_drv_post_mouse(e.x, e.y, e.flags, 0, NULL);
         drained = TRUE;
     }
     return drained;

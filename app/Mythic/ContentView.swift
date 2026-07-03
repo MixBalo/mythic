@@ -4,66 +4,103 @@ import QuartzCore
 import Metal
 import os.log
 
-// UIView whose backing layer is a CAMetalLayer (what DXMT renders into).
-// Also captures touches and forwards them to winios.drv as mouse events.
-final class MetalBackedView: UIView {
-    override class var layerClass: AnyClass { return CAMetalLayer.self }
+// 2026-07-03 window-hosted Metal layer.
+//
+// The presenting CAMetalLayer must NOT be a SwiftUI-hosted view's backing
+// layer: on iOS 26/27, SwiftUI's hosting intermittently routes such layers
+// through an indirect/snapshot path where direct Metal presentations are
+// silently dropped — presented drawables complete with presentedTime==0
+// (measured), the screen freezes on stale content, and only full-tree
+// re-renders (screenshots) reveal new frames. Which path a given run gets
+// appeared random — the "sometimes rendering starts at present #9,
+// sometimes never" lottery.
+//
+// So the layer now lives in MetalHostView, a raw UIView added directly to
+// the UIWindow (classic game setup, no SwiftUI management). The SwiftUI-
+// hosted MetalBackedView remains as a transparent layout placeholder that
+// tracks geometry and handles touch input. The host view sits on top of
+// the window but has interaction disabled, so touches fall through to the
+// SwiftUI hierarchy (and thus to the placeholder's touch handlers).
 
-    // 2026-07-03: keep the ProMotion/LTPO panel refreshing while the game
-    // runs. Without any system-visible animation the panel idles down to
-    // ~1Hz, DXMT's presentDrawableAfterMinimumDuration paces against that
-    // dead display timeline (~1 present/s), and presented frames never
-    // reach glass — the intermittent "presents count on a black screen
-    // until a screenshot/touch forces a composite" failure. A live
-    // CADisplayLink with a pinned frame-rate range keeps the display
-    // timeline active; the callback intentionally does nothing.
-    private var displayLink: CADisplayLink?
+/// Raw window-level host for the presenting CAMetalLayer.
+final class MetalHostView: UIView {
+    override class var layerClass: AnyClass { return CAMetalLayer.self }
+    var metalLayer: CAMetalLayer { return layer as! CAMetalLayer }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false   // touches fall through to SwiftUI
+        backgroundColor = .black
+        contentScaleFactor = UIScreen.main.scale
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+        // 2026-07-03 MeloNX trick: displaySyncEnabled is macOS-public but
+        // exists as PRIVATE API on iOS. Disabling it takes our presents out
+        // of the display-sync scheduling machinery — the thing that has been
+        // silently dropping them (presentedTime==0 on all but occasional
+        // frames) at our sub-1Hz game present cadence. MeloNX (shipping
+        // Switch emulator) sets exactly this pair on its layer.
+        let syncSel = NSSelectorFromString("setDisplaySyncEnabled:")
+        if metalLayer.responds(to: syncSel) {
+            metalLayer.perform(syncSel, with: NSNumber(value: false))
+            LogStore.shared.log("MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)")
+        }
+        let fpsSel = NSSelectorFromString("setNominalFramesPerSecond:")
+        if metalLayer.responds(to: fpsSel) {
+            metalLayer.perform(fpsSel, with: 60 as NSNumber)
+        }
+        UIApplication.shared.isIdleTimerDisabled = true
+        // Set once so DXMT's swapchain setup never blocks on a zero-sized
+        // layer. After this, DXMT's setProps is the ONLY drawableSize
+        // writer — per-layout rewrites from the app were a second writer
+        // fighting it (pool churn on every SwiftUI layout pass).
+        metalLayer.drawableSize = CGSize(width: 800, height: 600)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// SwiftUI-hosted placeholder: geometry + touch input only.
+final class MetalBackedView: UIView {
+    private var hostView: MetalHostView?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         self.isMultipleTouchEnabled = false
         self.isUserInteractionEnabled = true
+        self.backgroundColor = .clear
     }
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
+    // Visibility-stall postmortem (2026-07-03): the intermittent "presents
+    // count but the screen stays black until a bg/fg or screenshot" state
+    // was probed exhaustively — drawable leaks, present pacing, panel idle,
+    // SwiftUI hosting, display-sync, CADisplayLink, transaction nudges and
+    // view re-attach kicks were all eliminated (none changed it; only true
+    // scene-level lifecycle events land pending frames, ~1-2 each). The one
+    // robust correlate is present cadence: 60 FPS content always displays,
+    // ~1 FPS content mostly doesn't. Resolution path: raise game FPS (perf
+    // work), with a steady-rate re-present in DXMT as fallback insurance.
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window != nil {
-            if displayLink == nil {
-                let link = CADisplayLink(target: self, selector: #selector(displayTick))
-                link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
-                link.add(to: .main, forMode: .common)
-                displayLink = link
-                LogStore.shared.log("DisplayLink active (30-120Hz pinned) — panel idle-refresh workaround")
+        if let w = window {
+            if hostView == nil {
+                let host = MetalHostView(frame: convert(bounds, to: w))
+                w.addSubview(host)
+                hostView = host
+                mythic_display_set_layer(host.metalLayer)
+                LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted)", level: .success)
             }
         } else {
-            displayLink?.invalidate()
-            displayLink = nil
+            hostView?.removeFromSuperview()
+            hostView = nil
         }
-    }
-
-    @objc private func displayTick(_ link: CADisplayLink) {
-        // 2026-07-03: force the render server to re-composite this layer on
-        // every tick. Direct drawable presentations never flip on iOS 27 in
-        // this hosting configuration — user screenshots (forced composites)
-        // were the only thing making presented frames visible, roughly one
-        // queued presentation completing per composite. Nudging a benign
-        // animatable property server-side re-reads the layer's current
-        // contents each vsync — the in-app equivalent, continuously.
-        guard let l = self.layer as? CAMetalLayer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        l.opacity = (l.opacity >= 1.0) ? 0.9999 : 1.0
-        CATransaction.commit()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        if let layer = self.layer as? CAMetalLayer {
-            let scale = self.contentScaleFactor
-            let w = max(1, bounds.width * scale)
-            let h = max(1, bounds.height * scale)
-            layer.drawableSize = CGSize(width: w, height: h)
+        if let w = window, let host = hostView {
+            host.frame = convert(bounds, to: w)
         }
     }
 
@@ -100,24 +137,10 @@ final class MetalBackedView: UIView {
     }
 }
 
-// SwiftUI wrapper that publishes its CAMetalLayer to the DXMT shim.
+// SwiftUI wrapper around the placeholder view.
 struct MythicMetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MetalBackedView {
-        let v = MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
-        v.backgroundColor = .black
-        v.contentScaleFactor = UIScreen.main.scale
-        if let layer = v.layer as? CAMetalLayer {
-            layer.device = MTLCreateSystemDefaultDevice()
-            layer.pixelFormat = .bgra8Unorm
-            layer.framebufferOnly = true
-            // Explicit drawableSize — otherwise CAMetalLayer.nextDrawable
-            // blocks until bounds are non-zero, and DXMT's swapchain setup
-            // deadlocks before SwiftUI gets a chance to lay the view out.
-            layer.drawableSize = CGSize(width: 800, height: 600)
-            mythic_display_set_layer(layer)
-            LogStore.shared.log("MetalLayer registered with DXMT shim", level: .success)
-        }
-        return v
+        return MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
     }
     func updateUIView(_ uiView: MetalBackedView, context: Context) {}
 }
@@ -149,14 +172,24 @@ struct ContentView: View {
 
                 Divider()
 
-                // Metal render surface for DXMT output, with FPS overlay top-right.
-                ZStack(alignment: .topTrailing) {
-                    MythicMetalView()
-                        .frame(height: 240)
-                        .background(Color.black)
+                // Metal render surface for DXMT output, with FPS overlay top-right
+                // and a minimal key row bottom-left (menu navigation for games
+                // that ignore mouse input, e.g. Thumper wants Enter/Space).
+                // NOTE: the game surface is a raw window-level view positioned
+                // over this strip (see MetalHostView) — SwiftUI content placed
+                // "on top" here would be covered. Overlay + key row live BELOW.
+                MythicMetalView()
+                    .frame(height: 240)
+                    .background(Color.black)
+                HStack(spacing: 6) {
+                    keyButton("⏎", vk: 0x0D)   // VK_RETURN
+                    keyButton("␣", vk: 0x20)   // VK_SPACE
+                    keyButton("Esc", vk: 0x1B) // VK_ESCAPE
+                    Spacer()
                     FPSOverlay()
-                        .padding(8)
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
 
                 Divider()
 
@@ -213,6 +246,24 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+
+    /// Small on-screen key: posts VK down, then up 60ms later, through the
+    /// winios input queue (same path as touch→mouse).
+    private func keyButton(_ label: String, vk: Int32) -> some View {
+        Button(action: {
+            winios_post_key(vk, 1)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) {
+                winios_post_key(vk, 0)
+            }
+        }) {
+            Text(label)
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white)
+                .frame(minWidth: 34, minHeight: 30)
+                .background(Color.white.opacity(0.15))
+                .cornerRadius(6)
+        }
     }
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
@@ -671,17 +722,31 @@ struct ContentView: View {
             // presenting (present #2 = first post-splash frame) plus a
             // settle window, instead of waiting out the full 1200s cap.
             let maxWait = 1200.0  // hard safety cap (unchanged)
-            let settleAfterPresent2 = 60.0
+            // 2026-07-03 second iteration: detach on present #1 (splash shown)
+            // instead of #2. The 3-minute splash-hold is the game loading —
+            // running it detached should roughly halve it. Riskier than #2
+            // (thousands of load-time compiles + worker-thread spawns happen
+            // post-detach) but all known dependencies are covered: trap-mode
+            // writes, pre-executable pool, page0 once-guard.
+            let settleAfterFirstPresent = 20.0
             var presentingSince: CFAbsoluteTime? = nil
             let pollStart = CFAbsoluteTimeGetCurrent()
+            var lastHeartbeat = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
                 let now = CFAbsoluteTimeGetCurrent()
-                if presentingSince == nil && mythic_get_present_count() >= 2 {
-                    presentingSince = now
-                    logStore.log("Game is presenting (#2 reached) — early detach in \(Int(settleAfterPresent2))s")
+                // Diagnostic heartbeat: 2026-07-03's detach-at-#1 run never
+                // triggered despite presents visibly counting — log what this
+                // loop actually observes so that can't happen silently again.
+                if now - lastHeartbeat > 30 {
+                    lastHeartbeat = now
+                    logStore.log("detach-wait: presents=\(mythic_get_present_count()) running=\(wine_process_is_running()) elapsed=\(Int(now - pollStart))s")
                 }
-                if let t = presentingSince, now - t > settleAfterPresent2 {
+                if presentingSince == nil && mythic_get_present_count() >= 1 {
+                    presentingSince = now
+                    logStore.log("Game is presenting (#1, splash) — early detach in \(Int(settleAfterFirstPresent))s")
+                }
+                if let t = presentingSince, now - t > settleAfterFirstPresent {
                     logStore.log("Early detach: game presenting and settled", level: .success)
                     break
                 }
