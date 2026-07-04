@@ -1,4 +1,33 @@
 import SwiftUI
+import UIKit
+import QuartzCore
+
+/// Keeps the ProMotion panel promoted to 120Hz while MAX mode is on.
+/// CAMetalLayer presents alone don't express frame-rate intent — iOS
+/// parks the display at 60Hz and only promotes on touch (observed
+/// 2026-07-05: MAX mode ran 60 except ~119 bursts while touching). An
+/// active CADisplayLink with preferredFrameRateRange(120) is the
+/// documented way for present-driven Metal apps to hold the panel at
+/// 120. The tick itself does nothing.
+final class ProMotionIntent {
+    static let shared = ProMotionIntent()
+    private var link: CADisplayLink?
+
+    func setActive(_ active: Bool) {
+        if active {
+            guard link == nil else { return }
+            let l = CADisplayLink(target: self, selector: #selector(tick))
+            l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            l.add(to: .main, forMode: .common)
+            link = l
+        } else {
+            link?.invalidate()
+            link = nil
+        }
+    }
+
+    @objc private func tick(_ sender: CADisplayLink) {}
+}
 
 /// Small overlay shown over the Metal render view. Reads DXMT's present
 /// counter at 100ms intervals into a 5s rolling buffer, displays current
@@ -17,8 +46,10 @@ struct FPSOverlay: View {
     @State private var visible: Bool = true
     @State private var timer: Timer? = nil
     @State private var displayTimer: Timer? = nil
-    /// Mirrors DXMT's g_mythic_vsync_locked (read per present, live-safe).
-    @State private var vsyncLocked: Bool = true
+    /// Mirrors DXMT's g_mythic_vsync_mode (read per present, live-safe).
+    /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
+    /// mailbox — game unthrottled, panel shows ≤ display rate).
+    @State private var vsyncMode: Int32 = 1
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
     private let bufferCapacity = 50  // 5s @ 100ms
@@ -38,18 +69,22 @@ struct FPSOverlay: View {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
-                    // Vsync-lock pill: "60" = presents paced to 60Hz,
-                    // "MAX" = free-run to display max (120 ProMotion).
-                    // Live toggle — DXMT reads the flag per present.
-                    Text(vsyncLocked ? "60" : "MAX")
-                        .foregroundColor(vsyncLocked ? .cyan : .pink)
+                    // Pacing pill, cycles 60 → MAX(n) → RAW → 60.
+                    //   60: presents paced to exactly 60Hz.
+                    //   MAX(n): free-run to display refresh; n = current
+                    //     cap (120 = ProMotion; 60 = thermal/LPM capped).
+                    //   RAW: game unthrottled (frame-skip mailbox) —
+                    //     FPS readout = raw stack throughput.
+                    Text(pillLabel)
+                        .foregroundColor(pillColor)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .overlay(RoundedRectangle(cornerRadius: 4)
-                            .stroke(vsyncLocked ? Color.cyan : Color.pink, lineWidth: 1))
+                            .stroke(pillColor, lineWidth: 1))
                         .onTapGesture {
-                            vsyncLocked.toggle()
-                            mythic_set_vsync_locked(vsyncLocked ? 1 : 0)
+                            vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
+                            mythic_set_vsync_locked(vsyncMode)
+                            ProMotionIntent.shared.setActive(vsyncMode != 1)
                         }
                 }
                 .font(.system(.caption, design: .monospaced))
@@ -68,6 +103,22 @@ struct FPSOverlay: View {
         .onDisappear { stopTimers() }
     }
 
+    private var pillLabel: String {
+        switch vsyncMode {
+        case 1: return "60"
+        case 0: return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
+        default: return "RAW"
+        }
+    }
+
+    private var pillColor: Color {
+        switch vsyncMode {
+        case 1: return .cyan
+        case 0: return .pink
+        default: return .orange
+        }
+    }
+
     private var fpsColor: Color {
         if fps >= 50 { return .green }
         if fps >= 30 { return .yellow }
@@ -82,7 +133,8 @@ struct FPSOverlay: View {
         let c = mythic_get_present_count()
         samples = [(now, c)]
         presentCount = c
-        vsyncLocked = mythic_get_vsync_locked() != 0
+        vsyncMode = mythic_get_vsync_locked()
+        ProMotionIntent.shared.setActive(vsyncMode != 1)
 
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
