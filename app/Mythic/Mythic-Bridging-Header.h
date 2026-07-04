@@ -15,3 +15,10 @@ void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
 // DXMT present counter (winemetal_unix.c) — for SwiftUI FPS overlay
 #include <stdint.h>
 uint64_t mythic_get_present_count(void);
+
+// DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
+// via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,
+// requires CADisableMinimumFrameDurationOnPhone in Info.plist).
+// Read per present; safe to flip live mid-game.
+void mythic_set_vsync_locked(int locked);
+int mythic_get_vsync_locked(void);

@@ -17,6 +17,8 @@ struct FPSOverlay: View {
     @State private var visible: Bool = true
     @State private var timer: Timer? = nil
     @State private var displayTimer: Timer? = nil
+    /// Mirrors DXMT's g_mythic_vsync_locked (read per present, live-safe).
+    @State private var vsyncLocked: Bool = true
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
     private let bufferCapacity = 50  // 5s @ 100ms
@@ -36,6 +38,19 @@ struct FPSOverlay: View {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
+                    // Vsync-lock pill: "60" = presents paced to 60Hz,
+                    // "MAX" = free-run to display max (120 ProMotion).
+                    // Live toggle — DXMT reads the flag per present.
+                    Text(vsyncLocked ? "60" : "MAX")
+                        .foregroundColor(vsyncLocked ? .cyan : .pink)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .overlay(RoundedRectangle(cornerRadius: 4)
+                            .stroke(vsyncLocked ? Color.cyan : Color.pink, lineWidth: 1))
+                        .onTapGesture {
+                            vsyncLocked.toggle()
+                            mythic_set_vsync_locked(vsyncLocked ? 1 : 0)
+                        }
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -67,6 +82,7 @@ struct FPSOverlay: View {
         let c = mythic_get_present_count()
         samples = [(now, c)]
         presentCount = c
+        vsyncLocked = mythic_get_vsync_locked() != 0
 
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
