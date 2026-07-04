@@ -2132,6 +2132,14 @@ void server_init_process_done(void)
                 enum { PROF_SLOTS = 512 };
                 static uint64_t prof_keys[PROF_SLOTS];
                 static uint32_t prof_counts[PROF_SLOTS];
+                /* v4: follow the BUSIEST thread (max cpu_usage), re-chosen
+                 * every ~2s. The last-exec-faulter heuristic kept landing on
+                 * the WAITING main thread; the render worker that actually
+                 * burns the 53ms frame barely faults since the USD fix. */
+                mach_port_t prof_self = pthread_mach_thread_np(pthread_self());
+                mach_port_t prof_held = MACH_PORT_NULL;
+                integer_t prof_cpu = 0;
+                uint64_t prof_iter = 0;
                 /* Secondary histogram: LR of samples whose PC is in the
                  * dyld-shared-cache range. [PROF] showed ~87% of gameplay
                  * time in ONE system-dylib bucket (a wait syscall) — the
@@ -2143,8 +2151,34 @@ void server_init_process_done(void)
                 mach_port_t prof_thread = prof_thread_initial;
                 for (;;) {
                     usleep(2000);
-                    if (ios_last_exec_fault_thread != MACH_PORT_NULL)
-                        prof_thread = ios_last_exec_fault_thread;
+                    if ((prof_iter++ & 0x3FF) == 0) {
+                        thread_act_array_t tlist;
+                        mach_msg_type_number_t tcount;
+                        if (task_threads(mach_task_self(), &tlist, &tcount) == KERN_SUCCESS) {
+                            integer_t best_cpu = -1;
+                            mach_port_t best = MACH_PORT_NULL;
+                            unsigned int k;
+                            for (k = 0; k < tcount; k++) {
+                                thread_basic_info_data_t bi;
+                                mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+                                if (tlist[k] == prof_self) continue;
+                                if (thread_info(tlist[k], THREAD_BASIC_INFO,
+                                                (thread_info_t)&bi, &bic) != KERN_SUCCESS) continue;
+                                if (bi.cpu_usage > best_cpu) { best_cpu = bi.cpu_usage; best = tlist[k]; }
+                            }
+                            for (k = 0; k < tcount; k++)
+                                if (tlist[k] != best) mach_port_deallocate(mach_task_self(), tlist[k]);
+                            if (best != MACH_PORT_NULL) {
+                                if (prof_held != MACH_PORT_NULL && prof_held != best)
+                                    mach_port_deallocate(mach_task_self(), prof_held);
+                                prof_held = best;
+                                prof_thread = best;
+                                prof_cpu = best_cpu;
+                            }
+                            vm_deallocate(mach_task_self(), (vm_address_t)tlist,
+                                          tcount * sizeof(*tlist));
+                        }
+                    }
                     if (thread_suspend(prof_thread) != KERN_SUCCESS) { usleep(200000); continue; }
                     arm_thread_state64_t st;
                     mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
@@ -2160,7 +2194,11 @@ void server_init_process_done(void)
                         if (!prof_counts[i] && free_i < 0) free_i = i;
                     }
                     if (i == PROF_SLOTS && free_i >= 0) { prof_keys[free_i] = key; prof_counts[free_i] = 1; }
-                    if (pc_full >= 0x180000000ULL && pc_full < 0x260000000ULL) {
+                    /* v4.1: capture LR for ALL samples — pool-resident hot
+                     * functions (memset, virtual_unwind in ntdll's copy)
+                     * need their CALLERS named to attribute the unwind
+                     * storm, not just system-range wait syscalls. */
+                    {
                         uint64_t lr_key = arm_thread_state64_get_lr(st) >> 4;
                         for (i = 0; i < PROF_SLOTS; i++) {
                             if (prof_lr_counts[i] && prof_lr_keys[i] == lr_key) { prof_lr_counts[i]++; break; }
@@ -2168,10 +2206,61 @@ void server_init_process_done(void)
                         }
                     }
                     total++;
+                    /* v5: coherent fp-chain walk of the profiled thread every
+                     * ~2s. pc+lr can't attribute kernel time (lr lands inside
+                     * libsystem_kernel wrappers like mach_vm_map+0x6c); the fp
+                     * chain, walked while the thread is SUSPENDED, names the
+                     * real caller. Guest FEX frames don't keep fp chains —
+                     * bounded garbage, validity-checked. */
+                    if ((total % 1024) == 0) {
+                        arm_thread_state64_t bst;
+                        mach_msg_type_number_t bcnt = ARM_THREAD_STATE64_COUNT;
+                        if (thread_suspend(prof_thread) == KERN_SUCCESS) {
+                            uint64_t pcs[12];
+                            int nf = 0;
+                            if (thread_get_state(prof_thread, ARM_THREAD_STATE64,
+                                                 (thread_state_t)&bst, &bcnt) == KERN_SUCCESS) {
+                                uint64_t fp_w = arm_thread_state64_get_fp(bst);
+                                pcs[nf++] = arm_thread_state64_get_pc(bst);
+                                pcs[nf++] = arm_thread_state64_get_lr(bst);
+                                while (nf < 12 && fp_w > 0x1000) {
+                                    uint64_t fb[2]; mach_vm_size_t got = 0;
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)fp_w, 16,
+                                            (mach_vm_address_t)fb, &got) != KERN_SUCCESS
+                                        || got != 16)
+                                        break;
+                                    if (fb[1] < 0x4000) break;
+                                    pcs[nf++] = fb[1];
+                                    if (fb[0] <= fp_w) break; /* fp must move up-stack */
+                                    fp_w = fb[0];
+                                }
+                            }
+                            thread_resume(prof_thread);
+                            if (nf) {
+                                char bl[640]; int bln = 0;
+                                int f;
+                                bln += snprintf(bl+bln, sizeof(bl)-bln,
+                                                "[PROF-BT] tid=0x%x:", prof_thread);
+                                for (f = 0; f < nf && bln < (int)sizeof(bl)-90; f++) {
+                                    Dl_info bi2;
+                                    if (dladdr((void*)(uintptr_t)pcs[f], &bi2) && bi2.dli_sname)
+                                        bln += snprintf(bl+bln, sizeof(bl)-bln, " %s+0x%llx",
+                                                        bi2.dli_sname,
+                                                        (unsigned long long)(pcs[f]-(uintptr_t)bi2.dli_saddr));
+                                    else
+                                        bln += snprintf(bl+bln, sizeof(bl)-bln, " 0x%llx",
+                                                        (unsigned long long)pcs[f]);
+                                }
+                                dprintf(STDERR_FILENO, "%s\n", bl);
+                            }
+                        }
+                    }
                     if ((total % 4096) == 0) {
                         /* top-10 by count (simple selection; 512 slots) */
                         char line[512]; int len = 0;
-                        len += snprintf(line + len, sizeof(line) - len, "[PROF] n=%llu top:", (unsigned long long)total);
+                        len += snprintf(line + len, sizeof(line) - len, "[PROF] tid=0x%x cpu=%d n=%llu top:",
+                                        prof_thread, (int)prof_cpu, (unsigned long long)total);
                         for (int rank = 0; rank < 10 && len < (int)sizeof(line) - 40; rank++) {
                             int best = -1; uint32_t bc = 0;
                             for (i = 0; i < PROF_SLOTS; i++)

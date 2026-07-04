@@ -3355,7 +3355,41 @@ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT change
 
     if (drained || !check_queue_masks( wake_mask, changed_mask ))
     {
-        SERVER_START_REQ( set_queue_mask )
+        BOOL skip_server = FALSE;
+#ifdef WINE_IOS
+        /* iOS-Mythic 2026-07-04: pure polls (wake==changed==0 and nothing
+         * drained — e.g. GetAsyncKeyState's check_for_events) don't need
+         * the server to learn our masks; only real msg-waits do. Thumper
+         * polls input at kHz and EVERY poll was taking this set_queue_mask
+         * round trip ([PROF-BT]: read←read_reply_data←server_call_unlocked
+         * ←wine_server_call←process_driver_events←check_for_events←
+         * NtUserGetAsyncKeyState — the dominant game-thread kernel cost).
+         * Fresh input still syncs (drained==TRUE path unchanged; the
+         * winios_drv_post_* calls do their own server requests). Keep a
+         * ~1/s heartbeat so server-side is_queue_hung() (>5s without
+         * queue access) never triggers for poll-only phases. */
+        if (!drained && !wake_mask && !changed_mask)
+        {
+            static LONGLONG last_heartbeat; /* process-wide; benign race */
+            LARGE_INTEGER counter, freq;
+            LONGLONG now;
+            NtQueryPerformanceCounter( &counter, &freq );
+            now = counter.QuadPart / freq.QuadPart; /* seconds */
+            if (now == last_heartbeat) skip_server = TRUE;
+            else last_heartbeat = now;
+
+            {
+                extern int dprintf( int fd, const char *fmt, ... );
+                static unsigned int poll_total, poll_skipped;
+                poll_total++;
+                if (skip_server) poll_skipped++;
+                if ((poll_total & 0x3FFF) == 0)
+                    dprintf( 2, "[queue-mask] polls=%u skipped=%u\n",
+                             poll_total, poll_skipped );
+            }
+        }
+#endif
+        if (!skip_server) SERVER_START_REQ( set_queue_mask )
         {
             req->poll_events = drained;
             req->wake_mask = wake_mask;

@@ -559,8 +559,15 @@ static int ios_insn_x18_role(uint32_t insn)
         if (rn == 18) return X18_ROLE_RN;
     }
 
-    /* LDR/STR (register offset) — [31:21]=1x111000xx1, [11:10]=10 */
-    if ((top11 & 0x3E7) == 0x1C1 && ((insn >> 10) & 3) == 2)
+    /* LDR/STR (register offset) — [29:27]=111, V=0, [25:24]=00, [21]=1,
+     * [11:10]=10; size [31:30] and opc [23:22] are DON'T-CARES.
+     * iOS-Mythic 2026-07-04: mask was 0x3E7/0x1C1 which demanded
+     * insn[30]==0 AND insn[22]==0 — i.e. only 8/32-bit STORES matched.
+     * Every register-offset LOAD off x18 (`ldrb w8,[x18,x8]` — win32u's
+     * hottest TEB poll) went unpatched and cost one Mach fault per visit
+     * whenever x18 was 0 (~14%% of game-thread samples once
+     * UNIXCALL-DIRECT removed the constant x18 refresh). */
+    if ((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2)
     {
         if (rn == 18) return X18_ROLE_RN;
         if (rm == 18) return X18_ROLE_RM;
@@ -2064,6 +2071,27 @@ static void set_arm64ec_range( const void *addr, size_t size )
         if (end & 63) map[pos] |= ~maskbits( end );
     }
     else map[pos] |= maskbits( idx ) & ~maskbits( end );
+}
+
+/* Exported: mark an arbitrary range (e.g. hand-written stubs in the pool's
+ * reserved page) as ARM64EC code, committing the covering bitmap pages
+ * first. Without the bit set, arm64x_check_call routes branches to the
+ * range into the x86 emulator, which compiles the ARM64 bytes as x86
+ * (observed: the unix-call x18-restore stub executed as guest RIP).
+ * Returns 1 if marked, 0 if the EC bitmap doesn't exist yet (caller
+ * must treat the range as NOT callable via checked indirect calls). */
+int ios_jit_mark_ec_range( const void *addr, size_t size )
+{
+    if (!arm64ec_view) return 0;
+    {
+        size_t bm_start = ((size_t)addr >> 12) / 8;
+        size_t bm_end   = (((size_t)addr + size) >> 12) / 8;
+        size_t bm_size  = ROUND_SIZE( bm_start, bm_end + 1 - bm_start, page_mask );
+        void *bm_page   = ROUND_ADDR( (char *)arm64ec_view->base + bm_start, page_mask );
+        set_vprot( arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+    }
+    set_arm64ec_range( addr, size );
+    return 1;
 }
 
 

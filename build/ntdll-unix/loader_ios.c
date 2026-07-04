@@ -1719,6 +1719,25 @@ static void load_ntdll_functions( HMODULE module )
     if (p__wine_unix_call_dispatcher_arm64ec)
     {
         /* redirect __wine_unix_call_dispatcher to __wine_unix_call_dispatcher_arm64ec */
+        /* iOS-Mythic NOTE 2026-07-04: attempts 1-4 at de-faulting this slot
+         * (~100 Mach faults/present) used a hand-encoded x18-restore stub at
+         * pool rx_base+0x1000: (2) unmarked pool VA → routed into the x86
+         * emulator by the icall checker; (3) same, observed directly
+         * (State.rip = stub); (4) EC-marked stub → unix calls ran but a
+         * thread hard-stuck at unix_call_dispatcher+0x60 burning 100% CPU.
+         * The "frame contract" theory recorded then is WRONG — static
+         * analysis (2026-07-04) shows direct entry is safe by construction:
+         * the iOS dispatcher entry self-restores x18 from TPIDRRO_EL0 TLS,
+         * and the `stp x30,x9(NZCV)` at [frame+0x100] implicitly ZEROES
+         * restore_flags (0x10c) on every entry, so the return path is
+         * per-call clean. The syscall-dispatcher slot has always held the
+         * native unix address (fault-free direct entry at scale) — the
+         * unix-call path is architecturally identical. Attempt 4's real
+         * defects: an orphan non-module stub (no EC/SEH metadata, not
+         * reverse-translatable, hand-assembled encodings) in BOTH slot
+         * copies. Round 7 below instead uses the POOL ALIAS OF THE REAL EC
+         * THUNK — the exact code the Mach redirect already lands on in the
+         * working baseline, making post-entry state bit-identical to it. */
         *p__wine_unix_call_dispatcher = *p__wine_unix_call_dispatcher_arm64ec;
         *p__wine_unix_call_dispatcher_arm64ec = __wine_unix_call_dispatcher;
     }
@@ -1747,6 +1766,23 @@ static void load_ntdll_functions( HMODULE module )
             ios_jit_sync_write( p_xlate, sizeof(void*) );
         }
         else dprintf( 2, "XLATE-HOOK p_ios_jit_translate_addr export NOT FOUND\n" );
+
+        /* Reverse hook: pool alias → PE VA, used by PE ntdll's
+         * virtual_unwind so exception walks over pool-executing frames
+         * find their function tables (registered at PE VAs). */
+        {
+            extern void *ios_jit_reverse_translate_addr(const void *addr);
+            void **p_xlate_rev = (void **)find_named_export( module, exports,
+                                                             "p_ios_jit_reverse_translate_addr" );
+            if (p_xlate_rev)
+            {
+                *p_xlate_rev = (void *)ios_jit_reverse_translate_addr;
+                dprintf( 2, "XLATE-HOOK-REV installed p_ios_jit_reverse_translate_addr=%p at %p\n",
+                         ios_jit_reverse_translate_addr, p_xlate_rev );
+                ios_jit_sync_write( p_xlate_rev, sizeof(void*) );
+            }
+            else dprintf( 2, "XLATE-HOOK-REV export NOT FOUND\n" );
+        }
     }
 
     /* Sync dispatcher pointers to JIT pool .data copy.
@@ -1786,6 +1822,39 @@ static void load_ntdll_functions( HMODULE module )
                 jit_handle_p, (unsigned long long)*(uint64_t*)jit_handle_p);
         }
         ERR("synced dispatchers to JIT .data\n");
+    }
+
+    /* iOS-Mythic Round 7 (2026-07-04): de-fault the unix-call path.
+     * Pool-executing EC callers read this slot and `blr` its value. With
+     * the baseline PE VA they exec-fault (~100 Mach round trips/present,
+     * ~0.5ms wall each = the bulk of the gameplay frame); the Mach handler
+     * then redirects pc to the thunk's pool alias. Point the slot at that
+     * pool alias DIRECTLY: same destination, no fault. The only machine-
+     * state differences vs the fault path are the dead x16 value and the
+     * handler's side effects (x18 fix — the dispatcher entry re-derives
+     * x18 from TLS anyway; stale-VA telemetry — irrelevant here).
+     * The pool address must be in the EC bitmap or checked indirect calls
+     * route it into the x86 emulator (= attempts 2/3); the ntdll pool
+     * image copy is normally already marked at copy time, but mark
+     * explicitly and bail to baseline if the bitmap isn't up. */
+    if (p__wine_unix_call_dispatcher_arm64ec && !getenv("MYTHIC_NO_UNIXCALL_DIRECT"))
+    {
+        extern void *ios_jit_translate_addr(void *addr);
+        extern void ios_jit_sync_write(void *addr, size_t size);
+        extern int ios_jit_mark_ec_range(const void *addr, size_t size);
+        void *thunk_pe = *p__wine_unix_call_dispatcher;  /* __wine_unix_call_arm64ec PE VA */
+        void *thunk_pool = ios_jit_translate_addr(thunk_pe);
+
+        if (thunk_pool != thunk_pe && ios_jit_mark_ec_range(thunk_pool, 16))
+        {
+            *p__wine_unix_call_dispatcher = thunk_pool;
+            ios_jit_sync_write(p__wine_unix_call_dispatcher, sizeof(void*));
+            dprintf(2, "UNIXCALL-DIRECT: slot @ %p -> pool thunk %p (was PE %p)\n",
+                    p__wine_unix_call_dispatcher, thunk_pool, thunk_pe);
+        }
+        else
+            dprintf(2, "UNIXCALL-DIRECT: SKIPPED (pool=%p pe=%p) — keeping faulting baseline\n",
+                    thunk_pool, thunk_pe);
     }
 #endif
 #undef GET_FUNC

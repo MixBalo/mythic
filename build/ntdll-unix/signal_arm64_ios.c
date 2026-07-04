@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <unistd.h>
 #ifdef WINE_IOS
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/thread_act.h>
@@ -577,17 +578,24 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                         {
+                            /* Plain pc redirect — even with x18==0. The old
+                             * x18-restore trampoline clobbered x17, which is
+                             * LIVE in FEX-emitted code (callret scratch) and
+                             * in ARM64EC thunks. If the redirect target's
+                             * code needs the TEB, its [x18,#imm] access
+                             * faults and case 3 emulates it clobber-free. */
                             if (thread_teb && state.__x[18] == 0)
                             {
-                                /* Also fix x18 via trampoline */
-                                state.__x[17] = (uint64_t)(uintptr_t)jit_pc;
-                                __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
+                                static volatile int redir2_count = 0;
+                                int t2 = __sync_add_and_fetch(&redir2_count, 1);
+                                if (t2 <= 10 || (t2 % 4096) == 0)
+                                    dprintf(STDERR_FILENO,
+                                        "[x18-redir2] #%d pc=%p -> jit=%p (x18 set via state)\n",
+                                        t2, (void*)(uintptr_t)fault_pc, jit_pc);
+                                /* Same set_state x18 experiment as case 3. */
+                                state.__x[18] = thread_teb;
                             }
-                            else
-                            {
-                                /* x18 OK, just redirect PC */
-                                __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
-                            }
+                            __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
                             ios_exc_x18_fixes++;
                             handled = 1;
                         }
@@ -595,22 +603,182 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
-            /* 3. Fix x18=0 for DATA ACCESS faults.
-             * iOS zeros x18 on context switch / thread_set_state.
-             * Route through per-thread TEB trampoline to restore x18. */
-            if (!handled && state.__x[18] == 0 && thread_teb && thread_trampoline)
+            /* 3. Emulate [x18, #imm] accesses when x18 == 0.
+             * iOS zeros x18 on context switch. EC/FEX code reads the TEB
+             * through x18; with x18==0 the effective address IS the TEB
+             * offset, so we can complete the access in-handler against the
+             * real TEB (teb + fault_addr) and advance pc. Rn==18 in the
+             * faulting instruction is the exact discriminator — a fault
+             * with any other base register is NOT x18-caused and falls
+             * through to real fault handling.
+             *
+             * This REPLACES the old x18-restore trampoline for data faults.
+             * The trampoline clobbered x17 (its jump register) — fatal when
+             * the interrupted code held a live value there. Two confirmed
+             * kills (2026-07-04, after UNIXCALL-DIRECT widened the x18==0
+             * windows): (a) FEX emitter loop `str w16,[x15,x17]` re-executed
+             * with x17=pc → garbage address → eternal UNHANDLED; (b) ntdll
+             * EC TEB-read sites trampolined with live x17 (pool pointers,
+             * FP constants observed) → silent state corruption → heap
+             * damage → libsystem_malloc died inside Metal texture creation.
+             * Emulation clobbers NOTHING. x18 stays 0 afterwards; each
+             * subsequent TEB access costs one fault until the next context
+             * switch restores nothing — acceptable, bounded, correct. */
+            if (!handled && state.__x[18] == 0 && thread_teb)
             {
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
 
-                if (!is_exec_fault)
+                if (!is_exec_fault && fault_addr < 0x10000 &&
+                    fault_pc >= 0x100000000ULL)
                 {
-                    /* Data access fault — x18=0 caused a bad load/store.
-                     * Fix x18 via trampoline regardless of where PC is. */
-                    state.__x[17] = fault_pc;
-                    __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
-                    ios_exc_x18_fixes++;
-                    handled = 1;
+                    uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
+                    int rn = (insn >> 5) & 0x1f;
+
+                    if (rn == 18)
+                    {
+                        uintptr_t ea = thread_teb + fault_addr;
+                        int rt = insn & 0x1f;
+                        int emulated = 0;
+
+                        switch (insn & 0xffc00000)
+                        {
+                        /* unsigned-offset immediate loads, base x18 */
+                        case 0xf9400000: /* LDR Xt */
+                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            emulated = 1; break;
+                        case 0xb9400000: /* LDR Wt (zero-extend) */
+                            if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
+                            emulated = 1; break;
+                        case 0x39400000: /* LDRB Wt */
+                            if (rt != 31) state.__x[rt] = *(uint8_t *)ea;
+                            emulated = 1; break;
+                        case 0x79400000: /* LDRH Wt */
+                            if (rt != 31) state.__x[rt] = *(uint16_t *)ea;
+                            emulated = 1; break;
+                        /* unsigned-offset immediate stores, base x18 */
+                        case 0xf9000000: /* STR Xt */
+                            *(uint64_t *)ea = (rt == 31) ? 0 : state.__x[rt];
+                            emulated = 1; break;
+                        case 0xb9000000: /* STR Wt */
+                            *(uint32_t *)ea = (rt == 31) ? 0 : (uint32_t)state.__x[rt];
+                            emulated = 1; break;
+                        case 0x39000000: /* STRB Wt */
+                            *(uint8_t *)ea = (rt == 31) ? 0 : (uint8_t)state.__x[rt];
+                            emulated = 1; break;
+                        case 0x79000000: /* STRH Wt */
+                            *(uint16_t *)ea = (rt == 31) ? 0 : (uint16_t)state.__x[rt];
+                            emulated = 1; break;
+                        default: break;
+                        }
+
+                        /* LDP/STP Xt,Xt2,[x18,#imm] signed-offset (no writeback) */
+                        if (!emulated && (insn & 0xffc00000) == 0xa9400000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            if (rt != 31)  state.__x[rt]  = *(uint64_t *)ea;
+                            if (rt2 != 31) state.__x[rt2] = *(uint64_t *)(ea + 8);
+                            emulated = 1;
+                        }
+                        else if (!emulated && (insn & 0xffc00000) == 0xa9000000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            *(uint64_t *)ea       = (rt == 31)  ? 0 : state.__x[rt];
+                            *(uint64_t *)(ea + 8) = (rt2 == 31) ? 0 : state.__x[rt2];
+                            emulated = 1;
+                        }
+
+                        /* GPR register-offset (`ldrb w8,[x18,x8]` killed boot
+                         * 2026-07-04 19:39) and unscaled-immediate (LDUR/STUR)
+                         * families, any size, loads+stores+signed loads. The
+                         * hardware already computed the offset into fault_addr,
+                         * so only size/opc/Rt semantics matter here. */
+                        if (!emulated &&
+                            ((insn & 0x3f200c00) == 0x38200800 ||   /* register offset */
+                             (insn & 0x3f200c00) == 0x38000000))    /* unscaled imm9 */
+                        {
+                            int size = (insn >> 30) & 3;   /* 0=B 1=H 2=W 3=X */
+                            int opc  = (insn >> 22) & 3;   /* 0=ST 1=LD 2/3=LDS */
+                            uint64_t val = 0;
+                            emulated = 1;
+                            if (opc == 0)               /* store */
+                            {
+                                val = (rt == 31) ? 0 : state.__x[rt];
+                                switch (size)
+                                {
+                                case 0: *(uint8_t  *)ea = (uint8_t)val;  break;
+                                case 1: *(uint16_t *)ea = (uint16_t)val; break;
+                                case 2: *(uint32_t *)ea = (uint32_t)val; break;
+                                case 3: *(uint64_t *)ea = val;           break;
+                                }
+                            }
+                            else if (opc == 1)          /* zero-extending load */
+                            {
+                                switch (size)
+                                {
+                                case 0: val = *(uint8_t  *)ea; break;
+                                case 1: val = *(uint16_t *)ea; break;
+                                case 2: val = *(uint32_t *)ea; break;
+                                case 3: val = *(uint64_t *)ea; break;
+                                }
+                                if (rt != 31) state.__x[rt] = val;
+                            }
+                            else if (size == 3 && opc == 2)
+                            {
+                                /* PRFM (register/unscaled) — prefetch, no-op */
+                            }
+                            else                        /* sign-extending load */
+                            {
+                                int64_t sval = 0;
+                                switch (size)
+                                {
+                                case 0: sval = *(int8_t  *)ea; break;
+                                case 1: sval = *(int16_t *)ea; break;
+                                case 2: sval = *(int32_t *)ea; break; /* LDRSW */
+                                }
+                                if (opc == 3) /* 32-bit target: Wt, zero upper */
+                                    sval = (int64_t)(uint32_t)(int32_t)sval;
+                                if (rt != 31) state.__x[rt] = (uint64_t)sval;
+                            }
+                        }
+
+                        if (emulated)
+                        {
+                            static volatile int emul3_count = 0;
+                            int e3 = __sync_add_and_fetch(&emul3_count, 1);
+                            if (e3 <= 20 || (e3 % 4096) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[x18-emul3] #%d pc=%p insn=%08x teb+0x%llx rt=%d\n",
+                                    e3, (void*)(uintptr_t)fault_pc, insn,
+                                    (unsigned long long)fault_addr, rt);
+                            /* EXPERIMENT: also set x18 in the written-back
+                             * state. Project lore says thread_set_state
+                             * doesn't preserve x18 — from early testing that
+                             * may have been confounded. If it DOES stick,
+                             * the silent-copy hole (NtCurrentTeb = mov
+                             * x0,x18 propagating 0 without faulting) closes
+                             * and emul3 should fire ~once per context
+                             * switch instead of once per TEB access. Free
+                             * either way — verify via emul3 rate + next-
+                             * fault x18 values in the log. */
+                            state.__x[18] = thread_teb;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            ios_exc_x18_fixes++;
+                            handled = 1;
+                        }
+                        else
+                        {
+                            /* x18-based but unrecognized encoding (writeback,
+                             * register-offset, SIMD...). Log it — needs a new
+                             * case above, NOT the old x17-clobbering
+                             * trampoline. Falls through to real handling. */
+                            dprintf(STDERR_FILENO,
+                                "[x18-emul3] UNRECOGNIZED insn=%08x pc=%p teb+0x%llx\n",
+                                insn, (void*)(uintptr_t)fault_pc,
+                                (unsigned long long)fault_addr);
+                        }
+                    }
                 }
             }
 
@@ -1190,6 +1358,87 @@ static void *ios_mach_exception_thread( void *arg )
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
                         dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                    }
+                    /* iOS-Mythic: symbolize pc/lr via dladdr — works for
+                     * dyld-cache addresses in-process. Names the native
+                     * subsystem when a fault lands in system frameworks
+                     * (e.g. the 2026-07-04 post-UNIXCALL-DIRECT crash at
+                     * 0x18521c0d0 was unattributable offline: DeviceSupport
+                     * symbol tree only has lazily-extracted dylibs). */
+                    {
+                        Dl_info di_pc, di_lr;
+                        const char *pc_img = "?", *pc_sym = "?"; uint64_t pc_off = 0;
+                        const char *lr_img = "?", *lr_sym = "?"; uint64_t lr_off = 0;
+                        if (dladdr((void*)(uintptr_t)fault_pc, &di_pc))
+                        {
+                            if (di_pc.dli_fname) pc_img = di_pc.dli_fname;
+                            if (di_pc.dli_sname) { pc_sym = di_pc.dli_sname;
+                                pc_off = fault_pc - (uint64_t)(uintptr_t)di_pc.dli_saddr; }
+                        }
+                        if (dladdr((void*)(uintptr_t)state.__lr, &di_lr))
+                        {
+                            if (di_lr.dli_fname) lr_img = di_lr.dli_fname;
+                            if (di_lr.dli_sname) { lr_sym = di_lr.dli_sname;
+                                lr_off = state.__lr - (uint64_t)(uintptr_t)di_lr.dli_saddr; }
+                        }
+                        dprintf(STDERR_FILENO,
+                            "[mach_exc] sym pc=%s`%s+0x%llx lr=%s`%s+0x%llx\n",
+                            pc_img, pc_sym, (unsigned long long)pc_off,
+                            lr_img, lr_sym, (unsigned long long)lr_off);
+                        /* fp-chain backtrace of the faulting thread — names
+                         * the exact native call path (which Metal call fed
+                         * free() a garbage pointer). Native code has honest
+                         * x29 chains; stop on invalid fp. */
+                        if (cnt <= 3)
+                        {
+                            uint64_t fp_walk = state.__fp;
+                            int fr;
+                            for (fr = 0; fr < 10 && fp_walk; fr++)
+                            {
+                                uint64_t frame_buf[2];
+                                mach_vm_size_t got_fw = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)fp_walk, 16,
+                                        (mach_vm_address_t)frame_buf, &got_fw)
+                                        != KERN_SUCCESS || got_fw != 16)
+                                    break;
+                                {
+                                    uint64_t ret_pc = frame_buf[1];
+                                    Dl_info di_f;
+                                    const char *f_img = "?", *f_sym = "?";
+                                    uint64_t f_off = ret_pc;
+                                    if (ret_pc > 0x4000 &&
+                                        dladdr((void*)(uintptr_t)ret_pc, &di_f))
+                                    {
+                                        if (di_f.dli_fname) f_img = di_f.dli_fname;
+                                        if (di_f.dli_sname) { f_sym = di_f.dli_sname;
+                                            f_off = ret_pc - (uint64_t)(uintptr_t)di_f.dli_saddr; }
+                                    }
+                                    dprintf(STDERR_FILENO,
+                                        "[mach_exc] bt[%d] 0x%llx %s`%s+0x%llx\n",
+                                        fr, (unsigned long long)ret_pc,
+                                        f_img, f_sym, (unsigned long long)f_off);
+                                    if (ret_pc <= 0x4000) break;
+                                }
+                                fp_walk = frame_buf[0];
+                            }
+                        }
+                        /* One-shot: dump the faulting native function's
+                         * prologue so we can see what per-thread/global
+                         * state it reads (libsystem_malloc keeps dying on
+                         * corrupt zone state — need its actual fastpath). */
+                        static volatile int proto_dumped = 0;
+                        if (di_pc.dli_saddr && fault_pc >= 0x180000000ULL &&
+                            __sync_bool_compare_and_swap(&proto_dumped, 0, 1))
+                        {
+                            uint32_t *fp = (uint32_t*)di_pc.dli_saddr;
+                            int w;
+                            for (w = 0; w < 40; w += 8)
+                                dprintf(STDERR_FILENO,
+                                    "[mach_exc] fn+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                    w * 4, fp[w], fp[w+1], fp[w+2], fp[w+3],
+                                    fp[w+4], fp[w+5], fp[w+6], fp[w+7]);
+                        }
                     }
                     /* One-shot dump: on the first UNHANDLED exec fault, dump the
                      * JIT-pool RW alias contents around the relevant FEX CodeBuffer
@@ -4434,9 +4683,16 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                    "ldp x18, x19, [sp, #0x90]\n\t"
-#ifdef WINE_IOS
-                   "msr TPIDR_EL0, x18\n\t"  /* keep TPIDR_EL0 in sync */
-#endif
+                   /* iOS-Mythic 2026-07-04: REMOVED `msr TPIDR_EL0, x18`
+                    * ("keep TPIDR_EL0 in sync"). Nothing of ours reads
+                    * TPIDR_EL0 — every TEB recovery path (dispatchers, x18
+                    * patcher trampolines, Mach handler) uses TPIDRRO_EL0 +
+                    * TSD slot; the patcher header comment claiming
+                    * TPIDR_EL0 was stale. Writing an OS-owned per-thread
+                    * register on every unix-call return is pure risk:
+                    * libsystem_malloc died with corrupted per-thread zone
+                    * state (Metal texture allocs, 3 runs) right after
+                    * UNIXCALL-DIRECT multiplied direct returns. */
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
