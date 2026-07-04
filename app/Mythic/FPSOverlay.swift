@@ -41,6 +41,9 @@ final class ProMotionIntent {
 ///   - Display value refreshes every 250ms regardless.
 ///   - Tap to hide.
 struct FPSOverlay: View {
+    /// Compact = landscape side-bar variant: FPS + pacing pill stacked
+    /// vertically, no present counter (fits a ~120pt pillarbox bar).
+    var compact: Bool = false
     @State private var presentCount: UInt64 = 0
     @State private var fps: Double = 0
     @State private var visible: Bool = true
@@ -56,7 +59,17 @@ struct FPSOverlay: View {
 
     var body: some View {
         Group {
-            if visible {
+            if visible && compact {
+                VStack(spacing: 4) {
+                    Text(String(format: "%.1f", fps))
+                        .foregroundColor(fpsColor)
+                    pacingPill
+                }
+                .font(.system(.caption, design: .monospaced))
+                .padding(6)
+                .background(Color.black.opacity(0.55))
+                .cornerRadius(6)
+            } else if visible {
                 HStack(spacing: 8) {
                     Text("Present:")
                         .foregroundColor(.secondary)
@@ -69,23 +82,7 @@ struct FPSOverlay: View {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
-                    // Pacing pill, cycles 60 → MAX(n) → RAW → 60.
-                    //   60: presents paced to exactly 60Hz.
-                    //   MAX(n): free-run to display refresh; n = current
-                    //     cap (120 = ProMotion; 60 = thermal/LPM capped).
-                    //   RAW: game unthrottled (frame-skip mailbox) —
-                    //     FPS readout = raw stack throughput.
-                    Text(pillLabel)
-                        .foregroundColor(pillColor)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .overlay(RoundedRectangle(cornerRadius: 4)
-                            .stroke(pillColor, lineWidth: 1))
-                        .onTapGesture {
-                            vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
-                            mythic_set_vsync_locked(vsyncMode)
-                            ProMotionIntent.shared.setActive(vsyncMode != 1)
-                        }
+                    pacingPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -101,6 +98,27 @@ struct FPSOverlay: View {
         .onTapGesture { visible.toggle() }
         .onAppear { startTimers() }
         .onDisappear { stopTimers() }
+    }
+
+    /// Pacing pill, cycles 60 → MAX(n) → RAW → 60. Shared by the wide
+    /// (portrait) and compact (landscape bar) overlay variants.
+    ///   60: presents paced to exactly 60Hz.
+    ///   MAX(n): free-run to display refresh; n = current cap
+    ///     (120 = ProMotion; 60 = thermal/LPM capped).
+    ///   RAW: game unthrottled (frame-skip mailbox) — FPS readout =
+    ///     raw stack throughput.
+    private var pacingPill: some View {
+        Text(pillLabel)
+            .foregroundColor(pillColor)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .overlay(RoundedRectangle(cornerRadius: 4)
+                .stroke(pillColor, lineWidth: 1))
+            .onTapGesture {
+                vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
+                mythic_set_vsync_locked(vsyncMode)
+                ProMotionIntent.shared.setActive(vsyncMode != 1)
+            }
     }
 
     private var pillLabel: String {

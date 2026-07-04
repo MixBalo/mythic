@@ -24,6 +24,13 @@ import os.log
 
 /// Raw window-level host for the presenting CAMetalLayer.
 final class MetalHostView: UIView {
+    // Process-lifetime singleton. The CAMetalLayer is registered with DXMT's
+    // swapchain exactly once; if the host were recreated on view teardown
+    // (rotation, re-attach) DXMT would keep presenting to the DEAD layer —
+    // black surface both ways (2026-07-05 landscape regression). One host,
+    // one layer, forever; only its FRAME is re-parented/resized.
+    static let shared = MetalHostView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+
     override class var layerClass: AnyClass { return CAMetalLayer.self }
     var metalLayer: CAMetalLayer { return layer as! CAMetalLayer }
     override init(frame: CGRect) {
@@ -61,7 +68,7 @@ final class MetalHostView: UIView {
 
 // SwiftUI-hosted placeholder: geometry + touch input only.
 final class MetalBackedView: UIView {
-    private var hostView: MetalHostView?
+    private static var layerRegistered = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -81,37 +88,50 @@ final class MetalBackedView: UIView {
     // ~1 FPS content mostly doesn't. Resolution path: raise game FPS (perf
     // work), with a steady-rate re-present in DXMT as fallback insurance.
 
+    /// Largest 4:3 rect (the 1024×768 logical surface's aspect) that fits
+    /// centered in our bounds. The window-level host view gets THIS frame,
+    /// not our full bounds — otherwise landscape stretches the game to the
+    /// display edges (2026-07-05). Touch mapping uses the same rect so
+    /// letterboxing never skews input.
+    private func gameRect() -> CGRect {
+        let gw: CGFloat = 1024, gh: CGFloat = 768
+        let scale = min(bounds.width / gw, bounds.height / gh)
+        let w = gw * scale, h = gh * scale
+        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
+                      width: max(w, 1), height: max(h, 1))
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if let w = window {
-            if hostView == nil {
-                let host = MetalHostView(frame: convert(bounds, to: w))
-                w.addSubview(host)
-                hostView = host
-                mythic_display_set_layer(host.metalLayer)
-                LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted)", level: .success)
-            }
-        } else {
-            hostView?.removeFromSuperview()
-            hostView = nil
+        guard let w = window else { return }   // detach: leave the host be
+        let host = MetalHostView.shared
+        if host.superview !== w {
+            host.removeFromSuperview()
+            w.addSubview(host)
+        }
+        host.frame = convert(gameRect(), to: w)
+        if !Self.layerRegistered {
+            Self.layerRegistered = true
+            mythic_display_set_layer(host.metalLayer)
+            LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
         }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        if let w = window, let host = hostView {
-            host.frame = convert(bounds, to: w)
+        if let w = window {
+            MetalHostView.shared.frame = convert(gameRect(), to: w)
         }
     }
 
     // Map touch point in view-local UI points to the 1024×768 logical
-    // surface DXMT swapchains use, then post to winios.drv.
+    // surface DXMT swapchains use, then post to winios.drv. Coordinates
+    // are relative to the aspect-fit gameRect (letterbox borders clamp).
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
         let p = touch.location(in: self)
-        let w = max(1, bounds.width)
-        let h = max(1, bounds.height)
-        let x = Int32(p.x * 1024 / w)
-        let y = Int32(p.y * 768  / h)
+        let r = gameRect()
+        let x = Int32(min(max((p.x - r.minX) * 1024 / r.width, 0), 1023))
+        let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
         return (x, y)
     }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -137,6 +157,38 @@ final class MetalBackedView: UIView {
     }
 }
 
+/// Arrow-key button with press/hold/release semantics. DragGesture with
+/// zero minimum distance fires onChanged at touch-down (key down once)
+/// and onEnded at lift (key up) — unlike Button, which only taps.
+struct HoldKeyView: View {
+    let label: String
+    let vk: Int32
+    var big = false   // landscape D-pad: thumb-sized
+    @State private var isDown = false
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: big ? 22 : 14, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .frame(minWidth: big ? 56 : 34, minHeight: big ? 56 : 30)
+            .background(Color.white.opacity(isDown ? 0.35 : 0.15))
+            .cornerRadius(big ? 12 : 6)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        if !isDown {
+                            isDown = true
+                            winios_post_key(vk, 1)
+                        }
+                    }
+                    .onEnded { _ in
+                        isDown = false
+                        winios_post_key(vk, 0)
+                    }
+            )
+    }
+}
+
 // SwiftUI wrapper around the placeholder view.
 struct MythicMetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MetalBackedView {
@@ -151,6 +203,8 @@ struct ContentView: View {
     @State private var entitlements: EntitlementStatus?
     @State private var showSetupGuide = false
     @State private var debuggerAttached = isDebuggerAttached()
+    /// .compact = iPhone landscape: game surface expands, arrow keys appear.
+    @Environment(\.verticalSizeClass) private var vSizeClass
 
     enum JITStatus {
         case unknown
@@ -162,48 +216,20 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 0) {
-                // Status header
-                statusHeader
-
-                // Entitlement status
-                if let ents = entitlements {
-                    entitlementBadges(ents)
+            Group {
+                if vSizeClass == .compact {
+                    landscapeBody
+                } else {
+                    portraitBody
                 }
-
-                Divider()
-
-                // Metal render surface for DXMT output, with FPS overlay top-right
-                // and a minimal key row bottom-left (menu navigation for games
-                // that ignore mouse input, e.g. Thumper wants Enter/Space).
-                // NOTE: the game surface is a raw window-level view positioned
-                // over this strip (see MetalHostView) — SwiftUI content placed
-                // "on top" here would be covered. Overlay + key row live BELOW.
-                MythicMetalView()
-                    .frame(height: 240)
-                    .background(Color.black)
-                HStack(spacing: 6) {
-                    keyButton("⏎", vk: 0x0D)   // VK_RETURN
-                    keyButton("␣", vk: 0x20)   // VK_SPACE
-                    keyButton("Esc", vk: 0x1B) // VK_ESCAPE
-                    Spacer()
-                    FPSOverlay()
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-
-                Divider()
-
-                // Action buttons
-                actionButtons
-
-                Divider()
-
-                // Log console
-                logConsole
             }
+            // Rotation destroys/recreates the UIViewRepresentable across
+            // this if/else (two SwiftUI identities) — HARMLESS since
+            // 2026-07-05: MetalHostView is a process-lifetime singleton;
+            // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Mythic")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationBarHidden(vSizeClass == .compact)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { showSetupGuide = true }) {
@@ -220,6 +246,81 @@ struct ContentView: View {
                 logEntitlementStatus()
             }
         }
+    }
+
+    /// Portrait: classic tooling layout — header, badges, 240pt game strip,
+    /// key row, action buttons, log console.
+    private var portraitBody: some View {
+        VStack(spacing: 0) {
+            statusHeader
+            if let ents = entitlements {
+                entitlementBadges(ents)
+            }
+            Divider()
+            // Game surface strip. NOTE: the surface itself is a raw
+            // window-level view positioned over this placeholder
+            // (MetalHostView.shared) — SwiftUI content laid "on top" of the
+            // strip would be covered. Overlay + key row live BELOW.
+            MythicMetalView()
+                .frame(height: 240)
+                .background(Color.black)
+            HStack(spacing: 6) {
+                keyButton("⏎", vk: 0x0D)   // VK_RETURN
+                keyButton("␣", vk: 0x20)   // VK_SPACE
+                keyButton("Esc", vk: 0x1B) // VK_ESCAPE
+                Spacer()
+                FPSOverlay()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            Divider()
+            actionButtons
+            Divider()
+            logConsole
+        }
+    }
+
+    /// Landscape: game mode. Full-height 4:3 surface centered (aspect-fit
+    /// happens in MetalBackedView); ALL controls live in the pillarbox
+    /// bars left/right of the game — the window-level surface would cover
+    /// anything drawn over the game area itself. No header/log/nav chrome.
+    private var landscapeBody: some View {
+        GeometryReader { geo in
+            let gameW = min(geo.size.width, geo.size.height * 4.0 / 3.0)
+            let barW = max((geo.size.width - gameW) / 2.0, 44)
+            ZStack {
+                Color.black
+                MythicMetalView()
+                HStack(spacing: 0) {
+                    // Left bar: D-pad (hold semantics — Thumper's turns
+                    // are held keys).
+                    VStack(spacing: 12) {
+                        Spacer()
+                        holdKeyButton("▲", vk: 0x26, big: true)
+                        HStack(spacing: 16) {
+                            holdKeyButton("◀", vk: 0x25, big: true)
+                            holdKeyButton("▶", vk: 0x27, big: true)
+                        }
+                        holdKeyButton("▼", vk: 0x28, big: true)
+                        Spacer()
+                    }
+                    .frame(width: barW)
+                    Spacer(minLength: 0)
+                    // Right bar: FPS readout (compact) + menu keys.
+                    VStack(spacing: 12) {
+                        FPSOverlay(compact: true)
+                        Spacer()
+                        keyButton("⏎", vk: 0x0D)
+                        keyButton("␣", vk: 0x20)
+                        keyButton("Esc", vk: 0x1B)
+                        Spacer()
+                    }
+                    .frame(width: barW)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .background(Color.black)
     }
 
     private var statusHeader: some View {
@@ -247,6 +348,12 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+
+    /// Hold-to-press key: VK down on touch, VK up on release — for keys
+    /// games treat as held (arrows). Same winios queue as keyButton.
+    private func holdKeyButton(_ label: String, vk: Int32, big: Bool = false) -> some View {
+        HoldKeyView(label: label, vk: vk, big: big)
     }
 
     /// Small on-screen key: posts VK down, then up 60ms later, through the
