@@ -21,7 +21,26 @@
 
 #include "config.h"
 #include <os/log.h>
+#include <mach/mach_time.h>
+#include <mach/mach_init.h>
+#include <mach/semaphore.h>
+#include <mach/task.h>
 #include "wine_log_ios.h"
+
+/* iOS-Mythic 2026-07-05: in-process request-wake semaphore. The iOS
+ * server loop can't block in poll/kqueue (AF_UNIX invisible in the
+ * sandbox), so it slept a fixed 1ms tick — meaning every client request
+ * waited avg ~0.5ms (worst 1ms+) just to be NOTICED. Thumper does 8
+ * zero-timeout WaitForSingleObject polls per frame; each paid ~1.15ms
+ * of pure pickup+round-trip latency = the 55-vs-60 FPS gap. Clients
+ * (ntdll's server_call_unlocked, same process) signal this semaphore
+ * right after writing a request; the loop sleeps in semaphore_timedwait
+ * and wakes instantly. Extra signals just cause cheap extra scans. */
+semaphore_t ios_srv_wake_sem = 0;
+void ios_wineserver_wake(void)
+{
+    if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
+}
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
 
@@ -1040,6 +1059,7 @@ void main_loop(void)
         static int ios_events_fired = 0;
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
+        unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
         extern volatile int g_injected_client_fd;
@@ -1049,6 +1069,12 @@ void main_loop(void)
         extern volatile int g_wineserver_should_stop;
 
         ws_log("[wineserver-fd] iOS poll loop: master_fd=%d nb_users=%d active=%d", pollfd[0].fd, nb_users, active_users);
+        {
+            kern_return_t skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem,
+                                                  SYNC_POLICY_FIFO, 0 );
+            ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
+            if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
+        }
         while (active_users)
         {
             /* Check stop flag */
@@ -1058,8 +1084,14 @@ void main_loop(void)
                 break;
             }
 
-            /* Process expired timers */
-            timeout = get_next_timeout( NULL );
+            /* Process expired timers (also computes the next deadline) */
+            {
+                struct timespec next_ts;
+                timeout = get_next_timeout( &next_ts );
+                ios_next_timer_ns = (timeout >= 0)
+                    ? (unsigned long long)next_ts.tv_sec * 1000000000ull + next_ts.tv_nsec
+                    : ~0ull;
+            }
             if (!active_users) { ws_log("[wineserver-fd] LOOP EXIT: active_users=0 at iter=%d", ios_iter); break; }
 
             ios_iter++;
@@ -1090,7 +1122,37 @@ void main_loop(void)
                 }
             }
 
-            usleep( 1000 );  /* 1ms polling interval */
+            /* iOS-Mythic 2026-07-05: deadline-aware, REQUEST-INTERRUPTIBLE
+             * sleep (was a fixed usleep(1000)). Duration = min(1ms tick,
+             * next timer deadline) so timer wakes are exact (~50us); and
+             * the sleep is a semaphore_timedwait so a client signaling
+             * ios_srv_wake_sem after writing a request wakes the loop
+             * IMMEDIATELY — request pickup drops from avg ~0.5ms to ~50us.
+             * Thumper's 8 zero-timeout polls/frame each paid the old
+             * pickup latency: the 55-vs-60 FPS gap. */
+            {
+                unsigned long long sleep_ns = 1000000ull;
+                if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
+                if (sleep_ns > 0)
+                {
+                    if (ios_srv_wake_sem)
+                    {
+                        mach_timespec_t wts;
+                        wts.tv_sec = (unsigned int)(sleep_ns / 1000000000ull);
+                        wts.tv_nsec = (int)(sleep_ns % 1000000000ull);
+                        semaphore_timedwait( ios_srv_wake_sem, wts );
+                    }
+                    else
+                    {
+                        static mach_timebase_info_data_t ios_tb;
+                        unsigned long long deadline;
+                        if (!ios_tb.denom) mach_timebase_info( &ios_tb );
+                        deadline = mach_absolute_time()
+                                 + sleep_ns * ios_tb.denom / ios_tb.numer;
+                        mach_wait_until( deadline );
+                    }
+                }
+            }
             set_current_time();
 
             /* Check non-master fds for events.

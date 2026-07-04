@@ -32,6 +32,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <time.h>
 /* From signal_arm64_ios.c — written by __wine_syscall_dispatcher at entry */
 extern volatile uint64_t g_wine_dispatcher_x18;
 extern volatile uint64_t g_wine_dispatcher_count;
@@ -374,6 +375,19 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 }
 
 
+/* iOS-Mythic 2026-07-05: per-present frame-anatomy counters, read by
+ * winemetal_unix's Present-cadence log line (same binary). The wait
+ * accounting is gated to the GAME thread (main Wine thread, captured in
+ * server_init_process_done) so FMOD/worker threads blocking forever in
+ * waits don't swamp the signal. Question they answer: is the last
+ * ~1.5ms to locked-60 server-request WORK or wait-wake LATENCY? */
+volatile long long ios_srv_wait_us = 0;   /* game thread: wall us blocked in server_wait */
+volatile long long ios_srv_wait_req_us = 0; /* game thread: REQUESTED timeout us (finite waits) */
+volatile int ios_srv_wait_count = 0;      /* game thread: server_wait calls */
+volatile int ios_srv_wait_timeouts = 0;   /* ... of which returned STATUS_TIMEOUT */
+volatile int ios_srv_req_count = 0;       /* ALL threads: wineserver requests */
+uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_done */
+
 /***********************************************************************
  *           server_call_unlocked
  */
@@ -382,7 +396,15 @@ unsigned int server_call_unlocked( void *req_ptr )
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
 
+    ios_srv_req_count++;
     if ((ret = send_request( req ))) return ret;
+    /* iOS-Mythic 2026-07-05: kick the in-process server loop out of its
+     * tick sleep so the request is picked up in ~50us instead of waiting
+     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
+    {
+        extern void ios_wineserver_wake(void);
+        ios_wineserver_wake();
+    }
     return wait_reply( req );
 }
 
@@ -899,7 +921,37 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         abs_timeout -= now.QuadPart;
     }
 
-    ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+    {
+        int is_game = ios_srv_game_teb &&
+                      (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
+        struct timespec t0, t1;
+        if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+        if (is_game)
+        {
+            clock_gettime( CLOCK_MONOTONIC, &t1 );
+            ios_srv_wait_us += (t1.tv_sec - t0.tv_sec) * 1000000LL
+                             + (t1.tv_nsec - t0.tv_nsec) / 1000;
+            ios_srv_wait_count++;
+            if (ret == STATUS_TIMEOUT) ios_srv_wait_timeouts++;
+            /* Requested duration: only for RELATIVE timeouts (negative
+             * input) — those were converted to QPC-epoch absolutes above,
+             * so abs_timeout and QPC share an epoch. Positive inputs are
+             * NT-1601-epoch absolutes and would poison the math.
+             * overshoot/wait = (w_ms - wreq_ms)/waits per window. */
+            if (timeout && timeout->QuadPart < 0)
+            {
+                LARGE_INTEGER entry_now;
+                long long req_us;
+                NtQueryPerformanceCounter( &entry_now, NULL );
+                /* entry_now is post-wait; reconstruct from measured wall */
+                req_us = (abs_timeout - entry_now.QuadPart) / 10
+                       + (t1.tv_sec - t0.tv_sec) * 1000000LL
+                       + (t1.tv_nsec - t0.tv_nsec) / 1000;
+                if (req_us > 0) ios_srv_wait_req_us += req_us;
+            }
+        }
+    }
     if (ret == STATUS_USER_APC) return invoke_user_apc( NULL, &apc, ret );
 
     /* A test on Windows 2000 shows that Windows always yields during
@@ -1985,6 +2037,13 @@ void server_init_process_done(void)
     int suspend;
     FILE_FS_DEVICE_INFORMATION info;
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+
+    /* iOS-Mythic: this runs on the main (game) thread exactly once —
+     * capture its TEB for the server_wait frame-anatomy accounting. */
+    {
+        extern uintptr_t ios_srv_game_teb;
+        ios_srv_game_teb = (uintptr_t)NtCurrentTeb();
+    }
 
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
