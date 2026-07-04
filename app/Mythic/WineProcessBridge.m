@@ -131,6 +131,23 @@ static void *wine_process_thread(void *arg) {
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
 
+        /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
+         * on) booted to menu at 17-18 FPS with the x18-access emulator
+         * firing 135K+ times cleanly — handler fixes EXONERATED. The
+         * libsystem_malloc death is specific to UNIXCALL-DIRECT. Env
+         * removed; next crash run carries an fp-walk backtrace + malloc
+         * prologue dump to name the Metal call handing free() a garbage
+         * pointer. */
+
+        /* 2026-07-04: MYTHIC_HEAL retried with XLATE-HOOK-REV in place and
+         * STILL fatal — same C000001D libplatform (os_unfair_lock abort)
+         * seconds after healing the ntdll dispatch-thunk VA at boot. One of
+         * the rewritten slots has a consumer doing identity/offset math on
+         * the PE VA, which no unwinder fix helps. Blanket healing is dead;
+         * the fault-latency attack needs slot-level forensics (which slot
+         * is the pure branch-feeder) or a writer-side fix. Healer stays
+         * opt-in-off. */
+
         /* Steam game vars — Thumper queries SteamAppPath dozens of times in init
          * and uses it as base path for asset loading. Prior comment claimed
          * setenv didn't propagate to Wine's GetEnvironmentVariableW, but reading
