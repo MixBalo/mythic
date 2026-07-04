@@ -131,6 +131,16 @@ static void *wine_process_thread(void *arg) {
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
 
+        /* 2026-07-05 quiet/release mode: disables the heavyweight
+         * diagnostics — the PROF sampler (thread_suspends the game thread
+         * ~500x/s), per-present log lines (100+/s at RAW rates), winios
+         * poll heartbeat. Counters (present count for the FPS overlay,
+         * machexc, srvw) keep ticking; ERR-level and boot logging are
+         * untouched. Worth a few %% of frame time and, more importantly,
+         * HEAT — thermals are what cap ProMotion at 60. COMMENT THIS OUT
+         * for diagnostic/profiling sessions. */
+        setenv("MYTHIC_QUIET", "1", 1);
+
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
          * on) booted to menu at 17-18 FPS with the x18-access emulator
          * firing 135K+ times cleanly — handler fixes EXONERATED. The

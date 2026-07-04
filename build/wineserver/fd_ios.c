@@ -683,7 +683,10 @@ static inline void set_fd_epoll_events( struct fd *fd, int user, int events )
 {
     struct kevent ev[2];
 
-    if (kqueue_fd == -1) { ws_log("[wineserver-fd] set_fd_epoll_events: kqueue_fd=-1, skipping"); return; }
+    /* iOS-Mythic 2026-07-05: log line removed — kqueue is always skipped
+     * on iOS (poll fallback) and this fired per fd-event change: 3,234
+     * lines of pure noise in one gameplay run. */
+    if (kqueue_fd == -1) return;
 
     EV_SET( &ev[0], fd->unix_fd, EVFILT_READ, 0, NOTE_LOWAT, 1, (void *)(long)user );
     EV_SET( &ev[1], fd->unix_fd, EVFILT_WRITE, 0, NOTE_LOWAT, 1, (void *)(long)user );

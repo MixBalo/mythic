@@ -166,7 +166,9 @@ void winios_post_key(int vk, int down) {
 
 BOOL winios_pProcessEvents(DWORD mask) {
     static unsigned int cnt;
-    if ((cnt++ % 240) == 0) {
+    static int quiet = -1;
+    if (quiet < 0) quiet = getenv("MYTHIC_QUIET") != NULL;
+    if ((cnt++ % 240) == 0 && !quiet) {
         fprintf(stderr, "[winios] pProcessEvents called n=%u\n", cnt); fflush(stderr);
     }
     BOOL drained = FALSE;

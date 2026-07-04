@@ -2177,7 +2177,14 @@ void server_init_process_done(void)
          * (unix side), or elsewhere — mapping the hot buckets tells us
          * where the ~1.4s/frame actually goes. Counts halve at each print
          * so the histogram tracks the current phase. */
+        if (!getenv("MYTHIC_QUIET"))
         {
+            /* iOS-Mythic 2026-07-05 quiet mode: the sampler thread_suspends
+             * the game thread ~500x/s (each suspend+get_state+resume steals
+             * wall time and adds jitter) — a few %% of frame time plus heat,
+             * and heat is what caps ProMotion at 60. MYTHIC_QUIET (set in
+             * WineProcessBridge.m) skips the profiler entirely; comment the
+             * setenv out for diagnostic sessions. */
             pthread_t prof_pthread = pthread_self();
             mach_port_t prof_thread_initial = pthread_mach_thread_np(prof_pthread);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
