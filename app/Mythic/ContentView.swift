@@ -150,6 +150,7 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var showSetupGuide = false
+    @State private var debuggerAttached = isDebuggerAttached()
 
     enum JITStatus {
         case unknown
@@ -268,13 +269,18 @@ struct ContentView: View {
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
         HStack(spacing: 8) {
-            entitlementBadge("JIT", granted: ents.jitAllowed)
+            // Live debugger/JIT state, not the (macOS-only, never granted on
+            // iOS) allow-jit entitlement the old badge checked.
+            entitlementBadge("JIT", granted: debuggerAttached)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
             Spacer()
         }
         .padding(.horizontal)
         .padding(.bottom, 8)
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            debuggerAttached = isDebuggerAttached()
+        }
     }
 
     private func entitlementBadge(_ label: String, granted: Bool) -> some View {

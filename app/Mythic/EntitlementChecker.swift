@@ -42,3 +42,17 @@ struct EntitlementStatus {
         )
     }
 }
+
+/* Runtime check: is a debugger attached to this process (P_TRACED)?
+ * This is the signal StikDebug JIT actually rides on — CS_DEBUGGED gets
+ * set while traced, enabling JIT-region execution. The allow-jit
+ * ENTITLEMENT is macOS-only and never granted on iOS, so the old badge
+ * built on it was permanently ✗ no matter what StikDebug did. */
+func isDebuggerAttached() -> Bool {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+    let ret = sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0)
+    guard ret == 0 else { return false }
+    return (info.kp_proc.p_flag & P_TRACED) != 0
+}

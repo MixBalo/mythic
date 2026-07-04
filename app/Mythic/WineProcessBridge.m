@@ -253,6 +253,17 @@ static void *wine_process_thread(void *arg) {
                 NSArray *vcrtDlls = [fm contentsOfDirectoryAtPath:vcrtSource error:nil];
                 int vcrtLinked = 0, vcrtSkipped = 0;
                 for (NSString *dll in vcrtDlls) {
+                    /* NOTE 2026-07-03 (late): retried lifting BOTH exemptions
+                     * below after the fast-write bisect, hoping trap-mode had
+                     * fixed the corruption class (and to keep hot CRT calls
+                     * like memcpy inside the JIT — they cost a full x64→EC
+                     * round trip as ARM64EC builtins, a large share of the
+                     * 57ms menu frame). Result: guest RIP jumped to junk
+                     * (0x600000010xx, lr=0xa59696ff...) right after
+                     * MSVCP140/VCRUNTIME140 loaded x86_64, before present #1.
+                     * So the x86→EC SEH/transition corruption is NOT the
+                     * fast-write bug — it's still unfixed, and these
+                     * exemptions must stay until it is. */
                     /* Keep vcruntime140.dll as the ARM64EC builtin: its
                      * __C_specific_handler is invoked by Wine's SEH dispatch,
                      * and routing that through FEX corrupts x86 RSP (SEH

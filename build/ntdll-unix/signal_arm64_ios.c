@@ -242,6 +242,12 @@ volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
 volatile int ios_exc_msg_count = 0;
+/* Last thread that took an exec fault at a PE VA (i.e. made a native call
+ * through the redirect path) — the game thread in practice. The [PROF]
+ * sampler in server_ios.c follows this so it profiles the presenting
+ * thread instead of whatever thread first hit signal_start_thread (which
+ * died ~33s in and left [PROF] sampling a corpse). */
+volatile mach_port_t ios_last_exec_fault_thread = MACH_PORT_NULL;
 
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
 static __thread void *ios_my_trampoline = NULL;
@@ -434,7 +440,9 @@ static void *ios_mach_exception_thread( void *arg )
                     else
                     {
                         /* Exec fault OUTSIDE JIT pool RX — try translations. */
-                        void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        void *jit_pc;
+                        ios_last_exec_fault_thread = thread;
+                        jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
                         if (jit_pc == (void *)(uintptr_t)fault_pc)
                         {
                             /* iOS-Mythic: if PC is in JIT pool RW alias range,

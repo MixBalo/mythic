@@ -2119,14 +2119,24 @@ void server_init_process_done(void)
          * so the histogram tracks the current phase. */
         {
             pthread_t prof_pthread = pthread_self();
-            mach_port_t prof_thread = pthread_mach_thread_np(prof_pthread);
+            mach_port_t prof_thread_initial = pthread_mach_thread_np(prof_pthread);
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                /* Follow the game thread: the Mach handler records the last
+                 * thread that took a PE-VA exec fault (= made a native call)
+                 * in ios_last_exec_fault_thread. The first Wine thread we
+                 * originally pinned dies ~33s in, which froze [PROF] before
+                 * the menu phase. Re-read every iteration so the profile
+                 * tracks whichever thread is actually driving frames. */
+                extern volatile mach_port_t ios_last_exec_fault_thread;
                 enum { PROF_SLOTS = 512 };
                 static uint64_t prof_keys[PROF_SLOTS];
                 static uint32_t prof_counts[PROF_SLOTS];
                 uint64_t total = 0;
+                mach_port_t prof_thread = prof_thread_initial;
                 for (;;) {
                     usleep(2000);
+                    if (ios_last_exec_fault_thread != MACH_PORT_NULL)
+                        prof_thread = ios_last_exec_fault_thread;
                     if (thread_suspend(prof_thread) != KERN_SUCCESS) { usleep(200000); continue; }
                     arm_thread_state64_t st;
                     mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
