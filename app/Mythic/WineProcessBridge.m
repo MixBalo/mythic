@@ -5,6 +5,11 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <pthread.h>
+/* AVFoundation: AVAudioSession activation for the Tier-2 audio driver
+ * (audio_null_ios.c RemoteIO backend). AudioToolbox: pulls the framework
+ * in via autolink — the static-lib driver code can't autolink itself. */
+#import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -140,6 +145,23 @@ static void *wine_process_thread(void *arg) {
          * HEAT — thermals are what cap ProMotion at 60. COMMENT THIS OUT
          * for diagnostic/profiling sessions. */
         setenv("MYTHIC_QUIET", "1", 1);
+
+        /* 2026-07-05 audio: activate the AVAudioSession before Wine boots
+         * so the RemoteIO unit in the mmdevapi driver can start. Playback
+         * category = ignores silent switch (it's a game). */
+        {
+            NSError *aerr = nil;
+            AVAudioSession *session = [AVAudioSession sharedInstance];
+            [session setCategory:AVAudioSessionCategoryPlayback error:&aerr];
+            if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
+                          aerr.localizedDescription.UTF8String);
+            aerr = nil;
+            [session setActive:YES error:&aerr];
+            if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
+                          aerr.localizedDescription.UTF8String);
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
+                     session.sampleRate, session.outputLatency * 1000.0);
+        }
 
         /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
          * on) booted to menu at 17-18 FPS with the x18-access emulator
