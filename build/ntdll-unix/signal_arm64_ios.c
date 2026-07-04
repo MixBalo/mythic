@@ -41,6 +41,7 @@
 #include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread/pthread.h>
+#include <pthread/qos.h>
 #include <fcntl.h>
 #endif
 #ifdef HAVE_SYS_PARAM_H
@@ -249,6 +250,93 @@ volatile int ios_exc_msg_count = 0;
  * died ~33s in and left [PROF] sampling a corpse). */
 volatile mach_port_t ios_last_exec_fault_thread = MACH_PORT_NULL;
 
+/* Real unix-side KUSER_SHARED_DATA address, for unix code (e.g. win32u's
+ * get_tick_count) that would otherwise read the canonical 0x7ffe0000 and
+ * eat a Mach fault per load. */
+unsigned long long ios_get_real_usd(void)
+{
+    return (unsigned long long)ios_exc_usd;
+}
+
+/* ---- Self-healing stale-pointer patcher ----------------------------------
+ * Mechanism-#2 exec faults: pool-resident module copies hold function
+ * pointers that still carry PE VAs (lazily-written ARM64EC aux-IAT slots,
+ * runtime GetProcAddress results — writes that happen pool-side AFTER the
+ * NtProtect sync/translate pass ran). Each call through such a pointer
+ * faults (~8K/s in gameplay, each suspending the calling thread for a full
+ * handler round trip). The Mach handler enqueues every distinct faulted
+ * PE VA here; a low-priority scanner thread rewrites EVERY 8-byte slot in
+ * the module-copy pool ranges holding that value to its pool equivalent.
+ * Each stale pointer faults once, then never again. FEX CodeBuffer ranges
+ * are NOT scanned (guest-RIP constants live there). */
+#define IOS_STALE_VA_MAX 64
+/* Only heal a VA once it has exec-faulted this many times. Boot-time
+ * one-shot redirects (thread entry points, DLL entry calls) fault a
+ * handful of times and must NOT be healed — pool slots legitimately hold
+ * some of those PE VAs (CONTEXT records, pending thread params), and
+ * rewriting them broke boot (2026-07-04 freeze, pre-splash NULL-deref
+ * livelock). The pathological stale pointers fault thousands of times per
+ * second; a threshold cleanly separates the two populations. */
+#define IOS_STALE_VA_HEAL_THRESHOLD 256
+static uint64_t ios_stale_va_seen[IOS_STALE_VA_MAX];
+static uint32_t ios_stale_va_hits[IOS_STALE_VA_MAX];
+static volatile int ios_stale_va_seen_count = 0;
+static uint64_t ios_stale_va_queue[IOS_STALE_VA_MAX];
+static volatile int ios_stale_va_head = 0;   /* written by scanner */
+static volatile int ios_stale_va_tail = 0;   /* written by exc handler */
+
+static void ios_stale_va_enqueue( uint64_t va )
+{
+    int i, n = ios_stale_va_seen_count;
+    for (i = 0; i < n; i++)
+    {
+        if (ios_stale_va_seen[i] == va)
+        {
+            if (++ios_stale_va_hits[i] == IOS_STALE_VA_HEAL_THRESHOLD)
+            {
+                ios_stale_va_queue[ios_stale_va_tail % IOS_STALE_VA_MAX] = va;
+                ios_stale_va_tail++;
+                fprintf( stderr, "[stale-heal] 0x%llx crossed %d faults — queued for heal\n",
+                         (unsigned long long)va, IOS_STALE_VA_HEAL_THRESHOLD );
+            }
+            return;
+        }
+    }
+    if (n >= IOS_STALE_VA_MAX) return;
+    ios_stale_va_seen[n] = va;
+    ios_stale_va_hits[n] = 1;
+    ios_stale_va_seen_count = n + 1;
+}
+
+static void *ios_stale_va_scanner( void *arg )
+{
+    extern int ios_jit_patch_stale_pointer( unsigned long long stale_va );
+    /* Healing is OPT-IN (MYTHIC_HEAL=1). Even gated at 256 faults, blind
+     * pointer rewriting broke boot twice (2026-07-04): rewrote ntdll
+     * arm64x metadata slots whose consumers need PE VAs (identity/range
+     * comparisons, not just branches) → C000001D in libplatform. Until
+     * per-slot semantics are understood (dump forensics), this thread
+     * only reports WHICH VAs cross the threshold — free targeting data
+     * with zero behavior change. */
+    int do_heal = getenv( "MYTHIC_HEAL" ) != NULL;
+    pthread_setname_np( "wine-stale-heal" );
+    for (;;)
+    {
+        usleep( 100000 );
+        while (ios_stale_va_head != ios_stale_va_tail)
+        {
+            uint64_t va = ios_stale_va_queue[ios_stale_va_head % IOS_STALE_VA_MAX];
+            ios_stale_va_head++;
+            if (do_heal)
+                ios_jit_patch_stale_pointer( va );
+            else
+                fprintf( stderr, "[stale-heal] (dry-run) hot stale VA 0x%llx — heal skipped (set MYTHIC_HEAL=1 to enable)\n",
+                         (unsigned long long)va );
+        }
+    }
+    return NULL;
+}
+
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
 static __thread void *ios_my_trampoline = NULL;
 static __thread int ios_my_slot = -1;
@@ -332,6 +420,15 @@ static void *ios_mach_exception_thread( void *arg )
 
     /* Name this thread for debugging */
     pthread_setname_np("wine-x18-exc");
+
+    /* 2026-07-04 perf: this thread is effectively an interrupt handler —
+     * every STR emulation, exec-fault redirect, and USD read (~2,600 per
+     * present-group in gameplay) suspends the faulting thread until THIS
+     * thread services the message. At default QoS it is E-core-eligible
+     * and can be preempted by every USER_INTERACTIVE game thread — each
+     * fault then pays scheduling latency on top of handling cost. Run it
+     * as hot as its clients. */
+    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
 
     ios_exc_thread_alive = 1;
 
@@ -443,6 +540,11 @@ static void *ios_mach_exception_thread( void *arg )
                         void *jit_pc;
                         ios_last_exec_fault_thread = thread;
                         jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        /* Module-mapping hit = a stale PE-VA pointer somewhere
+                         * in the pool — queue it for the heal scanner so this
+                         * address only ever faults once. */
+                        if (jit_pc != (void *)(uintptr_t)fault_pc)
+                            ios_stale_va_enqueue((uint64_t)fault_pc);
                         if (jit_pc == (void *)(uintptr_t)fault_pc)
                         {
                             /* iOS-Mythic: if PC is in JIT pool RW alias range,
@@ -1526,6 +1628,13 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         pthread_create( &handler, NULL, ios_mach_exception_thread,
                         (void *)(uintptr_t)ios_exc_port );
         pthread_detach( handler );
+
+        /* Stale-pointer heal scanner (see ios_stale_va_scanner above). */
+        {
+            pthread_t healer;
+            pthread_create( &healer, NULL, ios_stale_va_scanner, NULL );
+            pthread_detach( healer );
+        }
 
         ios_exc_handler_started = 1;
     }

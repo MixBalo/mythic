@@ -91,8 +91,13 @@ struct FPSOverlay: View {
     }
 
     /// Compute FPS over an adaptive window: starting from the newest sample,
-    /// walk backwards until the count delta is ≥ 3 (or we hit buffer start).
-    /// This gives a stable readout at any rate (≥3 frames in window).
+    /// walk backwards until the window holds ≥3 presents AND spans ≥1s (or we
+    /// hit buffer start). The 1s minimum matters: with 100ms sampling, a
+    /// short window quantizes the readout to presents/0.2s = multiples of
+    /// 5.0 — at a true ~19 FPS it displayed a rock-steady "20.0" (4 presents
+    /// per 0.2s) with "dips" to 15.0, which read as an artificial frame lock
+    /// (2026-07-04, cost a day of pacing-hunt confusion). ≥1s gives 1-FPS
+    /// resolution; still responsive for a debug readout.
     private func computeAdaptiveFPS() -> Double {
         guard samples.count >= 2 else { return 0 }
         let latest = samples.last!
@@ -101,7 +106,8 @@ struct FPSOverlay: View {
         for i in (0..<samples.count).reversed() {
             let candidate = samples[i]
             let delta = latest.c &- candidate.c
-            if delta >= 3 {
+            let span = latest.t - candidate.t
+            if delta >= 3 && span >= 1.0 {
                 oldest = candidate
                 break
             }

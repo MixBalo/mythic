@@ -143,11 +143,18 @@ int wineserver_start(const char *prefix_path) {
 
     g_wineserver_running = 1;
 
-    // Use lower priority so wineserver doesn't starve the main thread
+    /* 2026-07-04 perf: the wineserver thread used to be created at LOWERED
+     * priority (sched_priority 20, "so wineserver doesn't starve the main
+     * thread"). That made every client server-request round trip wait on a
+     * low-priority, E-core-eligible thread — [PROF] showed the game thread
+     * parked in read_reply_data (waiting for wineserver replies) for most
+     * of each 55ms frame while game threads run USER_INTERACTIVE: textbook
+     * priority inversion. The server is on the critical path of every
+     * object wait / message pump call — it must run AT LEAST as hot as its
+     * clients. */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    struct sched_param sched = { .sched_priority = 20 };  // lower than default (31)
-    pthread_attr_setschedparam(&attr, &sched);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
 
     int ret = pthread_create(&g_wineserver_thread, &attr, wineserver_thread_func, NULL);
     pthread_attr_destroy(&attr);

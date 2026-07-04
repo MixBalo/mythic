@@ -43,6 +43,11 @@ static char *g_prefix_path = NULL;
 
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
+        /* Perf: the guest main thread runs ON this pthread. Promote to
+         * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
+         * timer coalescing (same rationale as start_thread in
+         * thread_ios.c — default QoS costs tens of ms of sleep leeway). */
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         LOG("Wine process thread started");
 
         // Seed prefix from bundled template on first launch (Proton-style).

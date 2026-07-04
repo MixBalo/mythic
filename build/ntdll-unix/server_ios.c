@@ -27,6 +27,7 @@
 #ifdef WINE_IOS
 #include <os/log.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2131,6 +2132,13 @@ void server_init_process_done(void)
                 enum { PROF_SLOTS = 512 };
                 static uint64_t prof_keys[PROF_SLOTS];
                 static uint32_t prof_counts[PROF_SLOTS];
+                /* Secondary histogram: LR of samples whose PC is in the
+                 * dyld-shared-cache range. [PROF] showed ~87% of gameplay
+                 * time in ONE system-dylib bucket (a wait syscall) — the
+                 * LR names the Wine call site, symbolizable with atos
+                 * against the app binary. */
+                static uint64_t prof_lr_keys[PROF_SLOTS];
+                static uint32_t prof_lr_counts[PROF_SLOTS];
                 uint64_t total = 0;
                 mach_port_t prof_thread = prof_thread_initial;
                 for (;;) {
@@ -2144,13 +2152,21 @@ void server_init_process_done(void)
                                                         (thread_state_t)&st, &cnt);
                     thread_resume(prof_thread);
                     if (kr != KERN_SUCCESS) continue;
-                    uint64_t key = arm_thread_state64_get_pc(st) >> 8;
+                    uint64_t pc_full = arm_thread_state64_get_pc(st);
+                    uint64_t key = pc_full >> 8;
                     int i, free_i = -1;
                     for (i = 0; i < PROF_SLOTS; i++) {
                         if (prof_counts[i] && prof_keys[i] == key) { prof_counts[i]++; break; }
                         if (!prof_counts[i] && free_i < 0) free_i = i;
                     }
                     if (i == PROF_SLOTS && free_i >= 0) { prof_keys[free_i] = key; prof_counts[free_i] = 1; }
+                    if (pc_full >= 0x180000000ULL && pc_full < 0x260000000ULL) {
+                        uint64_t lr_key = arm_thread_state64_get_lr(st) >> 4;
+                        for (i = 0; i < PROF_SLOTS; i++) {
+                            if (prof_lr_counts[i] && prof_lr_keys[i] == lr_key) { prof_lr_counts[i]++; break; }
+                            if (!prof_lr_counts[i]) { prof_lr_keys[i] = lr_key; prof_lr_counts[i] = 1; break; }
+                        }
+                    }
                     total++;
                     if ((total % 4096) == 0) {
                         /* top-10 by count (simple selection; 512 slots) */
@@ -2167,6 +2183,32 @@ void server_init_process_done(void)
                         }
                         dprintf(STDERR_FILENO, "%s\n", line);
                         for (i = 0; i < PROF_SLOTS; i++) prof_counts[i] >>= 1;
+
+                        /* top-8 wait-callers (LR of system-range samples),
+                         * self-symbolized via dladdr (works for dyld-cache
+                         * addresses; app-dylib statics resolve to nearest
+                         * exported symbol — cross-check offline with atos). */
+                        len = 0;
+                        len += snprintf(line + len, sizeof(line) - len, "[PROF-LR] top:");
+                        for (int rank = 0; rank < 8 && len < (int)sizeof(line) - 100; rank++) {
+                            int best = -1; uint32_t bc = 0;
+                            Dl_info info;
+                            uint64_t addr;
+                            for (i = 0; i < PROF_SLOTS; i++)
+                                if (prof_lr_counts[i] > bc) { bc = prof_lr_counts[i]; best = i; }
+                            if (best < 0 || bc == 0) break;
+                            addr = prof_lr_keys[best] << 4;
+                            if (rank < 3 && dladdr((void *)(uintptr_t)addr, &info) && info.dli_sname)
+                                len += snprintf(line + len, sizeof(line) - len, " 0x%llx(%s+0x%llx)*%u",
+                                                (unsigned long long)addr, info.dli_sname,
+                                                (unsigned long long)(addr - (uintptr_t)info.dli_saddr), bc);
+                            else
+                                len += snprintf(line + len, sizeof(line) - len, " 0x%llx*%u",
+                                                (unsigned long long)addr, bc);
+                            prof_lr_counts[best] = 0;
+                        }
+                        dprintf(STDERR_FILENO, "%s\n", line);
+                        for (i = 0; i < PROF_SLOTS; i++) prof_lr_counts[i] >>= 1;
                     }
                 }
             });

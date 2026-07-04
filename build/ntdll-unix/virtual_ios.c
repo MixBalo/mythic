@@ -437,6 +437,44 @@ void *ios_jit_translate_addr(void *addr)
     return addr;  /* Not in any mapping */
 }
 
+/* Self-heal one stale PE-VA pointer: rewrite every 8-byte-aligned slot in
+ * the module-copy pool ranges that holds `stale_va` to its pool-VA
+ * equivalent. Called from the heal scanner thread (signal_arm64_ios.c)
+ * for addresses that actually took an exec fault — i.e. values being
+ * BRANCHED to, not arbitrary lookalikes. Scans only registered module
+ * copies (never the FEX CodeBuffer tail, which embeds guest RIPs as
+ * data). Writes go to the RW alias; concurrent readers that still load
+ * the old value just take one more fault-redirect, which is benign. */
+int ios_jit_patch_stale_pointer(unsigned long long stale_va)
+{
+    int i, patched = 0;
+    void *target = ios_jit_translate_addr((void *)(uintptr_t)stale_va);
+    if (target == (void *)(uintptr_t)stale_va) return 0;
+    if (!ios_jit_rw_base_global || !ios_jit_rx_base_global) return 0;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t pool_off = (uintptr_t)ios_jit_mappings[i].jit_base
+                           - (uintptr_t)ios_jit_rx_base_global;
+        uint64_t *p = (uint64_t *)((char *)ios_jit_rw_base_global + pool_off);
+        uint64_t *end = (uint64_t *)((char *)p + (ios_jit_mappings[i].size & ~(size_t)7));
+        for (; p < end; p++)
+        {
+            if (*p == stale_va)
+            {
+                *p = (uint64_t)(uintptr_t)target;
+                patched++;
+            }
+        }
+    }
+    /* fprintf, not ERR — the perf WINEDEBUG default mutes err+virtual and
+     * this MUST stay visible (silent healing hid the 2026-07-04 boot
+     * breakage). */
+    fprintf(stderr, "[stale-heal] 0x%llx -> %p, rewrote %d slot(s)\n",
+            stale_va, target, patched);
+    return patched;
+}
+
 /* Reverse-translate a JIT pool address back to the original PE address.
  * Used when PE code passes ADRP-computed addresses to syscalls. */
 void *ios_jit_reverse_translate_addr(const void *addr)

@@ -45,7 +45,28 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 #define QS_HARDWARE     0x40000000
 #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
 
+#ifdef WINE_IOS
+/* iOS: the canonical 0x7ffe0000 page can't be mapped (the app's 4GB
+ * __PAGEZERO covers it), so every read through that address costs a Mach
+ * exception round trip via the handler's USD redirect — and get_tick_count
+ * below does THREE such loads per call, on every message-loop poll
+ * (profiled as a top residual fault source in gameplay). Resolve the real
+ * unix-side USD mapping once instead. */
+static const struct _KUSER_SHARED_DATA *get_user_shared_data(void)
+{
+    extern unsigned long long ios_get_real_usd(void);
+    static const struct _KUSER_SHARED_DATA *usd;
+    if (!usd)
+    {
+        unsigned long long real = ios_get_real_usd();
+        usd = (const struct _KUSER_SHARED_DATA *)(uintptr_t)(real ? real : 0x7ffe0000ULL);
+    }
+    return usd;
+}
+#define user_shared_data get_user_shared_data()
+#else
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+#endif
 
 static LONG atomic_load_long( const volatile LONG *ptr )
 {

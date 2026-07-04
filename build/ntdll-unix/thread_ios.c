@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1122,6 +1123,15 @@ static void start_thread( TEB *teb )
 {
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     BOOL suspend;
+
+    /* iOS-Mythic 2026-07-04 perf: promote guest threads to USER_INTERACTIVE
+     * QoS. Default-QoS pthreads on iOS are E-core-eligible and get heavy
+     * kernel timer coalescing (tens of ms of wakeup leeway on
+     * select/nanosleep). [PROF] showed the game thread parked ~87% of each
+     * 59ms frame in one system wait — if that's a frame-limiter sleep being
+     * coalesced, this alone can collapse the wait to its requested length.
+     * USER_INTERACTIVE = P-core scheduling + minimal timer leeway. */
+    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
