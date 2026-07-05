@@ -1676,6 +1676,15 @@ static const void *get_module_data_dir( HMODULE module, ULONG dir, ULONG *size )
 /***********************************************************************
  *           load_ntdll_functions
  */
+#ifdef WINE_IOS
+/* S1 pseudo-processes: locations of the dispatcher slots in ntdll's PE
+ * .data (unix-side view). Saved so wine_ios_child_main can verify (and
+ * repair) the slots inside a child's fresh ntdll copy. */
+void **ios_ntdll_syscall_dispatcher_ptr = NULL;
+void **ios_ntdll_unix_call_dispatcher_ptr = NULL;
+unixlib_handle_t *ios_ntdll_unixlib_handle_ptr = NULL;
+#endif
+
 static void load_ntdll_functions( HMODULE module )
 {
     void **p__wine_syscall_dispatcher;
@@ -1822,6 +1831,11 @@ static void load_ntdll_functions( HMODULE module )
                 jit_handle_p, (unsigned long long)*(uint64_t*)jit_handle_p);
         }
         ERR("synced dispatchers to JIT .data\n");
+
+        /* S1: remember the slot locations for child-copy verification */
+        ios_ntdll_syscall_dispatcher_ptr = p__wine_syscall_dispatcher;
+        ios_ntdll_unix_call_dispatcher_ptr = p__wine_unix_call_dispatcher;
+        ios_ntdll_unixlib_handle_ptr = p__wine_unixlib_handle;
     }
 
     /* iOS-Mythic Round 7 (2026-07-04): de-fault the unix-call path.
@@ -2602,6 +2616,15 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     child_peb->LdrData = NULL;            /* child builds fresh module list */
     child_peb->ImageBaseAddress = NULL;    /* set by init_startup_info */
     child_peb->ProcessParameters = NULL;   /* set by init_startup_info */
+    /* Clear locks/bitmaps that reference the parent's CRITICAL_SECTIONs.
+     * The child's LdrInitializeThunk (running against its own ntdll .data
+     * copy) creates fresh ones. Without clearing, child and parent would
+     * contend on shared CS state. */
+    child_peb->LoaderLock = NULL;
+    child_peb->FastPebLock = NULL;
+    child_peb->TlsBitmap = NULL;
+    child_peb->TlsBitmapBits[0] = 0;
+    child_peb->TlsBitmapBits[1] = 0;
     /* Point child's TEB to the new PEB */
     teb->Peb = child_peb;
 
@@ -2615,6 +2638,20 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     {
         extern pthread_key_t ios_teb_tls_key;
         pthread_setspecific( ios_teb_tls_key, teb );
+    }
+
+    /* Mirror the TEB into raw TSD slot 275 (offset 0x898), like start_thread
+     * and the main-thread init do. The x18 trampolines in the child's ntdll
+     * copy load the TEB from this slot; without it every patched x18 access
+     * on this thread reads TEB=0 and faults (S1 first-run storm: 60k+
+     * UNHANDLED at addr=<TEB field offset>, x17=0). The slot is zeroed
+     * again before thread exit (foreign ObjC destructor, S0 bugs 3+7). */
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        *(void **)(tsd_base + 275 * 8) = teb;
+        dprintf(STDERR_FILENO, "[Wine child] TEB %p mirrored to TSD slot 275\n", (void *)teb);
     }
 
     /* Switch global peb to child's PEB for the duration of child init.
@@ -2642,10 +2679,62 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         /* Set up thread stack */
         init_thread_stack( teb, 0, 0, 0 );
 
-        /* Share parent's JIT pool PE copies — no separate copies.
-         * The child uses the same ntdll .text/.data as the parent.
-         * This avoids __ulock_wait address mismatch and saves JIT pool space. */
-        dprintf(STDERR_FILENO, "[Wine child] sharing parent's JIT pool copies\n");
+        /* S1: per-child ntdll copy. The child cannot share the parent's
+         * ntdll .data (module list / loader lock / hash table collide), so
+         * copy the whole ntdll image into a fresh pool slot owned by this
+         * child's PEB. Owner-aware translation (this thread's TEB->Peb is
+         * already child_peb, and the TSD slot is set above) routes the
+         * child's ntdll faults + sync writes to its own copy; every other
+         * module falls back to the shared parent copies. */
+        {
+            extern int ios_jit_copy_module_for_child(void *module_addr, void *child_peb);
+            extern void *ios_jit_translate_addr(void *addr);
+            extern void ios_jit_sync_write(void *addr, size_t size);
+
+            if (ios_jit_copy_module_for_child(pLdrInitializeThunk, child_peb) != 0)
+            {
+                dprintf(STDERR_FILENO, "[Wine child] ntdll copy FAILED — falling back to SHARED ntdll (module lists will collide!)\n");
+            }
+            else
+            {
+                /* Verify from this (child) thread: translation must now hit
+                 * the child copy, and the dispatcher slots inside it must
+                 * hold sane values (inherited via the copy + pool sweep). */
+                void *jit_ldr = ios_jit_translate_addr(pLdrInitializeThunk);
+                dprintf(STDERR_FILENO, "[Wine child] LdrInitializeThunk %p -> child copy %p\n",
+                        pLdrInitializeThunk, jit_ldr);
+                if (ios_ntdll_syscall_dispatcher_ptr)
+                {
+                    uint64_t *slot = ios_jit_translate_addr(ios_ntdll_syscall_dispatcher_ptr);
+                    dprintf(STDERR_FILENO, "[Wine child] child syscall_disp slot %p = 0x%llx (unix func %p)\n",
+                            slot, (unsigned long long)*slot, __wine_syscall_dispatcher);
+                    if (*slot != (uint64_t)(uintptr_t)__wine_syscall_dispatcher)
+                    {
+                        *ios_ntdll_syscall_dispatcher_ptr = (void *)(uintptr_t)__wine_syscall_dispatcher;
+                        ios_jit_sync_write(ios_ntdll_syscall_dispatcher_ptr, sizeof(void*));
+                        dprintf(STDERR_FILENO, "[Wine child]   -> repaired syscall dispatcher slot\n");
+                    }
+                }
+                if (ios_ntdll_unix_call_dispatcher_ptr)
+                {
+                    uint64_t *slot = ios_jit_translate_addr(ios_ntdll_unix_call_dispatcher_ptr);
+                    dprintf(STDERR_FILENO, "[Wine child] child unix_call_disp slot %p = 0x%llx\n",
+                            slot, (unsigned long long)*slot);
+                }
+                if (ios_ntdll_unixlib_handle_ptr)
+                {
+                    uint64_t *slot = ios_jit_translate_addr(ios_ntdll_unixlib_handle_ptr);
+                    dprintf(STDERR_FILENO, "[Wine child] child unixlib_handle slot %p = 0x%llx (want %p)\n",
+                            slot, (unsigned long long)*slot, (void *)unix_call_funcs);
+                    if (*slot != (uint64_t)(uintptr_t)unix_call_funcs)
+                    {
+                        *ios_ntdll_unixlib_handle_ptr = (UINT_PTR)unix_call_funcs;
+                        ios_jit_sync_write(ios_ntdll_unixlib_handle_ptr, sizeof(UINT_PTR));
+                        dprintf(STDERR_FILENO, "[Wine child]   -> repaired unixlib handle slot\n");
+                    }
+                }
+            }
+        }
 
         /* Keep peb = child_peb through server_init_process_done, because:
          * 1. server_init_process_done sends PEB address to wineserver

@@ -514,7 +514,7 @@ static void *ios_mach_exception_thread( void *arg )
                 extern void *ios_jit_rx_base_global;
                 extern size_t ios_jit_pool_size_global;
                 extern int ios_jit_addr_is_text(uintptr_t addr);
-                extern void *ios_jit_translate_addr(void *addr);
+                extern void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb);
 
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
@@ -537,10 +537,17 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     else
                     {
-                        /* Exec fault OUTSIDE JIT pool RX — try translations. */
+                        /* Exec fault OUTSIDE JIT pool RX — try translations.
+                         * IMPORTANT: this handler runs on its own thread, so
+                         * translation must use the FAULTING thread's process
+                         * (its registered TEB->Peb), not ours — a child
+                         * thread's ntdll fault must redirect to the child's
+                         * copy (S1 pseudo-processes). */
                         void *jit_pc;
+                        void *fault_owner_peb = thread_teb ? ((TEB *)thread_teb)->Peb : NULL;
                         ios_last_exec_fault_thread = thread;
-                        jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        jit_pc = ios_jit_translate_addr_for_owner((void *)(uintptr_t)fault_pc,
+                                                                  fault_owner_peb);
                         /* Module-mapping hit = a stale PE-VA pointer somewhere
                          * in the pool — queue it for the heal scanner so this
                          * address only ever faults once. */

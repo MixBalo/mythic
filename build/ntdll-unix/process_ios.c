@@ -453,6 +453,17 @@ static void *ios_child_thread_entry( void *arg )
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
     free( args->argv );
     free( args );
+
+    /* Zero TSD slot 275 before the implicit pthread_exit: we write the TEB
+     * there without owning the key, and a foreign Apple key with an ObjC
+     * destructor owns that slot — destructor(TEB) crashes in objc_release
+     * (S0 bugs 3+7; same guard as pthread_exit_wrapper). */
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        *(void **)(tsd_base + 275 * 8) = NULL;
+    }
     return NULL;
 }
 #endif

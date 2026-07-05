@@ -455,6 +455,17 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.teal)
 
+                Button("Run Proc Test (CreateProcess)") {
+                    // Steam S1 smoke test: proc-test.exe spawns
+                    // child-test.exe as a pseudo-process (thread group with
+                    // its own ntdll copy), waits, checks exit code 42.
+                    setenv("MYTHIC_EXE", "proc-test.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
                 Button("Continue Net Test") {
                     // VPN gate: the test PE pauses before the Steam stage
                     // (all TLS code already JIT-compiled by then) so the

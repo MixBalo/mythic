@@ -135,9 +135,24 @@ struct ios_jit_mapping {
     intptr_t reloc_delta;   /* JIT dest - PE ImageBase */
     unsigned int reloc_rva; /* RVA of .reloc section */
     unsigned int reloc_size;/* Size of .reloc data */
+    void *owner_peb;    /* NULL = parent/default copy; else the PEB of the
+                         * pseudo-process that owns this copy (S1 child
+                         * processes get their own ntdll image so module
+                         * lists / loader locks don't collide). Multiple
+                         * entries may share one pe_base; translation picks
+                         * the entry owned by the current thread's process,
+                         * falling back to the NULL-owner (parent) entry. */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
+
+/* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
+ * (was a function-local static there); file-scope so the S1 per-child
+ * ntdll copy allocates from the same cursor instead of guessing pool usage.
+ * The pool TAIL is carved separately by NtAllocateVirtualMemoryEx for FEX
+ * EC_CODE buffers. Static: internal linkage, no wineserver-style symbol
+ * collision risk. */
+static size_t jit_pool_offset = 0;
 
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 void *ios_jit_rx_base_global = NULL;
@@ -243,6 +258,7 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
     ios_jit_mappings[ios_jit_mapping_count].reloc_delta = 0;
     ios_jit_mappings[ios_jit_mapping_count].reloc_rva = 0;
     ios_jit_mappings[ios_jit_mapping_count].reloc_size = 0;
+    ios_jit_mappings[ios_jit_mapping_count].owner_peb = NULL;
     ios_jit_mapping_count++;
 
     /* If xtajit64 has already registered its alias-mapping push callback
@@ -270,11 +286,17 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     int i;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
     ios_jit_alias_pushback_cb = params->callback;
-    /* Drain current table to the callback. */
+    /* Drain current table to the callback. Child-owned copies are skipped:
+     * they share pe_base with the parent entry and pushing both would
+     * double-register the alias range in FEX (x86-64 children under FEX
+     * will need per-process alias routing — deferred to S3). */
     for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        if (ios_jit_mappings[i].owner_peb) continue;
         params->callback((unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base,
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
+    }
     ERR("unixcall_ios_push_jit_aliases: registered callback + drained %d mappings\n",
         ios_jit_mapping_count);
     return STATUS_SUCCESS;
@@ -422,19 +444,59 @@ void ios_jit_set_teb(uintptr_t teb)
     }
 }
 
-/* Translate a PE address to JIT pool address. Returns original if not mapped. */
-void *ios_jit_translate_addr(void *addr)
+/* S1 pseudo-processes: identify the current thread's "process" by its
+ * TEB->Peb. The TEB is read from the same TSD slot the x18 trampolines
+ * use (async-signal-safe — the SEGV redirect runs on the faulting thread),
+ * with a pthread-key fallback for early boot before the slot offset is
+ * known. NULL = unknown → resolves to parent/default mapping entries. */
+void *ios_jit_current_peb(void)
 {
-    int i;
+    extern pthread_key_t ios_teb_tls_key;
+    extern int ios_teb_tls_slot_offset;
+    char *cur_teb = NULL;
+
+    if (ios_teb_tls_slot_offset)
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        cur_teb = *(char **)(tsd_base + ios_teb_tls_slot_offset);
+    }
+    if (!cur_teb && ios_teb_tls_key) cur_teb = pthread_getspecific(ios_teb_tls_key);
+    if (!cur_teb) return NULL;
+    return ((TEB *)cur_teb)->Peb;
+}
+
+/* Translate a PE address to a JIT pool address for a specific process.
+ * An entry owned by `owner_peb` wins; otherwise the NULL-owner (parent)
+ * entry applies. Child processes only own copies of ntdll — every other
+ * module resolves to the shared parent copy via the fallback. */
+void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb)
+{
+    int i, fallback = -1;
     uintptr_t a = (uintptr_t)addr;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (a >= base && a < base + ios_jit_mappings[i].size)
-            return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
+        {
+            if (ios_jit_mappings[i].owner_peb == owner_peb)
+                return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
+            if (!ios_jit_mappings[i].owner_peb && fallback < 0) fallback = i;
+        }
     }
+    if (fallback >= 0)
+        return (void *)((uintptr_t)ios_jit_mappings[fallback].jit_base
+                        + (a - (uintptr_t)ios_jit_mappings[fallback].pe_base));
     return addr;  /* Not in any mapping */
+}
+
+/* Translate a PE address to JIT pool address. Returns original if not mapped.
+ * Owner-aware: resolves against the calling thread's process. */
+void *ios_jit_translate_addr(void *addr)
+{
+    return ios_jit_translate_addr_for_owner(addr, ios_jit_current_peb());
 }
 
 /* Self-heal one stale PE-VA pointer: rewrite every 8-byte-aligned slot in
@@ -448,21 +510,27 @@ void *ios_jit_translate_addr(void *addr)
 int ios_jit_patch_stale_pointer(unsigned long long stale_va)
 {
     int i, patched = 0;
-    void *target = ios_jit_translate_addr((void *)(uintptr_t)stale_va);
+    void *target = ios_jit_translate_addr_for_owner((void *)(uintptr_t)stale_va, NULL);
     if (target == (void *)(uintptr_t)stale_va) return 0;
     if (!ios_jit_rw_base_global || !ios_jit_rx_base_global) return 0;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
+        /* Heal each pool range with ITS OWNER's translation: a stale
+         * ntdll PE-VA inside a child-owned copy must point at the child's
+         * copy, not the parent's. */
+        void *range_target = ios_jit_translate_addr_for_owner(
+            (void *)(uintptr_t)stale_va, ios_jit_mappings[i].owner_peb);
         uintptr_t pool_off = (uintptr_t)ios_jit_mappings[i].jit_base
                            - (uintptr_t)ios_jit_rx_base_global;
         uint64_t *p = (uint64_t *)((char *)ios_jit_rw_base_global + pool_off);
         uint64_t *end = (uint64_t *)((char *)p + (ios_jit_mappings[i].size & ~(size_t)7));
+        if (range_target == (void *)(uintptr_t)stale_va) continue;
         for (; p < end; p++)
         {
             if (*p == stale_va)
             {
-                *p = (uint64_t)(uintptr_t)target;
+                *p = (uint64_t)(uintptr_t)range_target;
                 patched++;
             }
         }
@@ -497,25 +565,31 @@ void *ios_jit_reverse_translate_addr(const void *addr)
  * that the JIT pool code needs to read. */
 void ios_jit_sync_write(void *addr, size_t size)
 {
-    int i;
+    int i, fallback = -1;
     uintptr_t a = (uintptr_t)addr;
+    void *cur_peb = ios_jit_current_peb();
 
+    /* Owner-aware: sync into the copy the CURRENT process's PE code reads
+     * (child init syncs into the child's ntdll copy; parent boot into the
+     * parent's). Falls back to the NULL-owner entry like translate does. */
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
-        uintptr_t a = (uintptr_t)addr;
         uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (a >= base && a < base + ios_jit_mappings[i].size)
         {
-            /* Compute offset within the image */
-            size_t off = a - base;
-            /* The JIT RW mapping is at ios_jit_rw_base_global + pool_offset.
-             * The pool_offset = jit_base - jit_rx_base_global */
-            uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[i].jit_base
-                                  - (uintptr_t)ios_jit_rx_base_global;
-            char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
-            memcpy(jit_rw_dest, addr, size);
-            return;
+            if (ios_jit_mappings[i].owner_peb == cur_peb) { fallback = i; break; }
+            if (!ios_jit_mappings[i].owner_peb && fallback < 0) fallback = i;
         }
+    }
+    if (fallback >= 0)
+    {
+        size_t off = a - (uintptr_t)ios_jit_mappings[fallback].pe_base;
+        /* The JIT RW mapping is at ios_jit_rw_base_global + pool_offset.
+         * The pool_offset = jit_base - jit_rx_base_global */
+        uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[fallback].jit_base
+                              - (uintptr_t)ios_jit_rx_base_global;
+        char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
+        memcpy(jit_rw_dest, addr, size);
     }
 }
 
@@ -2817,7 +2891,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         static void *jit_rx_base = NULL;
         static void *jit_rw_base = NULL;
         static size_t jit_pool_size = 0;
-        static size_t jit_pool_offset = 0;
+        /* jit_pool_offset promoted to file scope (S1: shared with the
+         * per-child ntdll copy allocator). */
         static int jit_pool_init_done = 0;
 
         if (!jit_pool_init_done)
@@ -3469,6 +3544,267 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     return mprotect( base, size, unix_prot );
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ * S1 pseudo-processes: per-child ntdll copy.
+ *
+ * Child "processes" are thread groups in the same Mach task. All modules
+ * except ntdll duplicate naturally (the child's loader maps them at fresh
+ * VAs → mprotect_exec makes fresh pool copies). ntdll is special: it is
+ * pre-mapped once by the unix side at a shared VA, and its .data holds
+ * per-process loader state (module list, loader lock, hash table). A child
+ * sharing the parent's ntdll .data corrupts both module lists — so each
+ * child gets its own pool copy of the whole ntdll image, registered as an
+ * owner_peb-tagged mapping entry. Translation picks the copy owned by the
+ * current thread's process (see ios_jit_translate_addr_for_owner).
+ *
+ * The copy source is the LIVE unix-side view: file-state .data (PE-side
+ * runtime writes go to the pool copies, never here) plus the handful of
+ * unix-written runtime slots we WANT to inherit (syscall/unix-call
+ * dispatchers, unixlib handle, xlate hooks — all unix .text addresses that
+ * the reloc range-check leaves untouched). Slots holding PARENT-POOL
+ * aliases (e.g. the Round-7 EC unix-call thunk) are rebased to the child
+ * copy by the pool-pointer sweep below.
+ */
+
+/* Mark ARM64EC CodeMap ranges for a child copy (mirror of the parent path
+ * in mprotect_exec, kept separate so the proven parent code is untouched).
+ * No-op for non-hybrid images (no .hexpthk section). */
+static void ios_jit_mark_ec_ranges_for_copy(char *rw_image, char *jit_base, size_t image_size)
+{
+    unsigned int pe_off = *(unsigned int *)(rw_image + 0x3C);
+    unsigned short num_sec = *(unsigned short *)(rw_image + pe_off + 6);
+    unsigned short opt_sz = *(unsigned short *)(rw_image + pe_off + 0x14);
+    char *sec = rw_image + pe_off + 0x18 + opt_sz;
+    int is_hybrid = 0, s;
+
+    for (s = 0; s < num_sec; s++, sec += 40)
+        if (!memcmp(sec, ".hexpthk", 8)) { is_hybrid = 1; break; }
+    if (!is_hybrid || !arm64ec_view) return;
+
+    {
+        size_t bm_start = ((size_t)jit_base >> 12) / 8;
+        size_t bm_end   = (((size_t)jit_base + image_size) >> 12) / 8;
+        size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+        void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+        set_vprot(arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+    }
+    {
+        char *opt_hdr = rw_image + pe_off + 0x18;
+        unsigned int load_cfg_rva = *(unsigned int *)(opt_hdr + 0x70 + 10*8);
+        unsigned int load_cfg_size = *(unsigned int *)(opt_hdr + 0x70 + 10*8 + 4);
+        uint64_t pe_image_base = *(uint64_t *)(opt_hdr + 0x18);
+        int found_codemap = 0;
+
+        if (load_cfg_rva && load_cfg_size > 0xD0)
+        {
+            uint64_t chpe_meta_va = *(uint64_t *)(rw_image + load_cfg_rva + 0xC8);
+            if (chpe_meta_va >= pe_image_base && chpe_meta_va < pe_image_base + image_size)
+            {
+                char *meta = rw_image + (chpe_meta_va - pe_image_base);
+                unsigned int code_map_rva = *(unsigned int *)(meta + 0x4);
+                unsigned int code_map_count = *(unsigned int *)(meta + 0x8);
+                if (code_map_rva && code_map_count)
+                {
+                    char *code_map = rw_image + code_map_rva;
+                    unsigned int k;
+                    for (k = 0; k < code_map_count; k++)
+                    {
+                        unsigned int start = *(unsigned int *)(code_map + k*8);
+                        unsigned int len   = *(unsigned int *)(code_map + k*8 + 4);
+                        if ((start & 0x3) == 1)  /* ARM64EC range */
+                            set_arm64ec_range(jit_base + (start & ~0x3u), len);
+                    }
+                    found_codemap = 1;
+                }
+            }
+        }
+        if (!found_codemap) set_arm64ec_range(jit_base, image_size);
+        dprintf(2, "[child-ntdll] EC ranges marked for copy at %p (codemap=%d)\n",
+                jit_base, found_codemap);
+    }
+}
+
+/* Copy the module containing `module_addr` into a fresh pool slot owned by
+ * `child_peb`. Returns 0 on success. Idempotent per (module, child). */
+int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
+{
+    const size_t pg = 0x4000;
+    struct ios_jit_mapping *m = NULL;
+    size_t alloc_size, offset;
+    char *rw_dest, *rx_dest, *src;
+    uint64_t pe_image_base;
+    intptr_t child_delta;
+    unsigned int pe_off;
+    int i;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if ((uintptr_t)module_addr >= base && (uintptr_t)module_addr < base + ios_jit_mappings[i].size)
+        {
+            if (ios_jit_mappings[i].owner_peb == child_peb) return 0;  /* already copied */
+            if (!ios_jit_mappings[i].owner_peb) m = &ios_jit_mappings[i];
+        }
+    }
+    if (!m || !ios_jit_rw_base_global)
+    {
+        dprintf(2, "[child-ntdll] no parent mapping found for %p\n", module_addr);
+        return -1;
+    }
+    if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
+    {
+        dprintf(2, "[child-ntdll] mapping table FULL — cannot register child copy\n");
+        return -1;
+    }
+
+    alloc_size = (m->size + pg - 1) & ~(pg - 1);
+    offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
+    if (offset + alloc_size > ios_jit_pool_size_global)
+    {
+        dprintf(2, "[child-ntdll] JIT pool exhausted (need 0x%lx at 0x%lx of 0x%lx)\n",
+                (unsigned long)alloc_size, (unsigned long)offset,
+                (unsigned long)ios_jit_pool_size_global);
+        return -1;
+    }
+
+    rw_dest = (char *)ios_jit_rw_base_global + offset;
+    rx_dest = (char *)ios_jit_rx_base_global + offset;
+    src = (char *)m->pe_base;
+
+    memcpy(rw_dest, src, m->size);
+
+    pe_off = *(unsigned int *)(rw_dest + 0x3C);
+    pe_image_base = m->pe_image_base ? m->pe_image_base
+                                     : *(uint64_t *)(rw_dest + pe_off + 0x30);
+    child_delta = (intptr_t)rx_dest - (intptr_t)pe_image_base;
+
+    /* Writable sections → RW on the RX view (mirrors parent path; a failed
+     * mprotect falls back to the STR fault emulator, just slower). */
+    {
+        unsigned short num_sec = *(unsigned short *)(rw_dest + pe_off + 6);
+        unsigned short opt_sz = *(unsigned short *)(rw_dest + pe_off + 0x14);
+        char *sec = rw_dest + pe_off + 0x18 + opt_sz;
+        int s;
+        for (s = 0; s < num_sec; s++, sec += 40)
+        {
+            unsigned int chars = *(unsigned int *)(sec + 36);
+            unsigned int rva = *(unsigned int *)(sec + 12);
+            unsigned int vsz = *(unsigned int *)(sec + 8);
+            if ((chars & 0x80000000) && vsz)  /* IMAGE_SCN_MEM_WRITE */
+            {
+                size_t p_off = rva & ~(pg - 1);
+                size_t p_sz = ((rva + vsz + pg - 1) & ~(pg - 1)) - p_off;
+                if (mprotect(rx_dest + p_off, p_sz, PROT_READ | PROT_WRITE) != 0)
+                    dprintf(2, "[child-ntdll] mprotect RW failed for section RVA 0x%x (errno=%d)\n",
+                            rva, errno);
+            }
+        }
+    }
+
+    /* DIR64 relocations with the child's delta. The unix view is
+     * unrelocated (values at PE ImageBase); the range check preserves
+     * runtime-written unix addresses (dispatchers, hooks). */
+    if (m->reloc_rva && m->reloc_size)
+    {
+        char *reloc = rw_dest + m->reloc_rva;
+        char *reloc_end = reloc + m->reloc_size;
+        int fixups = 0;
+        while (reloc < reloc_end)
+        {
+            unsigned int block_rva = *(unsigned int *)reloc;
+            unsigned int block_size = *(unsigned int *)(reloc + 4);
+            unsigned short *entries = (unsigned short *)(reloc + 8);
+            int j, num;
+            if (!block_size || block_size < 8) break;
+            num = (block_size - 8) / 2;
+            for (j = 0; j < num; j++)
+            {
+                if ((entries[j] >> 12) == 10)  /* IMAGE_REL_BASED_DIR64 */
+                {
+                    uint64_t *fixup = (uint64_t *)(rw_dest + block_rva + (entries[j] & 0xFFF));
+                    if (*fixup >= pe_image_base && *fixup < pe_image_base + m->size)
+                    {
+                        *fixup += child_delta;
+                        fixups++;
+                    }
+                }
+            }
+            reloc += block_size;
+        }
+        dprintf(2, "[child-ntdll] applied %d DIR64 fixups (delta=0x%lx)\n",
+                fixups, (long)child_delta);
+    }
+
+    /* Pool-pointer sweep: unix-side code wrote a few slots with PARENT-POOL
+     * aliases (e.g. the EC unix-call thunk, Round 7). Those are wrong for
+     * the child — rebase any 8-aligned value inside the parent's pool copy
+     * of THIS module to the child copy. The unix view only ever receives
+     * unix-side writes, so matches are genuine. */
+    {
+        uintptr_t pj = (uintptr_t)m->jit_base;
+        uint64_t *p = (uint64_t *)rw_dest;
+        uint64_t *end = (uint64_t *)(rw_dest + (m->size & ~(size_t)7));
+        int swept = 0;
+        for (; p < end; p++)
+        {
+            if (*p >= pj && *p < pj + m->size)
+            {
+                uint64_t nv = (uintptr_t)rx_dest + (*p - pj);
+                dprintf(2, "[child-ntdll]   pool-ptr rebase @+0x%lx: 0x%llx -> 0x%llx\n",
+                        (unsigned long)((char *)p - rw_dest),
+                        (unsigned long long)*p, (unsigned long long)nv);
+                *p = nv;
+                swept++;
+            }
+        }
+        dprintf(2, "[child-ntdll] pool-pointer sweep: %d slot(s) rebased\n", swept);
+    }
+
+    /* x18-patch the child's .text with its own trampolines (fresh from the
+     * unix view — the parent's patches live only in the parent's copy). */
+    if (m->text_size)
+    {
+        size_t tramp_alloc = (m->text_size + pg - 1) & ~(pg - 1);
+        size_t tramp_off = __sync_fetch_and_add(&jit_pool_offset, tramp_alloc);
+        if (tramp_off + tramp_alloc <= ios_jit_pool_size_global)
+        {
+            int patched = ios_jit_patch_x18(
+                rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
+                (char *)ios_jit_rw_base_global + tramp_off,
+                (char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
+            sys_icache_invalidate((char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
+            dprintf(2, "[child-ntdll] x18-patched %d instructions\n", patched);
+        }
+        else dprintf(2, "[child-ntdll] no pool space for x18 trampolines!\n");
+    }
+
+    ios_jit_mark_ec_ranges_for_copy(rw_dest, rx_dest, m->size);
+
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    sys_icache_invalidate(rx_dest, m->size);
+
+    /* Register: APPEND an owned entry — the parent's entry stays intact. */
+    ios_jit_mappings[ios_jit_mapping_count].pe_base = m->pe_base;
+    ios_jit_mappings[ios_jit_mapping_count].jit_base = rx_dest;
+    ios_jit_mappings[ios_jit_mapping_count].size = m->size;
+    ios_jit_mappings[ios_jit_mapping_count].text_offset = m->text_offset;
+    ios_jit_mappings[ios_jit_mapping_count].text_size = m->text_size;
+    ios_jit_mappings[ios_jit_mapping_count].pe_image_base = pe_image_base;
+    ios_jit_mappings[ios_jit_mapping_count].reloc_delta = child_delta;
+    ios_jit_mappings[ios_jit_mapping_count].reloc_rva = m->reloc_rva;
+    ios_jit_mappings[ios_jit_mapping_count].reloc_size = m->reloc_size;
+    ios_jit_mappings[ios_jit_mapping_count].owner_peb = child_peb;
+    __sync_synchronize();
+    ios_jit_mapping_count++;
+
+    dprintf(2, "[child-ntdll] copied %p+0x%lx -> %p (pool+0x%lx) owner_peb=%p\n",
+            m->pe_base, (unsigned long)m->size, rx_dest, (unsigned long)offset, child_peb);
+    return 0;
+}
+#endif  /* WINE_IOS */
 
 
 /***********************************************************************
@@ -5661,6 +5997,18 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
     }
 #endif
     teb->Peb = peb;
+#ifdef WINE_IOS
+    /* S1 pseudo-processes: a new thread belongs to its CREATOR's process.
+     * The global `peb` is switched (permanently) to the child's PEB during
+     * a child spawn, so parent threads created afterwards must not inherit
+     * it. ios_jit_current_peb() resolves the creating thread's PEB and is
+     * NULL-safe during early boot (falls back to the global). */
+    {
+        extern void *ios_jit_current_peb(void);
+        void *creator_peb = ios_jit_current_peb();
+        if (creator_peb) teb->Peb = creator_peb;
+    }
+#endif
     teb->Tib.Self = &teb->Tib;
     teb->Tib.StackBase = (void *)~0ul;
     teb->ActivationContextStackPointer = &teb->ActivationContextStack;
