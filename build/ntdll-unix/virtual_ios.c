@@ -219,6 +219,25 @@ void *ios_jit_get_trampoline(int slot)
     return NULL;
 }
 
+/* Reverse of the JIT translation: pool alias → original PE VA. For the
+ * thread-stack dumper — a wedged thread executing PE code shows JIT-pool
+ * pcs that dladdr can't name; this recovers "PE module base + offset". */
+uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base )
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uint64_t jb = (uint64_t)(uintptr_t)ios_jit_mappings[i].jit_base;
+        if (addr >= jb && addr < jb + ios_jit_mappings[i].size)
+        {
+            if (module_base) *module_base = (uint64_t)(uintptr_t)ios_jit_mappings[i].pe_base;
+            return (uint64_t)(uintptr_t)ios_jit_mappings[i].pe_base + (addr - jb);
+        }
+    }
+    if (module_base) *module_base = 0;
+    return 0;
+}
+
 /* Callback registered by xtajit64 (via unix_ios_push_jit_aliases unix-call)
  * so future ios_jit_add_mapping calls automatically push aliases to FEX
  * too. Without this, late-loaded DLLs (e.g. dlopen after process init)

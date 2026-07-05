@@ -72,7 +72,11 @@ final class MetalBackedView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        self.isMultipleTouchEnabled = false
+        // Multi-touch REQUIRED: with it off, a fast double-tap's second
+        // touch (landing before the first lift is processed) is silently
+        // swallowed — drag-arm never fired (2026-07-06). Two-finger
+        // scroll/right-click need it too.
+        self.isMultipleTouchEnabled = true
         self.isUserInteractionEnabled = true
         self.backgroundColor = .clear
     }
@@ -104,6 +108,18 @@ final class MetalBackedView: UIView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         guard let w = window else { return }   // detach: leave the host be
+        // SwiftUI ancestors attach gesture recognizers that can delay or
+        // cancel raw touch delivery (double-tap timing is exactly what
+        // they punish). Defuse them for our subtree.
+        var v: UIView? = self
+        while let s = v {
+            s.gestureRecognizers?.forEach {
+                $0.cancelsTouchesInView = false
+                $0.delaysTouchesBegan = false
+                $0.delaysTouchesEnded = false
+            }
+            v = s.superview
+        }
         let host = MetalHostView.shared
         if host.superview !== w {
             host.removeFromSuperview()
@@ -159,8 +175,8 @@ final class MetalBackedView: UIView {
     private var touchStartTime: TimeInterval = 0
     private var movedBeyondSlop = false
     private var dragActive = false
-    private var lastTapEndTime: TimeInterval = 0
-    private var lastTapPoint = CGPoint.zero
+    private var dragTouch: UITouch?          // the finger that owns the drag
+    private var touchGeneration = 0          // invalidates pending long-press timers
     private var twoFingerActive = false
     private var twoFingerMoved = false
     private var twoFingerStartTime: TimeInterval = 0
@@ -201,6 +217,7 @@ final class MetalBackedView: UIView {
         }
         let now = Date().timeIntervalSinceReferenceDate
         let active = activeTouches(event)
+        touchGeneration += 1
         if active.count >= 2 {
             twoFingerActive = true
             twoFingerMoved = false
@@ -216,10 +233,18 @@ final class MetalBackedView: UIView {
         lastPanPoint = p
         touchStartTime = now
         movedBeyondSlop = false
-        // double-tap-and-hold → drag: press within 0.3s + 40pt of last tap
-        if now - lastTapEndTime < 0.30 && hypot(p.x - lastTapPoint.x, p.y - lastTapPoint.y) < 40 {
-            dragActive = true
-            postPointer(F_LDOWN)
+        // long-press → drag: hold still for 0.5s, haptic confirms, then move
+        // the window; release drops. (Replaced double-tap-hold — it raced
+        // Windows' double-click detection: wine saw WM_LBUTTONDBLCLK.)
+        let gen = touchGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.touchGeneration == gen, !self.dragActive,
+                  !self.movedBeyondSlop, !self.twoFingerActive else { return }
+            self.dragActive = true
+            self.dragTouch = t
+            self.postPointer(self.F_LDOWN)
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            fputs("[trackpad] long-press drag armed\n", stderr)
         }
     }
 
@@ -243,7 +268,14 @@ final class MetalBackedView: UIView {
             while scrollAccum >= 14 { scrollAccum -= 14; postPointer(F_WHEEL, data: -120) }
             return
         }
-        guard let t = touches.first else { return }
+        let t: UITouch
+        if dragActive, let d = dragTouch {
+            guard touches.contains(d) else { return }  // only the old tap finger moved
+            t = d
+        } else {
+            guard let f = touches.first else { return }
+            t = f
+        }
         let p = t.location(in: self)
         let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
         lastPanPoint = p
@@ -274,17 +306,23 @@ final class MetalBackedView: UIView {
             }
             return
         }
+        touchGeneration += 1   // cancel any pending long-press
         if dragActive {
+            if let d = dragTouch, !touches.contains(d) {
+                fputs("[trackpad] ended: non-drag finger up (drag continues)\n", stderr)
+                return
+            }
+            fputs("[trackpad] ended: drag drop\n", stderr)
             postPointer(F_LUP)
             dragActive = false
-            lastTapEndTime = 0   // don't chain another drag off the drop
+            dragTouch = nil
             return
         }
-        if !movedBeyondSlop && now - touchStartTime < 0.30 {
+        // stationary release before the 0.5s drag threshold = click
+        if !movedBeyondSlop && now - touchStartTime < 0.5 {
+            fputs("[trackpad] ended: click\n", stderr)
             postPointer(F_LDOWN)
             postPointer(F_LUP)
-            lastTapEndTime = now
-            lastTapPoint = touchStartPoint
         }
     }
 
@@ -295,7 +333,10 @@ final class MetalBackedView: UIView {
             winios_post_touch_up(x, y)
             return
         }
+        fputs("[trackpad] CANCELLED (dragActive=\(dragActive))\n", stderr)
+        touchGeneration += 1
         if dragActive { postPointer(F_LUP); dragActive = false }
+        dragTouch = nil
         twoFingerActive = false
     }
 }
@@ -628,6 +669,8 @@ struct ContentView: View {
                     setenv("MYTHIC_DESKTOP", "1", 1)
                     setenv("MYTHIC_SCREEN_W", String(deskW), 1)
                     setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    // diagnostic: PNG-dump window surfaces to Documents/surfdump/
+                    setenv("MYTHIC_DUMP_SURFACES", "1", 1)
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)

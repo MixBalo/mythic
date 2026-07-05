@@ -1141,6 +1141,29 @@ void main_loop(void)
                 ws_log("[wineserver-fd] iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
             }
 
+            /* [srv-queues] desktop-mode diagnostic: dump every thread's
+             * message-queue state every ~10s (SendMessage stall triage) */
+            {
+                static int qdump_on = -1;
+                static struct timespec qdump_last;
+                if (qdump_on < 0)
+                {
+                    const char *d = getenv("MYTHIC_DESKTOP");
+                    qdump_on = (d && *d == '1');
+                }
+                if (qdump_on)
+                {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec - qdump_last.tv_sec >= 10)
+                    {
+                        extern void ios_dump_msg_queues(void);
+                        qdump_last = now;
+                        ios_dump_msg_queues();
+                    }
+                }
+            }
+
             /* Check for injected client fd (socketpair bypass) */
             {
                 int injected = __atomic_exchange_n(&g_injected_client_fd, -1, __ATOMIC_SEQ_CST);

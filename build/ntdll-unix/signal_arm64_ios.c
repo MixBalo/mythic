@@ -4737,3 +4737,113 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "ret x17" )
 
 #endif  /* __aarch64__ */
+
+/* ============================================================ *
+ * [thread-stacks] all-thread stack sampler — diagnoses wedged wine
+ * threads (S2: explorer main leaves its message pump and blocks
+ * forever; [srv-queues] showed wake_mask=0 with 20 posted messages
+ * pending). Called from an app-side GCD timer (Winios.m) so it keeps
+ * firing even when every wine thread is stuck. Samples WITHOUT
+ * suspending — racy pc/fp reads are acceptable for stuck-thread
+ * triage; a blocked thread's state is stable anyway.
+ * ============================================================ */
+/* Best-effort PE module name from the export directory at pe_base (the
+ * original unix-view image stays mapped). Returns "(exe)" for images
+ * without exports, "?" when headers look wrong. */
+static const char *ios_pe_module_name( uint64_t base )
+{
+    const unsigned char *p = (const unsigned char *)(uintptr_t)base;
+    uint32_t e_lfanew, exp_rva, name_rva;
+
+    if (!base) return "?";
+    if (p[0] != 'M' || p[1] != 'Z') return "?";
+    e_lfanew = *(const uint32_t *)(p + 0x3c);
+    if (e_lfanew == 0 || e_lfanew > 0x1000) return "?";
+    if (memcmp(p + e_lfanew, "PE\0\0", 4)) return "?";
+    exp_rva = *(const uint32_t *)(p + e_lfanew + 0x88);   /* PE32+ export dir RVA */
+    if (!exp_rva || exp_rva > 0x10000000) return "(exe)";
+    name_rva = *(const uint32_t *)(p + exp_rva + 0x0c);
+    if (!name_rva || name_rva > 0x10000000) return "(exe)";
+    return (const char *)(p + name_rva);
+}
+
+void ios_dump_all_thread_stacks(void)
+{
+    thread_act_array_t threads;
+    mach_msg_type_number_t count = 0, i;
+    thread_t self = mach_thread_self();
+
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+    fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);
+    for (i = 0; i < count; i++)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t st_count = ARM_THREAD_STATE64_COUNT;
+        char tname[64] = "";
+        pthread_t pt;
+        Dl_info di;
+        const char *img = "?", *sym = "?";
+        uint64_t off, fp_walk;
+        int fr;
+
+        if (threads[i] == self) goto next;
+        if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &st_count) != KERN_SUCCESS)
+            goto next;
+
+        pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt) pthread_getname_np(pt, tname, sizeof(tname));
+
+        off = st.__pc;
+        if (dladdr((void*)(uintptr_t)st.__pc, &di))
+        {
+            if (di.dli_fname) { img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname; }
+            if (di.dli_sname) { sym = di.dli_sname; off = st.__pc - (uint64_t)(uintptr_t)di.dli_saddr; }
+        }
+        fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx\n",
+                threads[i], tname, img, sym, (unsigned long long)off);
+        {
+            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+            uint64_t mod = 0, pe_va = ios_jit_reverse_translate(st.__pc, &mod);
+            if (pe_va)
+                fprintf(stderr, "[thread-stacks]   pc is PE code: %.32s+0x%llx (base=0x%llx va=0x%llx)\n",
+                        ios_pe_module_name(mod), (unsigned long long)(pe_va - mod),
+                        (unsigned long long)mod, (unsigned long long)pe_va);
+        }
+
+        fp_walk = st.__fp;
+        for (fr = 0; fr < 14 && fp_walk; fr++)
+        {
+            uint64_t frame_buf[2];
+            mach_vm_size_t got_fw = 0;
+            uint64_t ret_pc;
+
+            if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fp_walk, 16,
+                                       (mach_vm_address_t)frame_buf, &got_fw) != KERN_SUCCESS || got_fw != 16)
+                break;
+            ret_pc = frame_buf[1] & 0x0000007fffffffffull;   /* strip PAC bits */
+            if (ret_pc <= 0x4000) break;
+            img = "?"; sym = "?"; off = ret_pc;
+            if (dladdr((void*)(uintptr_t)ret_pc, &di))
+            {
+                if (di.dli_fname) { img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname; }
+                if (di.dli_sname) { sym = di.dli_sname; off = ret_pc - (uint64_t)(uintptr_t)di.dli_saddr; }
+            }
+            {
+                extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                uint64_t mod = 0, pe_va = ios_jit_reverse_translate(ret_pc, &mod);
+                if (pe_va)
+                    fprintf(stderr, "[thread-stacks]   bt[%d] PE %.32s+0x%llx (va=0x%llx)\n",
+                            fr, ios_pe_module_name(mod), (unsigned long long)(pe_va - mod),
+                            (unsigned long long)pe_va);
+                else
+                    fprintf(stderr, "[thread-stacks]   bt[%d] %s`%s+0x%llx\n", fr, img, sym, (unsigned long long)off);
+            }
+            fp_walk = frame_buf[0];
+        }
+next:
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
+    mach_port_deallocate(mach_task_self(), self);
+    fflush(stderr);
+}

@@ -117,6 +117,91 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     }
 }
 
+/* [winios-tree] window-tree dump: every top-level window with class,
+ * title, style and rects. Driven from the app side (Winios.m
+ * ProcessEvents drain) every few seconds in desktop mode — ground truth
+ * for "does the taskbar exist / is it visible / where is it". */
+void winios_dump_window_tree(void)
+{
+    HWND list[128];
+    ULONG size = ARRAY_SIZE(list), i;
+    NTSTATUS status;
+
+    status = NtUserBuildHwndList( 0, 0, FALSE, TRUE, 0, ARRAY_SIZE(list), list, &size );
+    if (status)
+    {
+        dprintf( 2, "[winios-tree] BuildHwndList failed 0x%x\n", (unsigned)status );
+        return;
+    }
+    dprintf( 2, "[winios-tree] ---- %u top-level windows ----\n", (unsigned)(size ? size - 1 : 0) );
+    for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
+    {
+        HWND hwnd = list[i];
+        WCHAR clsW[64], txtW[64];
+        char cls[64], txt[64];
+        UNICODE_STRING us = { .Buffer = clsW, .MaximumLength = sizeof(clsW) };
+        struct window_rects rects = {0};
+        DWORD style, ex_style, pid = 0, tid;
+        int j, n;
+
+        cls[0] = 0;
+        if (NtUserGetClassName( hwnd, FALSE, &us ) > 0)
+        {
+            for (j = 0; j < us.Length / (int)sizeof(WCHAR) && j < 63; j++)
+                cls[j] = (clsW[j] >= 32 && clsW[j] < 127) ? (char)clsW[j] : '?';
+            cls[j] = 0;
+        }
+        n = NtUserInternalGetWindowText( hwnd, txtW, ARRAY_SIZE(txtW) );
+        for (j = 0; j < n && j < 63; j++)
+            txt[j] = (txtW[j] >= 32 && txtW[j] < 127) ? (char)txtW[j] : '?';
+        txt[j] = 0;
+
+        style = get_window_long( hwnd, GWL_STYLE );
+        ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+        tid = get_window_thread( hwnd, &pid );
+        get_window_rects( hwnd, COORDS_SCREEN, &rects, get_thread_dpi() );
+
+        dprintf( 2, "[winios-tree] %p '%s' \"%s\" style=%08x ex=%08x vis=%d tid=%04x "
+                 "win={%d,%d,%d,%d} client={%d,%d,%d,%d}\n",
+                 hwnd, cls, txt, (unsigned)style, (unsigned)ex_style,
+                 (style & WS_VISIBLE) ? 1 : 0, (unsigned)tid,
+                 (int)rects.window.left, (int)rects.window.top, (int)rects.window.right, (int)rects.window.bottom,
+                 (int)rects.client.left, (int)rects.client.top, (int)rects.client.right, (int)rects.client.bottom );
+
+        /* children of visible top-levels (controls like the Start button) */
+        if (style & WS_VISIBLE)
+        {
+            HWND kids[32];
+            ULONG ksize = ARRAY_SIZE(kids), k;
+            if (!NtUserBuildHwndList( 0, hwnd, TRUE, TRUE, 0, ARRAY_SIZE(kids), kids, &ksize ))
+            {
+                for (k = 0; k + 1 < ksize && k < ARRAY_SIZE(kids); k++)
+                {
+                    WCHAR kclsW[32];
+                    char kcls[32];
+                    UNICODE_STRING kus = { .Buffer = kclsW, .MaximumLength = sizeof(kclsW) };
+                    struct window_rects krects = {0};
+                    DWORD kstyle;
+
+                    kcls[0] = 0;
+                    if (NtUserGetClassName( kids[k], FALSE, &kus ) > 0)
+                    {
+                        for (j = 0; j < kus.Length / (int)sizeof(WCHAR) && j < 31; j++)
+                            kcls[j] = (kclsW[j] >= 32 && kclsW[j] < 127) ? (char)kclsW[j] : '?';
+                        kcls[j] = 0;
+                    }
+                    kstyle = get_window_long( kids[k], GWL_STYLE );
+                    get_window_rects( kids[k], COORDS_SCREEN, &krects, get_thread_dpi() );
+                    dprintf( 2, "[winios-tree]    +child %p '%s' style=%08x vis=%d win={%d,%d,%d,%d}\n",
+                             kids[k], kcls, (unsigned)kstyle, (kstyle & WS_VISIBLE) ? 1 : 0,
+                             (int)krects.window.left, (int)krects.window.top,
+                             (int)krects.window.right, (int)krects.window.bottom );
+                }
+            }
+        }
+    }
+}
+
 /* ============================================================ *
  * winios window surfaces (S2): GDI window content → app compositor.
  * Modeled on win32u's offscreen surface (dce.c): the generic
@@ -132,6 +217,104 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
 extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible ) __attribute__((weak));
+extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
+                               const void *bgra ) __attribute__((weak));
+extern void winios_cursor_show( int show ) __attribute__((weak));
+
+static int winios_desktop_mode(void);
+
+/* pSetCursor: extract the cursor image as straight-alpha BGRA and forward
+ * to the app-side compositor cursor layer. win32u calls this on every
+ * cursor CHANGE (WM_SETCURSOR → NtUserSetCursor), so resize arrows,
+ * I-beam and app cursors all arrive here. */
+static void winios_drv_set_cursor( HWND hwnd, HCURSOR cursor )
+{
+    static HCURSOR last_cursor;
+    ICONINFO info = {0};
+    BITMAP bm;
+    HDC hdc;
+    unsigned int *color = NULL, *mask = NULL;
+    int w, h, i, has_alpha = 0;
+    char bmibuf[sizeof(BITMAPINFOHEADER) + 256 * sizeof(RGBQUAD)];
+    BITMAPINFO *bmi = (BITMAPINFO *)bmibuf;
+
+    if (!winios_desktop_mode() || !winios_cursor_set) return;
+    if (!cursor)
+    {
+        if (winios_cursor_show) winios_cursor_show( 0 );
+        return;
+    }
+    if (winios_cursor_show) winios_cursor_show( 1 );
+    if (cursor == last_cursor) return;
+
+    if (!NtUserGetIconInfo( cursor, &info, NULL, NULL, NULL, 0 )) return;
+    hdc = NtGdiCreateCompatibleDC( 0 );
+
+#define WINIOS_BMI_INIT(width, height) do { \
+        memset( bmibuf, 0, sizeof(bmibuf) ); \
+        bmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER); \
+        bmi->bmiHeader.biWidth = (width); \
+        bmi->bmiHeader.biHeight = -(height); \
+        bmi->bmiHeader.biPlanes = 1; \
+        bmi->bmiHeader.biBitCount = 32; \
+        bmi->bmiHeader.biCompression = BI_RGB; \
+    } while (0)
+
+    if (info.hbmColor)
+    {
+        if (!NtGdiExtGetObjectW( info.hbmColor, sizeof(bm), &bm )) goto done;
+        w = bm.bmWidth; h = bm.bmHeight;
+        if (w <= 0 || h <= 0 || w > 256 || h > 256) goto done;
+        if (!(color = malloc( (size_t)w * h * 4 ))) goto done;
+        WINIOS_BMI_INIT( w, h );
+        NtGdiGetDIBitsInternal( hdc, info.hbmColor, 0, h, color, bmi, DIB_RGB_COLORS,
+                                w * h * 4, sizeof(bmibuf) );
+        for (i = 0; i < w * h; i++) if (color[i] & 0xff000000) { has_alpha = 1; break; }
+        if (!has_alpha)
+        {
+            /* no alpha channel — derive from the AND mask (0 = opaque) */
+            if (!(mask = malloc( (size_t)w * h * 4 ))) goto done;
+            WINIOS_BMI_INIT( w, h );
+            NtGdiGetDIBitsInternal( hdc, info.hbmMask, 0, h, mask, bmi, DIB_RGB_COLORS,
+                                    w * h * 4, sizeof(bmibuf) );
+            for (i = 0; i < w * h; i++)
+                color[i] = (color[i] & 0xffffff) | ((mask[i] & 0xffffff) ? 0 : 0xff000000);
+        }
+    }
+    else  /* monochrome: hbmMask stacks AND (top) over XOR (bottom) */
+    {
+        if (!NtGdiExtGetObjectW( info.hbmMask, sizeof(bm), &bm )) goto done;
+        w = bm.bmWidth; h = bm.bmHeight / 2;
+        if (w <= 0 || h <= 0 || w > 256 || h > 256) goto done;
+        if (!(mask = malloc( (size_t)w * h * 2 * 4 ))) goto done;
+        WINIOS_BMI_INIT( w, h * 2 );
+        NtGdiGetDIBitsInternal( hdc, info.hbmMask, 0, h * 2, mask, bmi, DIB_RGB_COLORS,
+                                w * h * 2 * 4, sizeof(bmibuf) );
+        if (!(color = malloc( (size_t)w * h * 4 ))) goto done;
+        for (i = 0; i < w * h; i++)
+        {
+            int and_set = mask[i] & 0xffffff;
+            int xor_set = mask[w * h + i] & 0xffffff;
+            if (and_set && !xor_set) color[i] = 0;              /* transparent */
+            else if (xor_set)        color[i] = 0xffffffff;     /* white (invert ≈ white) */
+            else                     color[i] = 0xff000000;     /* black */
+        }
+    }
+#undef WINIOS_BMI_INIT
+
+    winios_cursor_set( (unsigned int)(UINT_PTR)cursor, w, h,
+                       (int)info.xHotspot, (int)info.yHotspot, color );
+    last_cursor = cursor;
+    dprintf( 2, "[winios] cursor set hcursor=%p %dx%d hot=(%u,%u)\n",
+             cursor, w, h, (unsigned)info.xHotspot, (unsigned)info.yHotspot );
+
+done:
+    free( color );
+    free( mask );
+    if (info.hbmColor) NtGdiDeleteObjectApp( info.hbmColor );
+    if (info.hbmMask) NtGdiDeleteObjectApp( info.hbmMask );
+    NtGdiDeleteObjectApp( hdc );
+}
 
 static int winios_desktop_mode(void)
 {
@@ -1271,7 +1454,8 @@ static void load_display_driver(void)
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
         if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
-        if (winios_pSetCursor)           winios_user_driver.pSetCursor           = winios_pSetCursor;
+        if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
+        else if (winios_pSetCursor)      winios_user_driver.pSetCursor           = winios_pSetCursor;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
         /* window-pos wrapper dereferences window_rects on this side and

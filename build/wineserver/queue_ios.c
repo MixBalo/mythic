@@ -4221,3 +4221,82 @@ DECL_HANDLER(set_keyboard_repeat)
 
     release_object( desktop );
 }
+
+/* ============================================================ *
+ * [srv-queues] full message-queue state dump — diagnoses
+ * cross-pseudo-process SendMessage stalls (S2 desktop). Called from
+ * the fd_ios.c server loop every ~10s when MYTHIC_DESKTOP=1.
+ * Shows per thread: wake bits vs mask (a thread with wake_bits
+ * matching wake_mask but not running = lost wakeup), pending sent
+ * messages with their sender, and whose reply each thread awaits.
+ * ============================================================ */
+
+struct ios_qdump_ctx
+{
+    int            count;
+    struct thread *threads[64];
+};
+
+static int ios_qdump_collect( struct process *process, void *arg )
+{
+    struct ios_qdump_ctx *ctx = arg;
+    struct thread *thread;
+    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+        if (ctx->count < 64) ctx->threads[ctx->count++] = thread;
+    return 0;
+}
+
+static unsigned int ios_qdump_tid( struct ios_qdump_ctx *ctx, struct msg_queue *q )
+{
+    int i;
+    if (!q) return 0;
+    for (i = 0; i < ctx->count; i++)
+        if (ctx->threads[i]->queue == q) return ctx->threads[i]->id;
+    return 0xdead;
+}
+
+void ios_dump_msg_queues(void)
+{
+    struct ios_qdump_ctx ctx = { 0 };
+    int i;
+
+    enum_processes( ios_qdump_collect, &ctx );
+    fprintf( stderr, "[srv-queues] ---- %d threads ----\n", ctx.count );
+    for (i = 0; i < ctx.count; i++)
+    {
+        struct thread *t = ctx.threads[i];
+        struct msg_queue *q = t->queue;
+        struct message *m;
+        struct message_result *r;
+        unsigned int wb = 0, wm = 0, cb = 0, cm = 0;
+        int nsend, npost, shown;
+
+        if (!q) continue;
+        if (q->shared)
+        {
+            wb = q->shared->wake_bits;
+            wm = q->shared->wake_mask;
+            cb = q->shared->changed_bits;
+            cm = q->shared->changed_mask;
+        }
+        nsend = list_count( &q->msg_list[SEND_MESSAGE] );
+        npost = list_count( &q->msg_list[POST_MESSAGE] );
+        fprintf( stderr, "[srv-queues] tid=%04x wake=%08x/%08x chg=%08x/%08x send_pend=%d post=%d recv_in_prog=%d\n",
+                 t->id, wb, wm, cb, cm, nsend, npost, q->recv_result != NULL );
+        shown = 0;
+        LIST_FOR_EACH_ENTRY( m, &q->msg_list[SEND_MESSAGE], struct message, entry )
+        {
+            if (shown++ >= 4) break;
+            fprintf( stderr, "[srv-queues]   in: msg=0x%x win=%08x from tid=%04x\n",
+                     m->msg, m->win, m->result ? ios_qdump_tid( &ctx, m->result->sender ) : 0 );
+        }
+        shown = 0;
+        LIST_FOR_EACH_ENTRY( r, &q->send_result, struct message_result, sender_entry )
+        {
+            if (shown++ >= 4) break;
+            fprintf( stderr, "[srv-queues]   awaiting reply: msg=0x%x from tid=%04x replied=%d\n",
+                     r->msg ? r->msg->msg : 0, ios_qdump_tid( &ctx, r->receiver ), r->replied );
+        }
+    }
+    fflush( stderr );
+}

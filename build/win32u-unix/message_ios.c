@@ -3469,8 +3469,45 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
     process_driver_events( QS_ALLINPUT, wake_mask, changed_mask );
     if (!(changed_mask & QS_SMRESULT) && (event = get_user_thread_info()->idle_event)) NtSetEvent( event, NULL );
 
-    do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
-    while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
+    /* iOS desktop mode: trackpad events sit in the app-side ring until a
+     * wine thread runs pProcessEvents — a thread sleeping here (e.g. the
+     * SC_MOVE / menu modal loops via NtUserGetMessage) never drains it,
+     * so drags advanced only when winemine's 1Hz timer woke the queue.
+     * Wake every 16ms to poll driver events; only surface WAIT_TIMEOUT
+     * when the CALLER's own deadline expires. Games path unchanged. */
+    {
+        static int ios_slice = -1;
+        if (ios_slice < 0)
+        {
+            const char *d = getenv( "MYTHIC_DESKTOP" );
+            ios_slice = (d && *d == '1');
+        }
+        if (!ios_slice)
+        {
+            do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );
+            while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
+        }
+        else for (;;)
+        {
+            LARGE_INTEGER slice_time, snow, *slice;
+
+            slice = get_nt_timeout( &slice_time, 16 );
+            NtQuerySystemTime( &snow );
+            slice->QuadPart = snow.QuadPart - slice->QuadPart;      /* absolute, 16ms out */
+            if (abs && abs->QuadPart <= slice->QuadPart) slice = abs;
+
+            do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), slice );
+            while (ret == count - 1 && !process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ));
+
+            if (ret != WAIT_TIMEOUT) break;
+            if (process_driver_events( QS_ALLINPUT, wake_mask, changed_mask ))
+            {
+                ret = count - 1;                                    /* treat as queue signaled */
+                break;
+            }
+            if (slice == abs) break;                                /* caller deadline reached */
+        }
+    }
 
     if (HIWORD(ret)) /* is it an error code? */
     {

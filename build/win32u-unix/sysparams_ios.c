@@ -7042,12 +7042,30 @@ int get_system_metrics( int index )
     case SM_CYMINTRACK:   return 38;
     case SM_CXMAXTRACK:   return 1920;
     case SM_CYMAXTRACK:   return 1080;
-    case SM_CXSCREEN:     return 1024;
-    case SM_CYSCREEN:     return 768;
-    case SM_CXFULLSCREEN: return 1024;
-    case SM_CYFULLSCREEN: return 745;
-    case SM_CXMAXIMIZED:  return 1040;
-    case SM_CYMAXIMIZED:  return 776;
+    /* screen-size metrics follow MYTHIC_SCREEN_W/H (defaults keep the
+     * legacy 1024x768 for the games path where the env is unset).
+     * Explorer's taskbar positions itself from SM_C{X,Y}SCREEN — the
+     * old hardcode parked it at y=748, below a 960x540 desktop. */
+    case SM_CXSCREEN:
+    case SM_CYSCREEN:
+    case SM_CXFULLSCREEN:
+    case SM_CYFULLSCREEN:
+    case SM_CXMAXIMIZED:
+    case SM_CYMAXIMIZED:
+    {
+        int sw, sh;
+        ios_screen_size( &sw, &sh );
+        switch (index)
+        {
+        case SM_CXSCREEN:     return sw;
+        case SM_CYSCREEN:     return sh;
+        case SM_CXFULLSCREEN: return sw;
+        case SM_CYFULLSCREEN: return sh - 23;   /* minus caption, like Windows */
+        case SM_CXMAXIMIZED:  return sw + 16;
+        case SM_CYMAXIMIZED:  return sh + 8;
+        }
+        return sw;
+    }
     }
 #endif
 

@@ -19,6 +19,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <ImageIO/ImageIO.h>
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -111,6 +112,8 @@ void winios_pWindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
 extern void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, void *hwnd);
 extern void winios_drv_post_key(unsigned short vk, unsigned int flags);
+extern void winios_dump_window_tree(void);
+extern void ios_dump_all_thread_stacks(void);
 
 #define WINIOS_RING_SIZE 256
 #define WINIOS_EV_MOUSE 0
@@ -177,6 +180,18 @@ BOOL winios_pProcessEvents(DWORD mask) {
     if (quiet < 0) quiet = getenv("MYTHIC_QUIET") != NULL;
     if ((cnt++ % 240) == 0 && !quiet) {
         fprintf(stderr, "[winios] pProcessEvents called n=%u\n", cnt); fflush(stderr);
+    }
+    /* Desktop debugging: dump the full window tree every ~5s. Runs on
+     * this wine thread (valid TEB — the dump walks win32u internals). */
+    static int desk = -1;
+    if (desk < 0) desk = ({ const char *d = getenv("MYTHIC_DESKTOP"); d && *d == '1'; });
+    if (desk) {
+        static double next_tree_dump;
+        double now = CACurrentMediaTime();
+        if (now >= next_tree_dump) {
+            next_tree_dump = now + 5.0;
+            winios_dump_window_tree();
+        }
     }
     BOOL drained = FALSE;
     for (;;) {
@@ -279,7 +294,10 @@ static void winios_layout_compositor(void) {
  * window coordinates — same geometry contract as the Metal host view. */
 void winios_set_compositor_frame(double x, double y, double w, double h) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        g_comp_frame = CGRectMake(x, y, w, h);
+        CGRect f = CGRectMake(x, y, w, h);
+        /* layoutSubviews storms identical frames — skip no-op relayouts */
+        if (g_comp_frame_set && CGRectEqualToRect(g_comp_frame, f)) return;
+        g_comp_frame = f;
         g_comp_frame_set = YES;
         winios_layout_compositor();
     });
@@ -314,6 +332,18 @@ static void winios_ensure_compositor(void) {
     winios_layout_compositor();
     fprintf(stderr, "[winios] compositor attached inside presentation frame\n");
     fflush(stderr);
+    /* Wedged-thread triage: sample every thread's stack every 20s from
+     * an app-side timer — keeps firing even when all wine threads are
+     * stuck (unlike the tree dump, which rides wine's event drain). */
+    static dispatch_source_t stack_timer;
+    if (!stack_timer) {
+        stack_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                          dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(stack_timer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC),
+                                  20 * NSEC_PER_SEC, NSEC_PER_SEC);
+        dispatch_source_set_event_handler(stack_timer, ^{ ios_dump_all_thread_stacks(); });
+        dispatch_resume(stack_timer);
+    }
 }
 
 /* main thread only */
@@ -365,12 +395,62 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible) {
     });
 }
 
+/* MYTHIC_DUMP_SURFACES=1: save each window's DIB as PNG under
+ * Documents/surfdump/ — surf-<hwnd>-first.png once, then
+ * surf-<hwnd>-latest.png at most every 2s. Ground truth for whether a
+ * rendering bug is in the surface bits (wine paint path) or in the
+ * compositor (crop/scale). */
+static void winios_dump_surface_png(HWND hwnd, NSData *data, int sw, int sh, int stride) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("winios.surfdump", DISPATCH_QUEUE_SERIAL); });
+    dispatch_async(q, ^{
+        static NSMutableDictionary<NSNumber *, NSNumber *> *lastWrite;
+        static NSMutableSet<NSNumber *> *wroteFirst;
+        if (!lastWrite) { lastWrite = [NSMutableDictionary new]; wroteFirst = [NSMutableSet new]; }
+        NSNumber *key = @((uintptr_t)hwnd);
+        double now = CACurrentMediaTime();
+        BOOL first = ![wroteFirst containsObject:key];
+        NSNumber *lw = lastWrite[key];
+        if (!first && lw && now - lw.doubleValue < 2.0) return;
+        lastWrite[key] = @(now);
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        NSString *dir = [docs stringByAppendingPathComponent:@"surfdump"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+        CGImageRef img = CGImageCreate(sw, sh, 8, 32, stride, cs,
+                                       kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
+                                       dp, NULL, false, kCGRenderingIntentDefault);
+        if (img) {
+            NSString *name = [NSString stringWithFormat:@"surf-%p-%s.png", hwnd, first ? "first" : "latest"];
+            NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]];
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url, CFSTR("public.png"), 1, NULL);
+            if (dest) {
+                CGImageDestinationAddImage(dest, img, NULL);
+                if (CGImageDestinationFinalize(dest) && first) {
+                    [wroteFirst addObject:key];
+                    fprintf(stderr, "[winios] surfdump wrote %s (%dx%d)\n", name.UTF8String, sw, sh);
+                    fflush(stderr);
+                }
+                CFRelease(dest);
+            }
+            CGImageRelease(img);
+        }
+        CGDataProviderRelease(dp);
+        CGColorSpaceRelease(cs);
+    });
+}
+
 /* Called from winios_surface_flush (wine thread) with the surface's
  * whole DIB. Copy immediately — `bits` is only valid for this call. */
 void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
                             int sw, int sh, int stride, const void *bits) {
     if (sw <= 0 || sh <= 0 || !bits) return;
     NSData *data = [NSData dataWithBytes:bits length:(size_t)stride * sh];
+    static int dumpSurf = -1;
+    if (dumpSurf < 0) dumpSurf = getenv("MYTHIC_DUMP_SURFACES") != NULL;
+    if (dumpSurf) winios_dump_surface_png(hwnd, data, sw, sh, stride);
     static unsigned cnt;
     if (cnt++ < 12) {
         fprintf(stderr, "[winios] present hwnd=%p dirty=(%d,%d %dx%d) surf=%dx%d\n",
@@ -437,24 +517,83 @@ static UIImage *winios_cursor_image(void) {
     return img;
 }
 
+/* Wine cursor image state (px). w==0 → builtin arrow fallback. */
+static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
+static CGPoint g_cursor_pos_px;
+
+/* main thread only */
+static void winios_ensure_cursor_layer(void) {
+    if (g_cursor_layer || !g_compositor_view) return;
+    UIImage *img = winios_cursor_image();
+    g_cursor_layer = [CALayer layer];
+    g_cursor_layer.zPosition = 10000;   /* above every window layer */
+    g_cursor_layer.anchorPoint = CGPointMake(0, 0);
+    g_cursor_layer.contents = (id)img.CGImage;
+    g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
+    g_cursor_layer.magnificationFilter = kCAFilterNearest;
+    [g_compositor_view.layer addSublayer:g_cursor_layer];
+}
+
+/* main thread only — place (and size) the cursor at its stored px pos,
+ * honoring the wine cursor's hotspot when one is set */
+static void winios_cursor_place(void) {
+    if (!g_cursor_layer) return;
+    CGFloat x = g_cursor_pos_px.x, y = g_cursor_pos_px.y;
+    if (g_cur_w > 0) {
+        g_cursor_layer.bounds = CGRectMake(0, 0, g_cur_w * g_px_to_pt, g_cur_h * g_px_to_pt);
+        g_cursor_layer.position = CGPointMake(g_desk_origin.x + (x - g_cur_hx) * g_px_to_pt,
+                                              g_desk_origin.y + (y - g_cur_hy) * g_px_to_pt);
+    } else {
+        g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
+                                              g_desk_origin.y + y * g_px_to_pt);
+    }
+}
+
 void winios_cursor_move(int x, int y) {
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
-        if (!g_cursor_layer) {
-            UIImage *img = winios_cursor_image();
-            g_cursor_layer = [CALayer layer];
-            g_cursor_layer.zPosition = 10000;   /* above every window layer */
-            g_cursor_layer.anchorPoint = CGPointMake(0, 0);
-            g_cursor_layer.contents = (id)img.CGImage;
-            g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
-            [g_compositor_view.layer addSublayer:g_cursor_layer];
-        }
+        winios_ensure_cursor_layer();
+        g_cursor_pos_px = CGPointMake(x, y);
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
-        g_cursor_layer.position = CGPointMake(g_desk_origin.x + x * g_px_to_pt,
-                                              g_desk_origin.y + y * g_px_to_pt);
+        winios_cursor_place();
         [CATransaction commit];
+    });
+}
+
+/* Called from winios_drv_set_cursor (wine thread) with a straight-alpha
+ * BGRA image + hotspot whenever the wine cursor changes (arrow → I-beam
+ * → resize arrows → app cursors). Copy before returning. */
+void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, const void *bgra) {
+    if (w <= 0 || h <= 0 || !bgra) return;
+    NSData *data = [NSData dataWithBytes:bgra length:(size_t)w * h * 4];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        winios_ensure_compositor();
+        if (!g_compositor_view) return;
+        winios_ensure_cursor_layer();
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+        CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
+                                       kCGBitmapByteOrder32Little | kCGImageAlphaFirst,
+                                       dp, NULL, false, kCGRenderingIntentDefault);
+        if (img) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            g_cursor_layer.contents = (__bridge id)img;
+            g_cur_w = w; g_cur_h = h; g_cur_hx = hot_x; g_cur_hy = hot_y;
+            winios_cursor_place();
+            [CATransaction commit];
+            CGImageRelease(img);
+        }
+        CGDataProviderRelease(dp);
+        CGColorSpaceRelease(cs);
+    });
+}
+
+void winios_cursor_show(int show) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_cursor_layer) g_cursor_layer.hidden = !show;
     });
 }
 
