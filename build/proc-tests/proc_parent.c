@@ -26,14 +26,21 @@ int main(void)
 {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-    char cmdline[] = "C:\\windows\\system32\\child-test.exe hello-from-parent";
+    /* depth=1: the child spawns a grandchild (itself at depth 0). Exercises
+     * a 3-process tree with two simultaneous pseudo-processes. */
+    char cmdline[] = "C:\\windows\\system32\\child-test.exe 1";
     DWORD wait_rc, exit_code = 0xdeadbeef;
     int pass;
 
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
 
-    out("[proc-test] === Mythic S1 CreateProcess smoke test ===\n");
+    out("[proc-test] === Mythic S1 CreateProcess smoke test v2 (env + 3-deep tree) ===\n");
+
+    /* Env inheritance: every process in the tree must see this. */
+    if (!SetEnvironmentVariableA("MYTHIC_TEST_VAR", "steam-s1"))
+        out("[proc-test] SetEnvironmentVariable FAILED err=%lu\n", GetLastError());
+
     out("[proc-test] parent pid=%lu spawning: %s\n",
         (unsigned long)GetCurrentProcessId(), cmdline);
 

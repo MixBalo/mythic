@@ -1125,10 +1125,17 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         NtTerminateThread( GetCurrentThread(), exit_code );
         /* if we somehow return, fall through */
     }
-    /* iOS: if process is already exiting and this is the self-terminate call,
+    /* iOS: if THIS pseudo-process is already exiting and this is the
+     * self-terminate call (the -1 pseudo-handle from RtlExitUserProcess),
      * go directly to exit_process. The server may return self=false because
-     * it already processed the termination, causing an infinite loop. */
-    if (process_exiting && handle)
+     * it already processed the termination, causing an infinite loop.
+     * Per-process flag: a global one poisons every other pseudo-process's
+     * exit once the first dies (2026-07-05 3-deep-tree bug) — and worse,
+     * would force-exit a process that merely KILLS another (handle != -1),
+     * which Steam does to its helpers. */
+    extern BOOL *ios_process_exiting_ptr(void);
+    BOOL *exiting_flag = ios_process_exiting_ptr();
+    if (*exiting_flag && handle == (HANDLE)~(ULONG_PTR)0)
     {
         ERR("NtTerminateProcess: process_exiting=1, forcing exit_process(%d)\n", (int)exit_code);
         exit_process( exit_code );
@@ -1145,9 +1152,15 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     SERVER_END_REQ;
     if (self)
     {
+#ifdef WINE_IOS
+        if (!handle) *exiting_flag = TRUE;
+        else if (*exiting_flag) exit_process( exit_code );
+        else abort_process( exit_code );
+#else
         if (!handle) process_exiting = TRUE;
         else if (process_exiting) exit_process( exit_code );
         else abort_process( exit_code );
+#endif
     }
     return ret;
 }

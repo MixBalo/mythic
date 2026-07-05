@@ -466,6 +466,19 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.indigo)
 
+                Button("Run cmd /c proc tree") {
+                    // Steam S1 ladder: wine's cmd runs the full test tree —
+                    // cmd → proc-test → child(depth 1) → grandchild(depth 0).
+                    // Four processes, three pseudo-process spawns; exit 0
+                    // bubbles up from proc-test's PASS.
+                    setenv("MYTHIC_EXE", "cmd.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/c C:\\windows\\system32\\proc-test.exe", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
                 Button("Continue Net Test") {
                     // VPN gate: the test PE pauses before the Steam stage
                     // (all TLS code already JIT-compiled by then) so the

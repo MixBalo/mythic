@@ -163,12 +163,69 @@ sigset_t server_block_set;  /* signals to block during server calls */
  * Wine process — a POSIX fd is process-wide, and in-process CreateThread
  * callers (e.g. DXMT's command-queue encode/finish threads) must reuse it.
  *
- * When CreateProcess child-process work is revived, each child-thread will
- * need its own fd_socket; the stashed approach used _Thread_local here, but
- * that silently broke in-process CreateThread because new threads got a -1
- * value and sendmsg failed. Per-child fd_socket will need a different
- * mechanism (e.g. keyed off a child-id set during thread setup). */
+ * S1 pseudo-processes: each child "process" has its OWN master socket, and
+ * the server detects process death by EOF on it. This global belongs to the
+ * PARENT only; children register theirs in ios_proc_sockets below, keyed by
+ * PEB (the pseudo-process identity — all the child's threads inherit it via
+ * TEB->Peb). The old code overwrote this global with the newest child's
+ * socket, so the SECOND process to exit closed an already-closed fd, its own
+ * socket stayed open, and wineserver reported it STILL_ACTIVE forever
+ * (2026-07-05 3-deep-tree bug). _Thread_local was tried before and broke
+ * in-process CreateThread (new threads saw -1). */
 static int fd_socket = -1;
+
+#ifdef WINE_IOS
+#define IOS_MAX_PROC_SOCKETS 64
+static struct ios_proc_socket
+{
+    void *peb;      /* NULL = free slot */
+    int fd;         /* this pseudo-process's master socket to wineserver */
+    BOOL exiting;   /* per-process process_exiting flag */
+} ios_proc_sockets[IOS_MAX_PROC_SOCKETS];
+static int ios_proc_socket_count = 0;
+
+extern void *ios_jit_current_peb(void);
+
+static int ios_proc_socket_index(void)
+{
+    void *cur = ios_jit_current_peb();
+    int i, n = ios_proc_socket_count;
+    if (cur)
+        for (i = 0; i < n; i++)
+            if (ios_proc_sockets[i].peb == cur) return i;
+    return -1;
+}
+
+/* Master socket for the CURRENT thread's pseudo-process (parent = global). */
+static int ios_current_fd_socket(void)
+{
+    int i = ios_proc_socket_index();
+    return (i >= 0) ? ios_proc_sockets[i].fd : fd_socket;
+}
+
+/* Per-process process_exiting flag (used by NtTerminateProcess). A global
+ * flag poisons every OTHER pseudo-process's exit path once the first one
+ * dies (they skip their self-terminate and the server never hears). */
+BOOL *ios_process_exiting_ptr(void)
+{
+    int i = ios_proc_socket_index();
+    return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
+}
+
+static void ios_register_proc_socket(void *peb_id, int fd)
+{
+    int idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
+    if (idx >= IOS_MAX_PROC_SOCKETS)
+    {
+        wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
+        return;
+    }
+    ios_proc_sockets[idx].fd = fd;
+    ios_proc_sockets[idx].exiting = FALSE;
+    __sync_synchronize();
+    ios_proc_sockets[idx].peb = peb_id;
+}
+#endif
 static _Thread_local int initial_cwd = -1;
 static pid_t server_pid;
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1115,7 +1172,11 @@ void CDECL wine_server_send_fd( int fd )
 
     for (;;)
     {
+#ifdef WINE_IOS
+        if ((ret = sendmsg( ios_current_fd_socket(), &msghdr, 0 )) == sizeof(data)) return;
+#else
         if ((ret = sendmsg( fd_socket, &msghdr, 0 )) == sizeof(data)) return;
+#endif
         if (ret >= 0) server_protocol_error( "partial write %d\n", ret );
         if (errno == EINTR) continue;
         if (errno == EPIPE) abort_thread(0);
@@ -1149,7 +1210,11 @@ int wine_server_receive_fd( obj_handle_t *handle )
 
     for (;;)
     {
+#ifdef WINE_IOS
+        if ((ret = recvmsg( ios_current_fd_socket(), &msghdr, MSG_CMSG_CLOEXEC )) > 0)
+#else
         if ((ret = recvmsg( fd_socket, &msghdr, MSG_CMSG_CLOEXEC )) > 0)
+#endif
         {
             struct cmsghdr *cmsg;
             for (cmsg = CMSG_FIRSTHDR( &msghdr ); cmsg; cmsg = CMSG_NXTHDR( &msghdr, cmsg ))
@@ -1778,7 +1843,22 @@ static int init_thread_pipe(void)
  */
 void process_exit_wrapper( int status )
 {
+#ifdef WINE_IOS
+    /* Close THIS pseudo-process's master socket — the EOF is how wineserver
+     * learns the process died (signals its process object, wakes waiters).
+     * Clear the registry slot so a stray second call can't double-close. */
+    int i = ios_proc_socket_index();
+    if (i >= 0)
+    {
+        wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
+                       status, ios_proc_sockets[i].fd);
+        close( ios_proc_sockets[i].fd );
+        ios_proc_sockets[i].peb = NULL;
+    }
+    else close( fd_socket );
+#else
     close( fd_socket );
+#endif
     wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d)", status );
     exit( status );  /* on iOS, wine_ios_exit shim longjmps back to wine_process_thread */
 }
@@ -1971,12 +2051,16 @@ size_t server_init_process_child( int child_fd_socket )
     size_t info_size;
     DWORD pid, tid;
 
-    /* Set the thread-local fd_socket for this child "process" */
-    fd_socket = child_fd_socket;
-    if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
-        wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", fd_socket);
+    /* Register this child's master socket keyed by its PEB (teb->Peb is
+     * already the child's — set in wine_ios_child_main before this call).
+     * The global fd_socket stays the PARENT's; send_fd/receive_fd/exit
+     * resolve per-process via ios_current_fd_socket(). */
+    if (fcntl( child_fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
+        wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", child_fd_socket);
+    ios_register_proc_socket( ios_jit_current_peb(), child_fd_socket );
 
-    wine_log_write("[Wine child] server_init_process_child: fd_socket=%d", fd_socket);
+    wine_log_write("[Wine child] server_init_process_child: fd_socket=%d (peb=%p)",
+                   child_fd_socket, ios_jit_current_peb());
 
     /* Do NOT set up signal mask — already done by parent (shared process) */
     /* Do NOT call setup_config_dir — already done by parent */
