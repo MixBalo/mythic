@@ -110,6 +110,11 @@ final class MetalBackedView: UIView {
             w.addSubview(host)
         }
         host.frame = convert(gameRect(), to: w)
+        // S2 desktop mode: the winios compositor renders the wine virtual
+        // desktop aspect-fit inside THIS placeholder's area, exactly like
+        // the games' Metal layer — never over the whole phone screen.
+        let full = convert(bounds, to: w)
+        winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         if !Self.layerRegistered {
             Self.layerRegistered = true
             mythic_display_set_layer(host.metalLayer)
@@ -121,6 +126,8 @@ final class MetalBackedView: UIView {
         super.layoutSubviews()
         if let w = window {
             MetalHostView.shared.frame = convert(gameRect(), to: w)
+            let full = convert(bounds, to: w)
+            winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
     }
 
@@ -134,26 +141,162 @@ final class MetalBackedView: UIView {
         let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
         return (x, y)
     }
+
+    // ==================================================================
+    // S2 desktop mode: trackpad-style pointer.
+    //   one finger move       — cursor moves relative (like a laptop pad)
+    //   single tap            — left click
+    //   double tap            — double click (two rapid clicks)
+    //   double tap + hold     — drag (button held while moving), lift = drop
+    //   two-finger drag       — scroll wheel
+    //   two-finger tap        — right click
+    // Cursor position lives here (desktop px); wine + the rendered arrow
+    // follow via winios_pointer / winios_cursor_move.
+    // ==================================================================
+    private static var cursor = CGPoint(x: 480, y: 270)
+    private var lastPanPoint = CGPoint.zero
+    private var touchStartPoint = CGPoint.zero
+    private var touchStartTime: TimeInterval = 0
+    private var movedBeyondSlop = false
+    private var dragActive = false
+    private var lastTapEndTime: TimeInterval = 0
+    private var lastTapPoint = CGPoint.zero
+    private var twoFingerActive = false
+    private var twoFingerMoved = false
+    private var twoFingerStartTime: TimeInterval = 0
+    private var lastTwoFingerY: CGFloat = 0
+    private var scrollAccum: CGFloat = 0
+
+    private let F_MOVE: UInt32 = 0x1, F_LDOWN: UInt32 = 0x2, F_LUP: UInt32 = 0x4
+    private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
+    private let F_WHEEL: UInt32 = 0x800, F_ABS: UInt32 = 0x8000
+
+    private var desktopMode: Bool {
+        guard let v = getenv("MYTHIC_DESKTOP") else { return false }
+        return v.pointee == 49  // '1'
+    }
+    private func envInt(_ name: String, _ def: Int) -> Int {
+        guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
+        return i
+    }
+    private func postPointer(_ flags: UInt32, data: Int32 = 0) {
+        winios_pointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, UInt32(bitPattern: data))
+    }
+    private func avgPoint(_ touches: [UITouch]) -> CGPoint {
+        var x: CGFloat = 0, y: CGFloat = 0
+        for t in touches { let p = t.location(in: self); x += p.x; y += p.y }
+        let n = CGFloat(max(touches.count, 1))
+        return CGPoint(x: x / n, y: y / n)
+    }
+    private func activeTouches(_ event: UIEvent?) -> [UITouch] {
+        (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_down(x, y)
+            return
+        }
+        let now = Date().timeIntervalSinceReferenceDate
+        let active = activeTouches(event)
+        if active.count >= 2 {
+            twoFingerActive = true
+            twoFingerMoved = false
+            twoFingerStartTime = now
+            lastTwoFingerY = avgPoint(active).y
+            scrollAccum = 0
+            // a drag started by the first finger stays active; harmless
+            return
+        }
         guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        LogStore.shared.log("[swift] touchesBegan x=\(x) y=\(y)", level: .info)
-        winios_post_touch_down(x, y)
+        let p = t.location(in: self)
+        touchStartPoint = p
+        lastPanPoint = p
+        touchStartTime = now
+        movedBeyondSlop = false
+        // double-tap-and-hold → drag: press within 0.3s + 40pt of last tap
+        if now - lastTapEndTime < 0.30 && hypot(p.x - lastTapPoint.x, p.y - lastTapPoint.y) < 40 {
+            dragActive = true
+            postPointer(F_LDOWN)
+        }
     }
+
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_move(x, y)
+            return
+        }
+        let active = activeTouches(event)
+        if twoFingerActive {
+            guard active.count >= 2 else { return }
+            let avg = avgPoint(active)
+            let dy = avg.y - lastTwoFingerY
+            lastTwoFingerY = avg.y
+            if abs(dy) > 2 { twoFingerMoved = true }
+            scrollAccum += dy
+            // 14pt of finger travel = one wheel notch; fingers up = wheel up
+            while scrollAccum <= -14 { scrollAccum += 14; postPointer(F_WHEEL, data: 120) }
+            while scrollAccum >= 14 { scrollAccum -= 14; postPointer(F_WHEEL, data: -120) }
+            return
+        }
         guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_move(x, y)
+        let p = t.location(in: self)
+        let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
+        lastPanPoint = p
+        if hypot(p.x - touchStartPoint.x, p.y - touchStartPoint.y) > 10 { movedBeyondSlop = true }
+        let sens: CGFloat = 2.0   // desktop px per view pt
+        let maxX = CGFloat(envInt("MYTHIC_SCREEN_W", 1024) - 1)
+        let maxY = CGFloat(envInt("MYTHIC_SCREEN_H", 768) - 1)
+        Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
+        Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
+        postPointer(F_MOVE | F_ABS)
     }
+
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_up(x, y)
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_up(x, y)
+            return
+        }
+        let now = Date().timeIntervalSinceReferenceDate
+        if twoFingerActive {
+            if activeTouches(event).isEmpty {
+                if !twoFingerMoved && now - twoFingerStartTime < 0.40 {
+                    postPointer(F_RDOWN)
+                    postPointer(F_RUP)
+                }
+                twoFingerActive = false
+            }
+            return
+        }
+        if dragActive {
+            postPointer(F_LUP)
+            dragActive = false
+            lastTapEndTime = 0   // don't chain another drag off the drop
+            return
+        }
+        if !movedBeyondSlop && now - touchStartTime < 0.30 {
+            postPointer(F_LDOWN)
+            postPointer(F_LUP)
+            lastTapEndTime = now
+            lastTapPoint = touchStartPoint
+        }
     }
+
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_up(x, y)
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_up(x, y)
+            return
+        }
+        if dragActive { postPointer(F_LUP); dragActive = false }
+        twoFingerActive = false
     }
 }
 
@@ -428,6 +571,7 @@ struct ContentView: View {
 
                 Button("Run Wine") {
                     setenv("MYTHIC_EXE", "cube.exe", 1)
+                    unsetenv("MYTHIC_DESKTOP")
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -440,6 +584,7 @@ struct ContentView: View {
                     setenv("MYTHIC_EXE",
                            "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
                     unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -465,6 +610,28 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.indigo)
+
+                Button("Run Desktop (explorer)") {
+                    // Steam S2 round 2: explorer creates the virtual desktop,
+                    // then spawns winemine as a pseudo-process INSIDE it.
+                    // No pixels yet (nulldrv) — validates child windows
+                    // joining the desktop tree + WM_PAINT flow.
+                    // /desktop=shell → wine explorer's REAL taskbar + Start
+                    // menu (EnableShell defaults on for the magic name
+                    // "shell" — same environment Winlator/Mobox show).
+                    // 960x540 landscape matches the presentation area.
+                    let deskW = 960, deskH = 540
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\winemine.exe", 1)
+                    // enables GDI window-surface compositing in the driver
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
 
                 Button("Run cmd /c proc tree") {
                     // Steam S1 ladder: wine's cmd runs the full test tree —

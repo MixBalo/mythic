@@ -81,13 +81,16 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
     /* Pass hwnd=NULL — the server then hit-tests via shallow_window_from_point
      * which walks the desktop's children (where the game's window lives).
      * Passing the desktop handle goes through window_thread_from_point on
-     * the detached desktop window and returns NULL, dropping the message. */
-    BOOL ret = NtUserSendHardwareInput( NULL, 0, &input, 0 );
+     * the detached desktop window and returns NULL, dropping the message.
+     * Call win32u's send_hardware_message directly (same library) instead
+     * of the NtUserCallHwndParam inline — we get the raw NTSTATUS and skip
+     * a dispatch layer that can fail for its own reasons. */
+    NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
         static unsigned cnt;
-        if (cnt++ < 20)
-            dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> %d\n",
-                    hwnd, flags, x, y, ret);
+        if (cnt++ < 40)
+            dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> status=0x%x\n",
+                    hwnd, flags, x, y, (unsigned)st);
     }
 }
 
@@ -106,12 +109,124 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     input.ki.time        = 0;
     input.ki.dwExtraInfo = 0;
 
-    BOOL ret = NtUserSendHardwareInput( NULL, 0, &input, 0 );
+    NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
         static unsigned cnt;
         if (cnt++ < 40)
-            dprintf(2, "[winios] drv_post_key vk=0x%x flags=0x%x -> %d\n", vk, flags, ret);
+            dprintf(2, "[winios] drv_post_key vk=0x%x flags=0x%x -> status=0x%x\n", vk, flags, (unsigned)st);
     }
+}
+
+/* ============================================================ *
+ * winios window surfaces (S2): GDI window content → app compositor.
+ * Modeled on win32u's offscreen surface (dce.c): the generic
+ * window_surface layer owns the 32bpp top-down DIB and hands us the
+ * bits at flush time; we just forward them to the app side, which
+ * uploads into a per-window CALayer. Gated on MYTHIC_DESKTOP=1 so the
+ * games path keeps its invisible offscreen surfaces unchanged.
+ * ============================================================ */
+
+/* Implemented in app/Mythic/Winios/Winios.m (weak, same pattern as the
+ * driver hooks below). Called on wine threads — the app side copies the
+ * bits before returning and uploads on the main thread. */
+extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
+                                    int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
+extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible ) __attribute__((weak));
+
+static int winios_desktop_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char *env = getenv( "MYTHIC_DESKTOP" );
+        mode = (env && *env == '1');
+    }
+    return mode;
+}
+
+static void winios_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
+{
+}
+
+static BOOL winios_surface_flush( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+                                  const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                  const BITMAPINFO *shape_info, const void *shape_bits )
+{
+    if (winios_surface_present && color_bits)
+    {
+        int surf_w = color_info->bmiHeader.biWidth;
+        int surf_h = color_info->bmiHeader.biHeight;
+        if (surf_h < 0) surf_h = -surf_h;
+        winios_surface_present( surface->hwnd,
+                                dirty->left, dirty->top,
+                                dirty->right - dirty->left, dirty->bottom - dirty->top,
+                                surf_w, surf_h, surf_w * 4, color_bits );
+    }
+    return TRUE;
+}
+
+static void winios_surface_destroy( struct window_surface *surface )
+{
+    /* Layer teardown happens on pDestroyWindow, not here — surfaces are
+     * recreated on every resize and dropping the layer would flicker. */
+}
+
+static const struct window_surface_funcs winios_surface_funcs =
+{
+    winios_surface_set_clip,
+    winios_surface_flush,
+    winios_surface_destroy
+};
+
+static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect,
+                                        struct window_surface **window_surface )
+{
+    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+    BITMAPINFO *info = (BITMAPINFO *)buffer;
+    struct window_surface *previous;
+
+    if ((previous = *window_surface) && previous->funcs == &winios_surface_funcs
+        && EqualRect( &previous->rect, surface_rect )) return TRUE;
+
+    memset( info, 0, sizeof(*info) );
+    info->bmiHeader.biSize        = sizeof(info->bmiHeader);
+    info->bmiHeader.biWidth       = surface_rect->right;
+    info->bmiHeader.biHeight      = -surface_rect->bottom; /* top-down */
+    info->bmiHeader.biPlanes      = 1;
+    info->bmiHeader.biBitCount    = 32;
+    info->bmiHeader.biSizeImage   = surface_rect->right * surface_rect->bottom * 4;
+    info->bmiHeader.biCompression = BI_RGB;
+
+    *window_surface = window_surface_create( sizeof(struct window_surface), &winios_surface_funcs,
+                                             hwnd, surface_rect, info, 0 );
+    if (previous) window_surface_release( previous );
+
+    {
+        static unsigned cnt;
+        if (cnt++ < 16)
+            dprintf( 2, "[winios] CreateWindowSurface hwnd=%p rect={%d,%d,%d,%d} layered=%d -> %p\n",
+                     hwnd, (int)surface_rect->left, (int)surface_rect->top,
+                     (int)surface_rect->right, (int)surface_rect->bottom, layered, *window_surface );
+    }
+    return TRUE;
+}
+
+/* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
+ * cannot include wine headers) and forward plain ints for the layer
+ * frame; chain to the Winios.m hook afterwards. */
+static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                           const struct window_rects *new_rects, struct window_surface *surface )
+{
+    /* desktop mode only — game windows must never wake the compositor
+     * (it would draw its backdrop OVER the DXMT Metal layer) */
+    if (winios_window_frame && winios_desktop_mode())
+    {
+        const RECT *v = &new_rects->visible;
+        int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
+        winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible );
+    }
+    if (winios_pWindowPosChanged)
+        winios_pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, new_rects, surface );
 }
 #endif
 
@@ -1159,7 +1274,17 @@ static void load_display_driver(void)
         if (winios_pSetCursor)           winios_user_driver.pSetCursor           = winios_pSetCursor;
         if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
         if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
-        if (winios_pWindowPosChanged)    winios_user_driver.pWindowPosChanged    = winios_pWindowPosChanged;
+        /* window-pos wrapper dereferences window_rects on this side and
+         * forwards plain ints to Winios.m's layer compositor */
+        if (winios_pWindowPosChanged || winios_window_frame)
+            winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
+        /* S2 desktop mode only: GDI window surfaces → app compositor.
+         * Games keep the offscreen (invisible) surface path. */
+        if (winios_desktop_mode())
+        {
+            winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
+            dprintf( 2, "[winios] desktop mode: window-surface compositing ENABLED\n" );
+        }
         winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
         __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
 #else

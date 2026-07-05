@@ -179,6 +179,25 @@ static struct monitor virtual_monitor =
     .rc_work.bottom = 768,
 };
 
+#ifdef WINE_IOS
+/* S2 virtual desktop: screen size for the virtual monitor. The app sets
+ * MYTHIC_SCREEN_W/H (device pixels, e.g. 1170x2532) in desktop mode so
+ * the wine desktop covers the whole display; default stays 1024x768 for
+ * the games path. */
+static void ios_screen_size( int *w, int *h )
+{
+    static int sw, sh;
+    if (!sw)
+    {
+        const char *we = getenv( "MYTHIC_SCREEN_W" ), *he = getenv( "MYTHIC_SCREEN_H" );
+        sw = (we && atoi( we ) > 0) ? atoi( we ) : 1024;
+        sh = (he && atoi( he ) > 0) ? atoi( he ) : 768;
+    }
+    *w = sw;
+    *h = sh;
+}
+#endif
+
 /* the various registry keys that are used to store parameters */
 enum parameter_key
 {
@@ -2388,6 +2407,15 @@ static RECT monitor_get_rect( struct monitor *monitor, UINT dpi, MONITOR_DPI_TYP
     UINT dpi_from, x, y;
     DEVMODEW *mode;
 
+#ifdef WINE_IOS
+    {
+        int sw, sh;
+        ios_screen_size( &sw, &sh );
+        rect.right = sw;
+        rect.bottom = sh;
+    }
+#endif
+
     /* services do not have any adapters, only a virtual monitor */
     if (!(source = monitor->source)) return rect;
 
@@ -2864,6 +2892,14 @@ static BOOL lock_display_devices( BOOL force )
         (NtUserGetObjectInformation( NtUserGetProcessWindowStation(), UOI_NAME, name, sizeof(name), NULL )
          && !wcscmp( name, wine_service_station_name )))
     {
+#ifdef WINE_IOS
+        {
+            int sw, sh;
+            ios_screen_size( &sw, &sh );
+            virtual_monitor.rc_work.right = sw;
+            virtual_monitor.rc_work.bottom = sh;
+        }
+#endif
         clear_display_devices();
         list_add_tail( &monitors, &virtual_monitor.entry );
         set_winstation_monitors( TRUE );

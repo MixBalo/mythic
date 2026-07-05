@@ -1840,6 +1840,14 @@ static user_handle_t find_hardware_message_window( struct desktop *desktop, stru
             if (is_window_visible( msg->win ) && !is_window_transparent( msg->win )) win = msg->win;
             else win = shallow_window_from_point( desktop, msg->x, msg->y );
             *thread = window_thread_from_point( win, msg->x, msg->y );
+            /* iOS S2 diag: trace button routing (spammy for moves — buttons only) */
+            if (get_hardware_msg_bit( msg->msg ) == QS_MOUSEBUTTON)
+            {
+                static unsigned diag_cnt;
+                if (diag_cnt++ < 40)
+                    fprintf( stderr, "[srv-input] btn msg=0x%x at (%d,%d) hit win=%08x thread=%p\n",
+                             msg->msg, msg->x, msg->y, win, *thread );
+            }
         }
         break;
     }

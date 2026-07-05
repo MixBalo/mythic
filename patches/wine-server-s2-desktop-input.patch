@@ -1,0 +1,42 @@
+diff --git a/server/winstation.c b/server/winstation.c
+index 4329f9f4384..421349c2537 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -718,6 +718,37 @@ DECL_HANDLER(create_desktop)
+     {
+         if ((desktop = create_desktop( &name, req->attributes, req->flags, winstation )))
+         {
++            /* iOS-Mythic (S2): a virtual desktop created by explorer must
++             * receive hardware input. Wine only marks WinSta0 WSF_VISIBLE,
++             * but is_service_process()=TRUE on iOS routes every process into
++             * a non-WinSta0 winstation — set_input_desktop then fails and
++             * send_hardware_message rejects ALL input with ACCESS_DENIED.
++             * Also init cursor.clip: monitors_get_union_rect is empty on iOS
++             * (no monitors reported), which clips every cursor coord to
++             * (0,0). Mirrors the detached-desktop hack in window_ios.c,
++             * which only covers the games path. */
++            if (req->flags & DF_WINE_VIRTUAL_DESKTOP)
++            {
++                const char *w_env = getenv( "MYTHIC_SCREEN_W" ), *h_env = getenv( "MYTHIC_SCREEN_H" );
++                int scr_w = (w_env && atoi( w_env ) > 0) ? atoi( w_env ) : 1024;
++                int scr_h = (h_env && atoi( h_env ) > 0) ? atoi( h_env ) : 768;
++                desktop_shm_t *desktop_shm = desktop->shared;
++
++                winstation->flags |= WSF_VISIBLE;
++                SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
++                {
++                    shared->cursor.clip.left = 0;
++                    shared->cursor.clip.top = 0;
++                    shared->cursor.clip.right = scr_w;
++                    shared->cursor.clip.bottom = scr_h;
++                }
++                SHARED_WRITE_END;
++                /* force: the games-path hack may have pointed input at the
++                 * initial Default desktop earlier in boot */
++                set_input_desktop( winstation, desktop );
++                fprintf( stderr, "[srv-desktop] virtual desktop created: clip %dx%d, winstation visible, input desktop set\n",
++                         scr_w, scr_h );
++            }
+             if (!winstation->input_desktop) set_input_desktop( winstation, desktop );
+             reply->handle = alloc_handle( current->process, desktop, req->access, req->attributes );
+             release_object( desktop );
