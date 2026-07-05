@@ -742,6 +742,37 @@ static void *ios_mach_exception_thread( void *arg )
                             }
                         }
 
+                        /* SIMD/FP register-offset + unsigned-offset loads/
+                         * stores, base x18 (V=1, bit 26). `LDR Q0,[x18,x8]`
+                         * (insn 3ce86a40) crashed the crypt32 cert-verify
+                         * SIMD memcpy 2026-07-05. ea = thread_teb+fault_addr
+                         * (hw already added the offset). Access width from
+                         * {size, opc<1>}: size0+opc<1> = 128-bit Q, else
+                         * 1<<size bytes (B/H/S/D). opc<0> (bit22): 1=load,
+                         * 0=store. Loads write neon_state.__v[rt] (zeroing
+                         * the upper lanes) and push it back immediately;
+                         * stores read from it. */
+                        if (!emulated && have_neon &&
+                            ((insn & 0x3f200c00) == 0x3c200800 ||   /* SIMD register offset */
+                             (insn & 0x3f000000) == 0x3d000000))    /* SIMD unsigned-offset imm */
+                        {
+                            int size = (insn >> 30) & 3;
+                            int opc  = (insn >> 22) & 3;
+                            int bytes = (size == 0 && (opc & 2)) ? 16 : (1 << size);
+                            if (opc & 1)   /* load */
+                            {
+                                memset(&neon_state.__v[rt], 0, 16);
+                                memcpy(&neon_state.__v[rt], (void *)ea, bytes);
+                                thread_set_state(thread, ARM_NEON_STATE64,
+                                                 (thread_state_t)&neon_state, neon_count);
+                            }
+                            else           /* store */
+                            {
+                                memcpy((void *)ea, &neon_state.__v[rt], bytes);
+                            }
+                            emulated = 1;
+                        }
+
                         if (emulated)
                         {
                             static volatile int emul3_count = 0;

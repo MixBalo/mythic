@@ -90,3 +90,5 @@ wine-ios-build/
 
 # StikDebug scripts (reference only)
 MeloNX.js
+build/gnutls-ios/src/
+build/gnutls-ios/obj/

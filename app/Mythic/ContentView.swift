@@ -445,6 +445,26 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
 
+                Button("Run Net Test (HTTPS)") {
+                    // Steam S0 smoke test: plain HTTP then HTTPS+certs via
+                    // winhttp -> ws2_32/schannel/bcrypt/crypt32 unixlibs.
+                    setenv("MYTHIC_EXE", "winhttp-test.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button("Continue Net Test") {
+                    // VPN gate: the test PE pauses before the Steam stage
+                    // (all TLS code already JIT-compiled by then) so the
+                    // JIT debugger can be detached and VPNs switched.
+                    // This drops C:\mythic-continue.flag to resume it.
+                    _ = mythic_write_continue_flag()
+                }
+                .buttonStyle(.bordered)
+                .tint(.teal)
+
                 Button("Run x64 Hello (FEX/ARM64EC)") {
                     setenv("MYTHIC_EXE", "hello-x64.exe", 1)
                     runWineFullSequence()

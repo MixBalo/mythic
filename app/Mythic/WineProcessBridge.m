@@ -238,6 +238,19 @@ static void *wine_process_thread(void *arg) {
             setenv("MYTHIC_DOCS_DIR", docs.UTF8String, 1);
         }
 
+        // Steam S0: root CA trust. iOS has no API to enumerate system
+        // roots, so crypt32's unix rootstore (crypt32_unixlib_ios.c)
+        // reads the bundled Mozilla CA set from this path instead.
+        {
+            NSString *caPath = [[NSBundle mainBundle] pathForResource:@"cacert" ofType:@"pem"];
+            if (caPath) {
+                setenv("MYTHIC_CA_BUNDLE", caPath.UTF8String, 1);
+                LOG("CA bundle: %{public}s", caPath.UTF8String);
+            } else {
+                LOG("WARNING: cacert.pem missing from bundle — HTTPS cert verification will fail");
+            }
+        }
+
         // Redirect stderr AND stdout to log file so Wine debug output (WINEDEBUG)
         // and the guest program's printf are both captured.
         {
@@ -458,6 +471,19 @@ static void *wine_process_thread(void *arg) {
         wineserver_stop();
 
         dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
+
+        // Steam S0: this thread's TEB was mirrored into pthread TSD slot
+        // 275 (FEX's hardcoded 0x898) which we don't own via
+        // pthread_key_create. Returning from a pthread runs foreign key
+        // destructors on whatever's in the slot -> objc_release(TEB)
+        // crash wedged the app after every net-test run. Clear it, same
+        // as ntdll's pthread_exit_wrapper does for Wine worker threads.
+        {
+            uintptr_t tsd_base;
+            __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+            tsd_base &= ~7ULL;
+            *(void **)(tsd_base + 275 * 8) = NULL;
+        }
     }
     return NULL;
 }
@@ -518,4 +544,18 @@ int wine_process_start(const char *prefix_path) {
 
 int wine_process_is_running(void) {
     return g_wine_running;
+}
+
+int mythic_write_continue_flag(void) {
+    if (!g_prefix_path) return -1;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/drive_c/mythic-continue.flag", g_prefix_path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG("continue flag write FAILED: %{public}s errno=%d", path, errno);
+        return -1;
+    }
+    close(fd);
+    LOG("continue flag written: %{public}s", path);
+    return 0;
 }

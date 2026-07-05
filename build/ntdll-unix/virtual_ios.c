@@ -1546,6 +1546,17 @@ extern const void *dxmt_winemetal_unix_call_funcs[];
  * to advance past audio-gated splash/intro sequences. See audio_null_ios.c */
 extern const void *audio_null_ios_unix_call_funcs[];
 
+/* iOS-Mythic 2026-07-05 (Steam S0): network + crypto unix tables,
+ * compiled from wine/dlls/<dll>/ sources into libntdll_unix.a with
+ * -D__wine_unix_call_funcs=<dll>_unix_call_funcs (build/ntdll-unix/
+ * build.sh compile_unixlib). The GnuTLS-backed ones (bcrypt, secur32,
+ * crypt32) resolve libgnutls statically via build/crypto-unix/
+ * gnutls_symtab_ios.c instead of dlopen. */
+extern const void *ws2_32_unix_call_funcs[];
+extern const void *bcrypt_unix_call_funcs[];
+extern const void *secur32_unix_call_funcs[];
+extern const void *crypt32_unix_call_funcs[];
+
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
  * statically-linked unix libs can keep their own init without colliding.
@@ -1608,6 +1619,26 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)audio_null_ios_unix_call_funcs;
             ERR("iOS: module %p (%s) -> audio_null_ios_unix_call_funcs (%p)\n",
                 module, match, audio_null_ios_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "ws2_32")) {
+            *funcs = (const void *)ws2_32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> ws2_32_unix_call_funcs (%p)\n",
+                module, match, (void *)ws2_32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "bcrypt")) {
+            *funcs = (const void *)bcrypt_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> bcrypt_unix_call_funcs (%p)\n",
+                module, match, (void *)bcrypt_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "secur32")) {
+            *funcs = (const void *)secur32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> secur32_unix_call_funcs (%p)\n",
+                module, match, (void *)secur32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "crypt32")) {
+            *funcs = (const void *)crypt32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> crypt32_unix_call_funcs (%p)\n",
+                module, match, (void *)crypt32_unix_call_funcs);
             status = STATUS_SUCCESS;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.

@@ -1110,6 +1110,20 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
     close( ntdll_get_thread_data()->wait_fd[1] );
     close( ntdll_get_thread_data()->reply_fd );
     close( ntdll_get_thread_data()->request_fd );
+    /* iOS-Mythic (Steam S0): we write the TEB directly into TSD slot 275
+     * (start_thread above) because FEX hardcodes offset 0x898 — but we
+     * don't OWN dynamic key 275. If an Apple framework allocated that key
+     * with an ObjC destructor, pthread's TSD cleanup calls
+     * destructor(TEB) at thread exit → objc_release on a non-object →
+     * crash (seen: every winhttp resolver-thread exit died in
+     * objc_release+0x10 under pthread_exit). NULL values are skipped by
+     * the cleanup loop, so clear the slot before exiting. */
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        *(void **)(tsd_base + 275 * 8) = NULL;
+    }
     pthread_exit( UIntToPtr(status) );
 }
 

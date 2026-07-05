@@ -1022,6 +1022,43 @@ static int get_next_timeout( struct timespec *ts )
 }
 
 /* server main poll() loop */
+/* iOS-Mythic 2026-07-05 (Steam S0): the sandbox poll() limitation is
+ * specific to the AF_UNIX master socketpair — real INET sockets (TCP/
+ * UDP) are fully kernel-pollable on iOS. wineserver's sock.c depends on
+ * true poll semantics (POLLOUT edge = connect completed, POLLERR/HUP =
+ * failure); the synthesized events below (unconditional POLLOUT) made
+ * every nonblocking connect look complete-but-unwritable → WSAEWOULDBLOCK
+ * loops in winhttp. So INET fds get a real zero-timeout poll() each
+ * iteration; pipes and the AF_UNIX pair keep the legacy synthesis.
+ * Family is cached per (user,fd) — getsockname once per socket. */
+static signed char ios_fd_is_inet( int user, int fd )
+{
+    static int *cache_fd;
+    static signed char *cache_val;
+    static int cache_size;
+
+    if (user >= cache_size)
+    {
+        int newsize = (user + 64) & ~63;
+        int *nfd = realloc( cache_fd, newsize * sizeof(*nfd) );
+        signed char *nval = realloc( cache_val, newsize );
+        if (!nfd || !nval) return 0;
+        memset( nfd + cache_size, 0xff, (newsize - cache_size) * sizeof(*nfd) );
+        cache_fd = nfd; cache_val = nval; cache_size = newsize;
+    }
+    if (cache_fd[user] != fd)
+    {
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        cache_fd[user] = fd;
+        if (getsockname( fd, (struct sockaddr *)&ss, &slen ) == -1)
+            cache_val[user] = 0;
+        else
+            cache_val[user] = (ss.ss_family == AF_INET || ss.ss_family == AF_INET6);
+    }
+    return cache_val[user];
+}
+
 void main_loop(void)
 {
     int i, ret, timeout;
@@ -1158,15 +1195,49 @@ void main_loop(void)
             }
             set_current_time();
 
+            /* Real sockets first: zero-timeout poll() gives true INET
+             * event semantics (connect completion, errors, data). See
+             * ios_fd_is_inet comment. Dispatch re-checks fd identity —
+             * fd_poll_event may remove/reuse later poll users. */
+            {
+                struct pollfd rp[64];
+                int rp_user[64];
+                int nrp = 0, k;
+
+                for (i = 1; i < nb_users && nrp < 64; i++)
+                {
+                    if (pollfd[i].fd < 0 || !pollfd[i].events) continue;
+                    if (!ios_fd_is_inet( i, pollfd[i].fd )) continue;
+                    rp[nrp].fd = pollfd[i].fd;
+                    rp[nrp].events = pollfd[i].events;
+                    rp[nrp].revents = 0;
+                    rp_user[nrp++] = i;
+                }
+                if (nrp && poll( rp, nrp, 0 ) > 0)
+                {
+                    for (k = 0; k < nrp; k++)
+                    {
+                        int u = rp_user[k];
+                        if (!rp[k].revents) continue;
+                        if (pollfd[u].fd != rp[k].fd) continue;  /* user removed mid-dispatch */
+                        ios_events_fired++;
+                        fd_poll_event( poll_users[u], rp[k].revents );
+                    }
+                }
+            }
+
             /* Check non-master fds for events.
              * Init fds (signal pipes, files): use ioctl(FIONREAD) — works for pipes/files.
              * Client fds (socketpair, request pipe): always try non-blocking read —
-             * ioctl(FIONREAD) is broken for AF_UNIX sockets on iOS. */
+             * ioctl(FIONREAD) is broken for AF_UNIX sockets on iOS.
+             * INET sockets: handled by the real poll() above — skip here. */
             for (i = 1; i < nb_users; i++)
             {
                 if (pollfd[i].fd >= 0 && pollfd[i].events)
                 {
                     short revents = 0;
+
+                    if (ios_fd_is_inet( i, pollfd[i].fd )) continue;
 
                     if (pollfd[i].events & POLLIN)
                     {
