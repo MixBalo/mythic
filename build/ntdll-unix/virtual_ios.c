@@ -980,6 +980,13 @@ static void *host_addr_space_limit;  /* top of the host virtual address space */
 
 static struct file_view *arm64ec_view;
 
+/* X3c: EC bitmap base for wiring EcCodeBitMap into cross-arch child PEBs
+ * (alloc_arm64ec_map only sets it on the PEB current at first allocation). */
+void *ios_arm64ec_bitmap_base(void)
+{
+    return arm64ec_view ? arm64ec_view->base : NULL;
+}
+
 ULONG_PTR user_space_wow_limit = 0;
 struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
 

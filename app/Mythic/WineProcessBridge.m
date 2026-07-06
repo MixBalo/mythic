@@ -319,13 +319,55 @@ static void *wine_process_thread(void *arg) {
                 int crossLinked = 0;
                 for (NSString *f in others) {
                     NSString *dst = [sys32Dir stringByAppendingPathComponent:f];
-                    if ([fm fileExistsAtPath:dst]) continue;   // session set wins
+                    // fileExistsAtPath FOLLOWS symlinks: YES means the session
+                    // (main) pass already linked this name to a resolvable
+                    // file — that arch wins, leave it.
+                    if ([fm fileExistsAtPath:dst]) continue;
+                    // NO means absent OR a stale/dangling symlink left by a
+                    // previous install (bundle UUID changed on reinstall).
+                    // createSymbolicLink fails with EEXIST on a dangling link
+                    // that still occupies the path — which silently left the
+                    // -x64 files pointing at a dead bundle, so they vanished
+                    // from Wine's dir enumeration. Clear then recreate, like
+                    // the main pass does.
+                    [fm removeItemAtPath:dst error:nil];
                     NSString *src = [otherSource stringByAppendingPathComponent:f];
                     if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
                         crossLinked++;
                 }
                 dprintf(STDERR_FILENO, "[WineProc] Cross-linked %d non-colliding files from %s -> sys32\n",
                         crossLinked, other_subdir);
+            }
+
+            // X3c mixed-mode: full per-arch DLL farms. A cross-arch child's
+            // private ntdll retries C:\windows\sysx64 (SysWOW64-style) when a
+            // system32 name resolves to the session arch's binary — colliding
+            // names (ucrtbase, kernel32, ...) always do. sysaa64 is the
+            // mirror for the future inverse case (aarch64 child in an EC
+            // session, e.g. rpcss under Steam).
+            {
+                struct { const char *farm; const char *arch; } farms[] = {
+                    { "sysx64",  "arm64ec-windows" },
+                    { "sysaa64", "aarch64-windows" },
+                };
+                for (int i = 0; i < 2; i++) {
+                    NSString *farmDir = [prefix stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"drive_c/windows/%s", farms[i].farm]];
+                    NSString *archSource = [bundlePath stringByAppendingPathComponent:
+                        [NSString stringWithUTF8String:farms[i].arch]];
+                    [fm createDirectoryAtPath:farmDir withIntermediateDirectories:YES attributes:nil error:nil];
+                    NSArray *files = [fm contentsOfDirectoryAtPath:archSource error:nil];
+                    int farmLinked = 0;
+                    for (NSString *f in files) {
+                        NSString *dst = [farmDir stringByAppendingPathComponent:f];
+                        [fm removeItemAtPath:dst error:nil];  // self-heal stale links on reinstall
+                        NSString *src = [archSource stringByAppendingPathComponent:f];
+                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                            farmLinked++;
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] Farm %s: %d links -> %s\n",
+                            farms[i].farm, farmLinked, farms[i].arch);
+                }
             }
 
             // Layer Microsoft's real VC++ Runtime DLLs ON TOP of the ARM64EC

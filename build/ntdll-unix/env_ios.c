@@ -2080,6 +2080,8 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
+    dprintf(2, "[main-exe] load_main_exe = 0x%x Machine=0x%x chars=0x%x\n",
+            (unsigned)status, main_image_info.Machine, main_image_info.ImageCharacteristics);
     if (NT_SUCCESS(status))
     {
         char *loader;
@@ -2088,13 +2090,28 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         /* if we have to use a different loader, fall back to start.exe */
         if ((loader = get_alternate_wineloader( main_image_info.Machine )))
         {
+            dprintf(2, "[main-exe] get_alternate_wineloader returned '%s' -> forcing start.exe\n", loader);
             free( loader );
             status = STATUS_INVALID_IMAGE_FORMAT;
+        }
+        /* iOS: STATUS_IMAGE_NOT_AT_BASE is informational — the exe is mapped
+         * and already relocated by map_image_into_view. Whether the preferred
+         * base (0x140000000 for mingw exes) is free depends on ASLR vs the
+         * JIT pool, so this fires nondeterministically. Treating it as
+         * failure punts a healthy main exe to start.exe, an aarch64-only
+         * builtin that can never load in an EC session -> c0000135 at boot.
+         * (Same fix existed in the submodule's env.c but this fork is what
+         * builds.) */
+        if (status == STATUS_IMAGE_NOT_AT_BASE)
+        {
+            dprintf(2, "[main-exe] NOT_AT_BASE (relocated) — continuing normally\n");
+            status = STATUS_SUCCESS;
         }
     }
 
     if (status)  /* try launching it through start.exe */
     {
+        dprintf(2, "[main-exe] falling back to start.exe (status=0x%x)\n", (unsigned)status);
         static const char *args[] = { "start.exe", "/exec" };
         free( nt_name.Buffer );
         if (*module) NtUnmapViewOfSection( GetCurrentProcess(), *module );

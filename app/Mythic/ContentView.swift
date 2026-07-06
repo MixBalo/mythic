@@ -70,6 +70,19 @@ final class MetalHostView: UIView {
 final class MetalBackedView: UIView {
     private static var layerRegistered = false
 
+    // Hardware keyboard bridge: the view becomes first responder so the iOS
+    // software keyboard appears, and each typed character is forwarded to
+    // Wine as a virtual-key sequence (winios_post_key → send_hardware_message
+    // → WM_KEYDOWN/WM_CHAR). Lets the user type into Windows dialogs (e.g.
+    // Run) directly instead of relying on the browse list.
+    static weak var keyboardTarget: MetalBackedView?
+    override var canBecomeFirstResponder: Bool { true }
+    static func toggleKeyboard() {
+        guard let v = keyboardTarget else { return }
+        if v.isFirstResponder { v.resignFirstResponder() }
+        else { v.becomeFirstResponder() }
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         // Multi-touch REQUIRED: with it off, a fast double-tap's second
@@ -108,6 +121,7 @@ final class MetalBackedView: UIView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         guard let w = window else { return }   // detach: leave the host be
+        MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
         // SwiftUI ancestors attach gesture recognizers that can delay or
         // cancel raw touch delivery (double-tap timing is exactly what
         // they punish). Defuse them for our subtree.
@@ -374,6 +388,67 @@ struct HoldKeyView: View {
 }
 
 // SwiftUI wrapper around the placeholder view.
+// iOS software-keyboard → Wine key events. Each character is mapped to a
+// US-layout virtual-key (+ shift where needed) and posted as a down/up pair;
+// the message queue's ToUnicode then produces the right WM_CHAR. Paths need
+// the full symbol set (":" "\" "-" "." "_"), so the table is comprehensive.
+extension MetalBackedView: UIKeyInput {
+    var hasText: Bool { false }
+
+    // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
+    private static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
+        if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
+        if ch == "\t" { return (0x09, false) }                 // VK_TAB
+        if ch == " " { return (0x20, false) }                  // VK_SPACE
+        if ch.isLetter, let up = ch.uppercased().first?.asciiValue, up >= 0x41, up <= 0x5A {
+            return (Int32(up), ch.isUppercase)                 // VK_A..VK_Z
+        }
+        if let a = ch.asciiValue, a >= 0x30, a <= 0x39 {
+            return (Int32(a), false)                           // VK_0..VK_9 (unshifted)
+        }
+        let table: [Character: (Int32, Bool)] = [
+            "!": (0x31, true), "@": (0x32, true), "#": (0x33, true), "$": (0x34, true),
+            "%": (0x35, true), "^": (0x36, true), "&": (0x37, true), "*": (0x38, true),
+            "(": (0x39, true), ")": (0x30, true),
+            "-": (0xBD, false), "_": (0xBD, true),
+            "=": (0xBB, false), "+": (0xBB, true),
+            "[": (0xDB, false), "{": (0xDB, true),
+            "]": (0xDD, false), "}": (0xDD, true),
+            "\\": (0xDC, false), "|": (0xDC, true),
+            ";": (0xBA, false), ":": (0xBA, true),
+            "'": (0xDE, false), "\"": (0xDE, true),
+            ",": (0xBC, false), "<": (0xBC, true),
+            ".": (0xBE, false), ">": (0xBE, true),
+            "/": (0xBF, false), "?": (0xBF, true),
+            "`": (0xC0, false), "~": (0xC0, true),
+        ]
+        return table[ch]
+    }
+
+    func insertText(_ text: String) {
+        for ch in text {
+            guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
+            if shift { winios_post_key(0x10, 1) }   // VK_SHIFT down
+            winios_post_key(vk, 1)
+            winios_post_key(vk, 0)
+            if shift { winios_post_key(0x10, 0) }    // VK_SHIFT up
+        }
+    }
+
+    func deleteBackward() {
+        winios_post_key(0x08, 1)   // VK_BACK down
+        winios_post_key(0x08, 0)
+    }
+
+    // Traits: keep iOS from rewriting path characters.
+    var keyboardType: UIKeyboardType { get { .asciiCapable } set {} }
+    var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
+    var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
+    var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
+    var smartDashesType: UITextSmartDashesType { get { .no } set {} }
+    var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+}
+
 struct MythicMetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MetalBackedView {
         return MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
@@ -452,6 +527,12 @@ struct ContentView: View {
                 keyButton("⏎", vk: 0x0D)   // VK_RETURN
                 keyButton("␣", vk: 0x20)   // VK_SPACE
                 keyButton("Esc", vk: 0x1B) // VK_ESCAPE
+                Button { MetalBackedView.toggleKeyboard() } label: {
+                    Text("⌨").font(.system(size: 20))
+                        .frame(minWidth: 40, minHeight: 32)
+                        .background(Color.secondary.opacity(0.25))
+                        .cornerRadius(6)
+                }
                 Spacer()
                 FPSOverlay()
             }

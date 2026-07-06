@@ -306,11 +306,17 @@ static const char *get_so_dir( WORD machine )
  * written before the count is published. Audit 2026-07-06: every
  * is_arm64ec/main_image_info consumer lives in forked files; unforked
  * wine unix files have zero users. */
+#include "ios_mixed.h"
+
 #define IOS_MAX_PROC_IDENTS 64
 struct ios_proc_ident
 {
     void *peb;                        /* NULL = free slot */
     SECTION_IMAGE_INFORMATION info;   /* this pseudo-process's main exe */
+    /* X3c: cross-arch children run their own ntdll image (the session's
+     * aarch64 ntdll can't host an AMD64 process). NULL = session ntdll. */
+    void *ntdll_module;
+    struct ios_ntdll_funcs funcs;     /* valid when ntdll_module != NULL */
 };
 static struct ios_proc_ident ios_proc_idents[IOS_MAX_PROC_IDENTS];
 static int ios_proc_ident_count;
@@ -351,6 +357,33 @@ void ios_register_proc_ident( void *peb_id, const SECTION_IMAGE_INFORMATION *inf
     ios_proc_ident_count = idx + 1;
     dprintf(2, "[proc-ident] peb=%p Machine=0x%x (slot %d)\n",
             peb_id, info->Machine, idx);
+}
+
+/* X3c: attach a private ntdll image + entry points to a registered ident. */
+static void ios_set_proc_ntdll( void *peb_id, void *module, const struct ios_ntdll_funcs *funcs )
+{
+    int i, n = ios_proc_ident_count;
+    for (i = 0; i < n; i++)
+    {
+        if (ios_proc_idents[i].peb != peb_id) continue;
+        ios_proc_idents[i].funcs = *funcs;
+        __sync_synchronize();
+        ios_proc_idents[i].ntdll_module = module;
+        dprintf(2, "[proc-ident] peb=%p private ntdll=%p (slot %d)\n", peb_id, module, i);
+        return;
+    }
+    dprintf(2, "[proc-ident] ios_set_proc_ntdll: peb %p NOT REGISTERED\n", peb_id);
+}
+
+const struct ios_ntdll_funcs *ios_cur_ntdll_funcs(void)
+{
+    void *cur = ios_jit_current_peb();
+    int i, n = ios_proc_ident_count;
+    if (cur)
+        for (i = 0; i < n; i++)
+            if (ios_proc_idents[i].peb == cur)
+                return ios_proc_idents[i].ntdll_module ? &ios_proc_idents[i].funcs : NULL;
+    return NULL;
 }
 #endif
 
@@ -1149,6 +1182,41 @@ volatile uint64_t g_wine_unix_call_count = 0;
 static NTSTATUS ios_wrap_unix_call(int index, void *args, unixlib_entry_t real_func)
 {
     g_wine_unix_call_count++;
+    /* X3c probe: trace the first unix calls of a mixed-mode child (the one
+     * kind with a private ntdll) — its PE loader exits DLL_NOT_FOUND with
+     * zero syscalls and no debug trace ever reaching the log. dbg_write
+     * payloads are echoed so the PE side's own messages surface. */
+    {
+        static int ios_ecx_traced;
+        if (ios_ecx_traced < 24 && ios_cur_ntdll_funcs())
+        {
+            static const char *ios_ecx_names[] = { "load_so_dll", "unwind_builtin_dll",
+                "dbg_write", "server_call", "fd_to_handle", "handle_to_fd",
+                "spawnvp", "time_precise", "push_jit_aliases" };
+            int n = __sync_fetch_and_add(&ios_ecx_traced, 1);
+            NTSTATUS st;
+            if (index == 2)
+            {
+                struct { const char *str; unsigned int len; } *p = args;
+                dprintf(2, "[ecx-trace] #%d dbg_write: %.*s", n,
+                        p->len > 200 ? 200 : (int)p->len, p->str);
+            }
+            else if (index == 0)
+            {
+                struct load_so_dll_params *p = args;
+                char nm[128]; int i, len = p->nt_name.Length / 2;
+                if (len > 127) len = 127;
+                for (i = 0; i < len; i++) nm[i] = (char)p->nt_name.Buffer[i];
+                nm[len] = 0;
+                dprintf(2, "[ecx-trace] #%d load_so_dll %s\n", n, nm);
+            }
+            else dprintf(2, "[ecx-trace] #%d %s(args=%p)\n", n,
+                         index >= 0 && index < 9 ? ios_ecx_names[index] : "?", args);
+            st = real_func(args);
+            if (index != 2) dprintf(2, "[ecx-trace] #%d -> 0x%x\n", n, (unsigned)st);
+            return st;
+        }
+    }
     return real_func(args);
 }
 
@@ -1622,12 +1690,18 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
 
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
     if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE ))
+    {
+        dprintf(2, "[main-exe] get_nt_and_unix_names FAILED for main image\n");
         return STATUS_DLL_NOT_FOUND;
+    }
 
     status = open_dll_file( unix_name, &attr, &mapping );
+    dprintf(2, "[main-exe] open_dll_file('%s') = 0x%x\n", unix_name, (unsigned)status);
     if (!status)
     {
         status = virtual_map_module( mapping, module, &size, info, 0, 0, machine );
+        dprintf(2, "[main-exe] virtual_map_module = 0x%x Machine=0x%x chars=0x%x\n",
+                (unsigned)status, info->Machine, info->ImageCharacteristics);
         if (status == STATUS_IMAGE_MACHINE_TYPE_MISMATCH && info->ComPlusNativeReady)
         {
             info->Machine = native_machine;
@@ -1663,6 +1737,8 @@ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **mod
     {
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
                                    search_machine, load_machine, FALSE, 0 );
+        dprintf(2, "[main-exe] builtin-path retry: find_builtin_dll(search_machine=0x%x) = 0x%x Machine=0x%x\n",
+                search_machine, (unsigned)status, main_image_info.Machine);
     }
     return status;
 }
@@ -2026,6 +2102,165 @@ static void redirect_ntdll_functions( HMODULE module )
     REDIRECT( RtlUserThreadStart );
 #undef REDIRECT
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ * X3c: private ARM64EC ntdll for a cross-arch child pseudo-process.
+ *
+ * An AMD64 child under an aarch64 session cannot use the session ntdll
+ * (no EC syscall thunks / KiUserEmulationDispatcher / load_arm64ec_module),
+ * and it cannot share another image's .data anyway. Map the arm64ec build
+ * as a SECOND ntdll image at a fresh VA: the standard map pipeline
+ * (map_image_into_view → update_arm64ec_ranges → mprotect_exec) gives it a
+ * pool copy, EC bitmap ranges, alias registration and x18 patching exactly
+ * like any child-loaded DLL (proven by X1's per-child ucrtbase). The image
+ * is child-unique, so no per-child copy pass is needed — but its dispatcher
+ * slots must be wired the same way load_ntdll_functions does for the
+ * session image (including the Round-7 EC unix-call swap), with every
+ * PE-.data write synced into the pool copy.
+ */
+static int ios_load_child_ec_ntdll( PEB *child_peb )
+{
+    static WCHAR path[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                           's','y','s','t','e','m','3','2','\\','n','t','d','l','l','.','d','l','l',0};
+    extern void ios_jit_sync_write(void *addr, size_t size);
+    extern void *ios_jit_translate_addr(void *addr);
+    extern void *ios_arm64ec_bitmap_base(void);
+    const char *pe_dir = get_pe_dir( IMAGE_FILE_MACHINE_AMD64 );  /* owner-aware → /arm64ec-windows */
+    unsigned int status;
+    SECTION_IMAGE_INFORMATION info;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING str;
+    struct ios_ntdll_funcs funcs = { NULL };
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    void *module;
+    SIZE_T size = 0;
+    char *name = NULL;
+
+    init_unicode_string( &str, path );
+    InitializeObjectAttributes( &attr, &str, 0, 0, NULL );
+
+    if (build_dir) asprintf( &name, "%s%s/ntdll.dll", ntdll_dir, pe_dir );
+    else asprintf( &name, "%s%s/ntdll.dll", dll_dir, pe_dir );
+
+    dprintf(2, "[ec-child-ntdll] loading %s for peb=%p\n", name, (void *)child_peb);
+    status = open_builtin_pe_file( name, &attr, &module, &size, &info, 0, 0,
+                                   IMAGE_FILE_MACHINE_AMD64, FALSE, 0 );
+    if (status == STATUS_IMAGE_NOT_AT_BASE) status = virtual_relocate_module( module );
+    if (status)
+    {
+        dprintf(2, "[ec-child-ntdll] FAILED to load %s: 0x%x\n", name, status);
+        free( name );
+        return -1;
+    }
+    free( name );
+    dprintf(2, "[ec-child-ntdll] mapped at %p size=0x%lx Machine=0x%x\n",
+            module, (unsigned long)size, info.Machine);
+
+    exports = get_module_data_dir( module, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL );
+    if (!exports)
+    {
+        dprintf(2, "[ec-child-ntdll] no export directory!\n");
+        return -1;
+    }
+
+    {
+        void **p__wine_syscall_dispatcher;
+        void **p__wine_unix_call_dispatcher;
+        void **p__wine_unix_call_dispatcher_arm64ec;
+        unixlib_handle_t *p__wine_unixlib_handle;
+
+#define EC_GET(dst, sym) \
+        if (!((dst) = (void *)find_named_export( module, exports, sym ))) \
+            dprintf(2, "[ec-child-ntdll] export %s NOT FOUND\n", sym)
+
+        EC_GET( funcs.LdrInitializeThunk,              "LdrInitializeThunk" );
+        EC_GET( funcs.RtlUserThreadStart,              "RtlUserThreadStart" );
+        EC_GET( funcs.KiUserExceptionDispatcher,       "KiUserExceptionDispatcher" );
+        EC_GET( funcs.KiUserApcDispatcher,             "KiUserApcDispatcher" );
+        EC_GET( funcs.KiUserCallbackDispatcher,        "KiUserCallbackDispatcher" );
+        EC_GET( funcs.KiUserEmulationDispatcher,       "KiUserEmulationDispatcher" );
+        EC_GET( funcs.KiRaiseUserExceptionDispatcher,  "KiRaiseUserExceptionDispatcher" );
+        EC_GET( funcs.DbgUiRemoteBreakin,              "DbgUiRemoteBreakin" );
+        EC_GET( p__wine_syscall_dispatcher,            "__wine_syscall_dispatcher" );
+        EC_GET( p__wine_unix_call_dispatcher,          "__wine_unix_call_dispatcher" );
+        EC_GET( p__wine_unix_call_dispatcher_arm64ec,  "__wine_unix_call_dispatcher_arm64ec" );
+        EC_GET( p__wine_unixlib_handle,                "__wine_unixlib_handle" );
+#undef EC_GET
+        if (!funcs.LdrInitializeThunk || !p__wine_syscall_dispatcher || !p__wine_unixlib_handle)
+            return -1;
+
+        /* Same slot recipe as load_ntdll_functions for the session image. */
+        *p__wine_syscall_dispatcher = __wine_syscall_dispatcher;
+        *p__wine_unixlib_handle = (UINT_PTR)unix_call_funcs;
+        if (p__wine_unix_call_dispatcher_arm64ec)
+        {
+            /* Round-7 EC unix-call swap (see load_ntdll_functions). */
+            *p__wine_unix_call_dispatcher = *p__wine_unix_call_dispatcher_arm64ec;
+            *p__wine_unix_call_dispatcher_arm64ec = __wine_unix_call_dispatcher;
+        }
+        else if (p__wine_unix_call_dispatcher)
+            *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
+
+        /* JIT translate hooks, as for the session image. */
+        {
+            extern void *ios_jit_reverse_translate_addr(const void *addr);
+            void **p_xlate = (void **)find_named_export( module, exports, "p_ios_jit_translate_addr" );
+            void **p_xlate_rev = (void **)find_named_export( module, exports, "p_ios_jit_reverse_translate_addr" );
+            if (p_xlate)     { *p_xlate = (void *)ios_jit_translate_addr;              ios_jit_sync_write( p_xlate, sizeof(void*) ); }
+            else dprintf(2, "[ec-child-ntdll] p_ios_jit_translate_addr NOT FOUND\n");
+            if (p_xlate_rev) { *p_xlate_rev = (void *)ios_jit_reverse_translate_addr;  ios_jit_sync_write( p_xlate_rev, sizeof(void*) ); }
+        }
+
+        /* Sync all written slots into the pool copy (PE code reads there). */
+        ios_jit_sync_write( p__wine_syscall_dispatcher, sizeof(void*) );
+        if (p__wine_unix_call_dispatcher) ios_jit_sync_write( p__wine_unix_call_dispatcher, sizeof(void*) );
+        ios_jit_sync_write( p__wine_unixlib_handle, sizeof(UINT_PTR) );
+        if (p__wine_unix_call_dispatcher_arm64ec)
+            ios_jit_sync_write( p__wine_unix_call_dispatcher_arm64ec, sizeof(void*) );
+
+        dprintf(2, "[ec-child-ntdll] syscall_disp slot %p -> pool %p\n",
+                (void *)p__wine_syscall_dispatcher,
+                ios_jit_translate_addr( p__wine_syscall_dispatcher ));
+    }
+
+    /* Redirect exported entry points to their EC variants (hybrid metadata),
+     * mirroring redirect_ntdll_functions on the p* globals. */
+    {
+        const IMAGE_LOAD_CONFIG_DIRECTORY *loadcfg;
+        const IMAGE_ARM64EC_METADATA *metadata;
+        if ((loadcfg = get_module_data_dir( module, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, NULL )) &&
+            (metadata = (void *)loadcfg->CHPEMetadataPointer))
+        {
+#define EC_REDIRECT(fld) \
+            if (funcs.fld) funcs.fld = get_rva( module, redirect_arm64ec_rva( module, \
+                                       (char *)funcs.fld - (char *)module, metadata ))
+            EC_REDIRECT( LdrInitializeThunk );
+            EC_REDIRECT( RtlUserThreadStart );
+            EC_REDIRECT( KiUserExceptionDispatcher );
+            EC_REDIRECT( KiUserApcDispatcher );
+            EC_REDIRECT( KiUserCallbackDispatcher );
+            EC_REDIRECT( KiUserEmulationDispatcher );
+            EC_REDIRECT( KiRaiseUserExceptionDispatcher );
+            EC_REDIRECT( DbgUiRemoteBreakin );
+#undef EC_REDIRECT
+        }
+        else dprintf(2, "[ec-child-ntdll] no CHPE metadata — EC redirect skipped!\n");
+    }
+
+    /* The EC code bitmap is lazily created by the first hybrid AMD64 map;
+     * only the creating PEB gets EcCodeBitMap set. Every EC child needs it
+     * (arm64x_check_call reads TEB->Peb->EcCodeBitMap). */
+    if (!child_peb->EcCodeBitMap) child_peb->EcCodeBitMap = ios_arm64ec_bitmap_base();
+    dprintf(2, "[ec-child-ntdll] EcCodeBitMap=%p LdrInitializeThunk=%p (pool %p)\n",
+            child_peb->EcCodeBitMap, funcs.LdrInitializeThunk,
+            ios_jit_translate_addr( funcs.LdrInitializeThunk ));
+
+    ios_set_proc_ntdll( child_peb, module, &funcs );
+    return 0;
+}
+#endif
 
 
 /***********************************************************************
@@ -2701,6 +2936,23 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         dprintf(STDERR_FILENO, "[Wine child] cloning PEB from initial %p (global peb=%p)\n",
                 ios_initial_peb, peb);
         memcpy( child_peb, ios_initial_peb, sizeof(PEB) );
+        /* Copy the debug channel table too. dbg_init() writes it at
+         * peb + 2*page_size (0x2000) in the SESSION peb only; PE-side
+         * __wine_dbg_get_channel_flags reads it from the CURRENT peb at the
+         * same offset. Default flags live in the TERMINATOR entry, so a
+         * zeroed region means default=0 = ALL channels (even err) silently
+         * off. Session-copy children dodge this by inheriting the already-
+         * initialized debug_options pointer in ntdll .data, but a freshly
+         * mapped EC ntdll re-derives it from its own peb and goes mute. */
+        {
+            struct dbg_channel { unsigned char flags; char name[15]; };
+            const struct dbg_channel *src = (const struct dbg_channel *)((char *)ios_initial_peb + 0x2000);
+            unsigned int nb = 0;
+            while (nb < 255 && src[nb].name[0]) nb++;
+            memcpy( (char *)child_peb + 0x2000, src, (nb + 1) * sizeof(*src) );
+            dprintf(STDERR_FILENO, "[Wine child] dbg-channel table copied: %u entries, default flags=0x%x\n",
+                    nb, src[nb].flags);
+        }
     }
     child_peb->LdrData = NULL;            /* child builds fresh module list */
     child_peb->ImageBaseAddress = NULL;    /* set by init_startup_info */
@@ -2779,6 +3031,20 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         /* Set up thread stack */
         init_thread_stack( teb, 0, 0, 0 );
 
+        /* X3c: a cross-arch child (AMD64 exe, non-EC session) cannot run on
+         * the session's aarch64 ntdll at all — load the ARM64EC build as a
+         * private second image instead of copying the session image. The
+         * fresh image needs no per-child copy (nobody else uses its .data);
+         * the standard map pipeline gave it pool/EC/x18 treatment. */
+        if (ios_cur_image_info()->Machine == IMAGE_FILE_MACHINE_AMD64 && !is_arm64ec())
+        {
+            if (ios_load_child_ec_ntdll( child_peb ) != 0)
+            {
+                dprintf(STDERR_FILENO, "[Wine child] EC ntdll load FAILED — cross-arch child cannot start\n");
+                return;
+            }
+        }
+        else
         /* S1: per-child ntdll copy. The child cannot share the parent's
          * ntdll .data (module list / loader lock / hash table collide), so
          * copy the whole ntdll image into a fresh pool slot owned by this

@@ -75,6 +75,14 @@ static const char *ios_pe_module_name( uint64_t base );
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
+/* X3 mixed-mode: user-mode entry points follow the current pseudo-process's
+ * ntdll image (cross-arch children run a private ARM64EC ntdll). Falls back
+ * to the session p* globals when the process has no private image. */
+#include "ios_mixed.h"
+#define IOS_PFUNC(name) __extension__ ({ \
+    const struct ios_ntdll_funcs *_iosf = ios_cur_ntdll_funcs(); \
+    _iosf ? _iosf->name : (void *)p##name; })
+
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
@@ -2110,7 +2118,7 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
         user_context->ContextFlags = CONTEXT_FULL;
         NtGetContextThread( GetCurrentThread(), user_context );
         frame->sp = (ULONG_PTR)user_context;
-        frame->pc = (ULONG_PTR)pKiUserEmulationDispatcher;
+        frame->pc = (ULONG_PTR)IOS_PFUNC(KiUserEmulationDispatcher);
     }
     return status;
 }
@@ -2513,7 +2521,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     context_init_empty_xstate( &stack->context, stack->redzone );
 
     SP_sig(sigcontext) = (ULONG_PTR)stack;
-    PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+    PC_sig(sigcontext) = (ULONG_PTR)IOS_PFUNC(KiUserExceptionDispatcher);
     REGn_sig(18, sigcontext) = (ULONG_PTR)NtCurrentTeb();
 #ifdef WINE_IOS
     /* iOS sigreturn zeroes x18 — route through trampoline */
@@ -2569,7 +2577,7 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     stack->alertable = TRUE;
 
     frame->sp = (ULONG64)stack;
-    frame->pc = (ULONG64)pKiUserApcDispatcher;
+    frame->pc = (ULONG64)IOS_PFUNC(KiUserApcDispatcher);
     frame->restore_flags |= CONTEXT_CONTROL;
     syscall_frame_fixup_for_fastpath( frame );
     return status;
@@ -2600,7 +2608,7 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
     memmove( &stack->rec, rec, sizeof(*rec) );
     context_init_empty_xstate( &stack->context, stack->redzone );
 
-    frame->pc = (ULONG64)pKiUserExceptionDispatcher;
+    frame->pc = (ULONG64)IOS_PFUNC(KiUserExceptionDispatcher);
     frame->sp = (ULONG64)stack;
     frame->restore_flags |= CONTEXT_CONTROL;
     syscall_frame_fixup_for_fastpath( frame );
@@ -2776,7 +2784,7 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->sp   = frame->sp;
     stack->pc   = frame->pc;
     memcpy( stack->args_data, args, len );
-    return call_user_mode_callback( sp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
+    return call_user_mode_callback( sp, ret_ptr, ret_len, IOS_PFUNC(KiUserCallbackDispatcher), NtCurrentTeb() );
 }
 
 
@@ -4101,7 +4109,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     context.X1  = (DWORD64)arg;
     context.X18 = (DWORD64)teb;
     context.Sp  = (DWORD64)teb->Tib.StackBase;
-    context.Pc  = (DWORD64)pRtlUserThreadStart;
+    context.Pc  = (DWORD64)IOS_PFUNC(RtlUserThreadStart);
 
     if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
     {
@@ -4144,7 +4152,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     signal_set_full_context( ctx );
 
     frame->sp    = (ULONG64)ctx;
-    frame->pc    = (ULONG64)pLdrInitializeThunk;
+    frame->pc    = (ULONG64)IOS_PFUNC(LdrInitializeThunk);
     frame->x[0]  = (ULONG64)ctx;
     frame->x[18] = (ULONG64)teb;
 

@@ -477,6 +477,10 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
     {
         if (is_process_init_done( process ))
         {
+            if (!(view->image.image_charact & IMAGE_FILE_DLL))
+                ws_log("[srv-map] add_process_view: EXE view but process %04x already init-done "
+                       "(state=%d charact=%x machine=%04x)", process->id,
+                       process->startup_state, view->image.image_charact, process->machine);
             generate_dll_event( thread, DbgLoadDllStateChange, view );
         }
         else if (!(view->image.image_charact & IMAGE_FILE_DLL))
@@ -1710,7 +1714,14 @@ DECL_HANDLER(map_image_view)
         {
             /* on 32-bit, the native 64-bit machine is allowed */
             if (is_machine_64bit( current->process->machine ) || req->machine != native_machine)
+            {
+                ws_log("[srv-map] map_view mismatch: pid=%04x req_machine=%04x proc_machine=%04x "
+                       "startup_state=%d charact=%x image_flags=%x img_machine=%04x",
+                       current->process->id, req->machine, current->process->machine,
+                       current->process->startup_state, view->image.image_charact,
+                       view->image.image_flags, view->image.machine);
                 set_error( STATUS_IMAGE_MACHINE_TYPE_MISMATCH );
+            }
         }
     }
 
