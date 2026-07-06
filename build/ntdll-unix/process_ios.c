@@ -1110,6 +1110,95 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                 handle, (unsigned int)exit_code,
                 (unsigned long long)g_wine_dispatcher_count,
                 (unsigned long long)g_wine_unix_call_count);
+            /* task #24: Thumper's settings page deliberately calls
+             * ExitProcess(-1) from a fresh thread with no preceding
+             * exception — the deciding code is invisible. Dump the calling
+             * thread's guest x64 state: RIP, gregs, and return-address-
+             * looking qwords on the guest stack (attributed offline via the
+             * [jit-pool]/load-order tables). FEX state layout: rip@0x18,
+             * gregs@0x20 (CoreState.h); cpuarea+0x30 = FEX state ptr (same
+             * offset the [fault_rip] probe uses). dprintf not ERR — this
+             * must survive err-channel muting. */
+            {
+                TEB *cur_teb = NtCurrentTeb();
+                CHPE_V2_CPU_AREA_INFO *cpuarea = cur_teb ? cur_teb->ChpeV2CpuAreaInfo : NULL;
+                void *fex_state = cpuarea ? *(void **)((char *)cpuarea + 0x30) : NULL;
+                if (fex_state)
+                {
+                    const uint64_t *fx = (const uint64_t *)fex_state;
+                    uint64_t rip = fx[0x18 / 8];
+                    const uint64_t *gregs = &fx[0x20 / 8];
+                    uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
+                    uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
+                    uint64_t rsp = 0;
+                    int gi, hits = 0;
+                    dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
+                            (unsigned long long)rip, (unsigned long long)slimit,
+                            (unsigned long long)sbase);
+                    dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[0], gregs[1], gregs[2], gregs[3],
+                            gregs[4], gregs[5], gregs[6], gregs[7]);
+                    dprintf(2, "[term-stack] g8-15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[8], gregs[9], gregs[10], gregs[11],
+                            gregs[12], gregs[13], gregs[14], gregs[15]);
+                    /* rsp: prefer a greg inside the cpuarea's recorded range,
+                     * but the live FEX stack can differ (seq-3656 run: rsp
+                     * pair 0x1613ffxxx vs recorded [0x1514a0000..0x1514e0000])
+                     * — fall back to any pointer-looking greg whose memory
+                     * reads back. Use mach reads so a bad candidate can't
+                     * fault the caller. */
+                    for (gi = 0; gi < 16; gi++)
+                        if (gregs[gi] >= slimit && gregs[gi] < sbase) { rsp = gregs[gi]; break; }
+                    {
+                        extern unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out);
+                        static uint64_t stack_buf[512];
+                        int cand;
+                        for (cand = -1; cand < 16 && hits == 0; cand++)
+                        {
+                            uint64_t try_sp = (cand < 0) ? rsp : gregs[cand];
+                            mach_vm_size_t got_sb = 0;
+                            int wi, nw;
+                            if (!try_sp || (try_sp & 7) || try_sp < 0x100000000ULL ||
+                                try_sp >= 0x800000000000ULL) continue;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)try_sp,
+                                    sizeof(stack_buf), (mach_vm_address_t)stack_buf, &got_sb ) != KERN_SUCCESS ||
+                                got_sb < 64) continue;
+                            nw = (int)(got_sb / 8);
+                            for (wi = 0; wi < nw && hits < 24; wi++)
+                            {
+                                uint64_t v = stack_buf[wi];
+                                unsigned long long msz = 0;
+                                unsigned long long mbase = ios_jit_module_base_for_va( v, &msz );
+                                if (!mbase) continue;
+                                /* name via export directory of the map view */
+                                {
+                                    const unsigned char *mb = (const unsigned char *)(uintptr_t)mbase;
+                                    const char *mname = "?";
+                                    unsigned int e_lf, exp_rva, name_rva;
+                                    if (mb[0] == 'M' && mb[1] == 'Z' &&
+                                        (e_lf = *(const unsigned int *)(mb + 0x3c)) < 0x1000 &&
+                                        (exp_rva = *(const unsigned int *)(mb + e_lf + 0x88)) &&
+                                        exp_rva < msz &&
+                                        (name_rva = *(const unsigned int *)(mb + exp_rva + 0x0c)) &&
+                                        name_rva < msz)
+                                        mname = (const char *)(mb + name_rva);
+                                    else if (mb[0] == 'M' && mb[1] == 'Z')
+                                        mname = "(exe)";
+                                    dprintf(2, "[term-stack] sp+%03x: %llx  %.32s+0x%llx\n",
+                                            wi * 8, (unsigned long long)v, mname,
+                                            (unsigned long long)(v - mbase));
+                                }
+                                hits++;
+                            }
+                            if (hits)
+                                dprintf(2, "[term-stack] used %s=0x%llx, scanned %d qwords, %d code-like\n",
+                                        cand < 0 ? "cpuarea-rsp" : "greg", (unsigned long long)try_sp, nw, hits);
+                        }
+                        if (!hits) dprintf(2, "[term-stack] no readable stack candidate produced hits\n");
+                    }
+                }
+                else dprintf(2, "[term-stack] no FEX state on this thread (cpuarea=%p)\n", (void *)cpuarea);
+            }
         }
     }
     /* iOS-Mythic 2026-05-13: stack-cookie failures (STATUS_STACK_BUFFER_OVERRUN

@@ -2646,11 +2646,46 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context );
 /***********************************************************************
  *           setup_raise_exception
  */
+/* task #24 probe: Thumper's settings page dies via its own ExitProcess(-1)
+ * with the actual failure invisible (handled guest exception / C++ throw /
+ * OutputDebugString we never see). Log every exception dispatched to the
+ * guest: code+address+params. DBG_PRINTEXCEPTION carries the game's own
+ * debug string — print it. 0xE06D7363 = MSVC C++ throw. */
+static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *rec, ULONG64 pc )
+{
+    static volatile int exc_logged = 0;
+    int n = __sync_add_and_fetch(&exc_logged, 1);
+    if (n > 80) return;
+    dprintf(2, "[exc-disp] %s tid=%04x code=%08x flags=%x addr=%p pc=%llx nparams=%u p0=%llx p1=%llx\n",
+            via, (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+            (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags,
+            rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
+            rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
+            rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
+    if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
+        dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
+                (int)(rec->ExceptionInformation[0] > 512 ? 512 : rec->ExceptionInformation[0]),
+                (const char *)rec->ExceptionInformation[1]);
+    if (rec->ExceptionCode == 0x4001000a && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_WIDE_C */
+    {
+        const WCHAR *ws = (const WCHAR *)rec->ExceptionInformation[1];
+        char buf[256];
+        int i;
+        for (i = 0; i < 255 && ws[i]; i++) buf[i] = (ws[i] < 128) ? (char)ws[i] : '?';
+        buf[i] = 0;
+        dprintf(2, "[exc-disp]   OutputDebugStringW: \"%s\"\n", buf);
+    }
+}
+
 static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
     NTSTATUS status;
+
+    ios_log_guest_exception( "raise", rec, context->Pc );
 
     status = send_debug_event( rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -2750,7 +2785,11 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
 {
     struct syscall_frame *frame = get_syscall_frame();
     struct exc_stack_layout *stack;
-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+    NTSTATUS status;
+
+    ios_log_guest_exception( "dispatch", rec, context->Pc );
+
+    status = NtSetContextThread( GetCurrentThread(), context );
 
     if (status) return status;
     stack = (struct exc_stack_layout *)(context->Sp & ~15) - 1;
@@ -3218,6 +3257,37 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ERR("  fp=%p lr=%p sp=%p\n",
                 (void*)FP_sig(context), (void*)REGn_sig(30, context),
                 (void*)SP_sig(context));
+            /* task #24: settings threads fault in the TSD-275 thunk with a
+             * NULL slot despite start_thread's write. Dump the live slot +
+             * base at fault time, and dladdr any dyld-cache pc/lr so Apple
+             * frames name themselves. */
+            {
+                extern pthread_key_t ios_teb_tls_key;
+                uintptr_t tsd_base_now;
+                __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base_now));
+                tsd_base_now &= ~7ULL;
+                ERR("  [tsd275] base=%p slot275=%p teb_key_val=%p\n",
+                    (void*)tsd_base_now, *(void **)(tsd_base_now + 275 * 8),
+                    pthread_getspecific(ios_teb_tls_key));
+            }
+            {
+                uintptr_t sym_addrs[2] = { (uintptr_t)PC_sig(context), (uintptr_t)REGn_sig(30, context) };
+                int si;
+                for (si = 0; si < 2; si++)
+                {
+                    Dl_info di_s;
+                    const char *img_s;
+                    if (sym_addrs[si] >= 0x180000000ULL && (sym_addrs[si] >> 32) < 0x300 &&
+                        dladdr((void *)sym_addrs[si], &di_s) && di_s.dli_sname)
+                    {
+                        img_s = di_s.dli_fname ? strrchr(di_s.dli_fname, '/') : NULL;
+                        img_s = img_s ? img_s + 1 : (di_s.dli_fname ? di_s.dli_fname : "?");
+                        ERR("  [sym] %s=%s`%s+0x%llx\n", si ? "lr" : "pc", img_s,
+                            di_s.dli_sname,
+                            (unsigned long long)(sym_addrs[si] - (uintptr_t)di_s.dli_saddr));
+                    }
+                }
+            }
             if ((uintptr_t)PC_sig(context) >= 0x100000000ULL)
             {
                 uint32_t *p = (uint32_t*)(uintptr_t)PC_sig(context);

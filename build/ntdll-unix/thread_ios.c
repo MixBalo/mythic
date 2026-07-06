@@ -1128,6 +1128,9 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
         uintptr_t tsd_base;
         __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
         tsd_base &= ~7ULL;
+        dprintf(2, "[tsd275] tid=%04x CLEAR at pthread_exit (was %p)\n",
+                (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                *(void **)(tsd_base + 275 * 8));
         *(void **)(tsd_base + 275 * 8) = NULL;
     }
     pthread_exit( UIntToPtr(status) );
@@ -1173,6 +1176,12 @@ static void start_thread( TEB *teb )
         __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
         tsd_base &= ~7ULL;
         *(void **)(tsd_base + 275 * 8) = teb;
+        /* task #24: Thumper's settings threads fault with TSD[275]==NULL in
+         * the x18-free thunks despite this write. Trace the slot lifecycle:
+         * this set, the exit-time clears, and the value at SEGV time. */
+        dprintf(2, "[tsd275] tid=%04x SET teb=%p tsd_base=%p readback=%p\n",
+                (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread, (void *)teb,
+                (void *)tsd_base, *(void **)(tsd_base + 275 * 8));
     }
     server_init_thread( thread_data->start, &suspend );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );

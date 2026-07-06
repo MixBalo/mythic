@@ -668,6 +668,23 @@ int ios_jit_patch_stale_pointer(unsigned long long stale_va)
     return patched;
 }
 
+/* task #24 [term-stack]: map a guest PE VA to its module base + size so
+ * the terminate-time stack dump can self-attribute return addresses. */
+unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out)
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (va >= b && va < b + ios_jit_mappings[i].size)
+        {
+            if (size_out) *size_out = ios_jit_mappings[i].size;
+            return b;
+        }
+    }
+    return 0;
+}
+
 /* Reverse-translate a JIT pool address back to the original PE address.
  * Used when PE code passes ADRP-computed addresses to syscalls. */
 void *ios_jit_reverse_translate_addr(const void *addr)

@@ -3837,6 +3837,76 @@ static struct source *find_source( UNICODE_STRING *name )
     return source;
 }
 
+/* iOS-Mythic (task #24): in the virtual-monitor regime the sources list
+ * is EMPTY — find_source() fails, so NtUserEnumDisplayDevices and
+ * NtUserEnumDisplaySettings hard-fail for every caller. Games treat that
+ * as a fatal video-init error: Thumper's video settings page enumerated
+ * modes, got nothing, and exited -1 (the "settings freeze"). It also
+ * booted at the phantom 1024x768 (its internal default after the failed
+ * query) which cropped on the 960x540 desktop. Synthesize one adapter +
+ * one monitor + a small mode list with the REAL desktop resolution as
+ * current/registry mode. */
+static BOOL ios_virtual_monitor_active(void)
+{
+    BOOL ret;
+    if (!lock_display_devices( FALSE )) return FALSE;
+    ret = list_head( &monitors ) == &virtual_monitor.entry;
+    unlock_display_devices();
+    return ret;
+}
+
+static BOOL ios_virtual_enum_display_settings( DWORD index, DEVMODEW *devmode, DWORD flags )
+{
+    int sw, sh;
+    UINT idx = index;
+
+    ios_screen_size( &sw, &sh );
+
+    devmode->dmFields = DM_POSITION | DM_DISPLAYORIENTATION | DM_BITSPERPEL |
+                        DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
+    devmode->dmDisplayOrientation = DMDO_DEFAULT;
+    devmode->dmBitsPerPel = 32;
+    devmode->dmDisplayFrequency = 60;
+    devmode->dmDisplayFlags = 0;
+    devmode->dmPosition.x = 0;
+    devmode->dmPosition.y = 0;
+
+    if (index == ENUM_CURRENT_SETTINGS || index == ENUM_REGISTRY_SETTINGS)
+    {
+        devmode->dmPelsWidth = sw;
+        devmode->dmPelsHeight = sh;
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf(2, "[vmode] synthesized %s = %dx%d\n",
+                        index == ENUM_CURRENT_SETTINGS ? "CURRENT" : "REGISTRY", sw, sh);
+        }
+        return TRUE;
+    }
+    if (index == WINE_ENUM_PHYSICAL_SETTINGS) return FALSE;
+
+    {
+        /* Classic small modes + the desktop resolution (deduped). Nothing
+         * LARGER than the desktop — bigger modes crop on the virtual
+         * desktop surface. */
+        UINT widths[3]  = {640, 800, 0};
+        UINT heights[3] = {480, 600, 0};
+        UINT count = 2;
+        if (!((sw == 640 && sh == 480) || (sw == 800 && sh == 600)))
+        {
+            widths[2] = sw; heights[2] = sh; count = 3;
+        }
+        if (idx >= count)
+        {
+            RtlSetLastWin32Error( ERROR_NO_MORE_FILES );
+            return FALSE;
+        }
+        devmode->dmPelsWidth = widths[idx];
+        devmode->dmPelsHeight = heights[idx];
+    }
+    return TRUE;
+}
+
 static void monitor_get_interface_name( struct monitor *monitor, WCHAR *interface_name )
 {
     char buffer[MAX_PATH] = {0}, *tmp;
@@ -3896,6 +3966,50 @@ NTSTATUS WINAPI NtUserEnumDisplayDevices( UNICODE_STRING *device, DWORD index,
     TRACE( "%s %u %p %#x\n", debugstr_us( device ), index, info, flags );
 
     if (!info || !info->cb) return STATUS_UNSUCCESSFUL;
+
+#ifdef WINE_IOS
+    /* Virtual-monitor regime (task #24): sources list is empty, so the
+     * normal lookup finds nothing. Synthesize a single primary adapter
+     * "\\.\DISPLAY1" and its monitor so games' display enumeration
+     * succeeds. */
+    if (ios_virtual_monitor_active())
+    {
+        static const WCHAR display1W[] = {'\\','\\','.','\\','D','I','S','P','L','A','Y','1',0};
+        BOOL is_adapter = !device || !device->Length;
+
+        if (index) return STATUS_UNSUCCESSFUL;
+        if (!is_adapter &&
+            (device->Length != (sizeof(display1W) - sizeof(WCHAR)) ||
+             wcsnicmp( device->Buffer, display1W, ARRAY_SIZE(display1W) - 1 )))
+            return STATUS_UNSUCCESSFUL;
+
+        if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceName) + sizeof(info->DeviceName))
+            asciiz_to_unicode( info->DeviceName,
+                               is_adapter ? "\\\\.\\DISPLAY1" : "\\\\.\\DISPLAY1\\Monitor0" );
+        if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceString) + sizeof(info->DeviceString))
+            asciiz_to_unicode( info->DeviceString,
+                               is_adapter ? "Mythic Display" : "Generic Non-PnP Monitor" );
+        if (info->cb >= offsetof(DISPLAY_DEVICEW, StateFlags) + sizeof(info->StateFlags))
+        {
+            if (is_adapter)
+                info->StateFlags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP |
+                                   DISPLAY_DEVICE_PRIMARY_DEVICE | DISPLAY_DEVICE_VGA_COMPATIBLE;
+            else
+                info->StateFlags = DISPLAY_DEVICE_ATTACHED | DISPLAY_DEVICE_ACTIVE;
+        }
+        if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceID) + sizeof(info->DeviceID))
+            *info->DeviceID = 0;
+        if (info->cb >= offsetof(DISPLAY_DEVICEW, DeviceKey) + sizeof(info->DeviceKey))
+            *info->DeviceKey = 0;
+        {
+            static int logged;
+            if (logged++ < 4)
+                dprintf(2, "[vmode] synthesized EnumDisplayDevices %s idx=%u\n",
+                        is_adapter ? "adapter" : "monitor", index);
+        }
+        return STATUS_SUCCESS;
+    }
+#endif
 
     if (!lock_display_devices( FALSE )) return STATUS_UNSUCCESSFUL;
 
@@ -4603,7 +4717,24 @@ BOOL WINAPI NtUserEnumDisplaySettings( UNICODE_STRING *device, DWORD index, DEVM
     TRACE( "device %s, index %#x, devmode %p, flags %#x\n",
            debugstr_us(device), index, devmode, flags );
 
-    if (!(source = find_source( device ))) return FALSE;
+    if (!(source = find_source( device )))
+    {
+#ifdef WINE_IOS
+        /* Virtual-monitor regime: no sources exist. Synthesize instead of
+         * hard-failing (task #24 — games treat failure as fatal). Any
+         * device name maps to the single virtual display. */
+        if (ios_virtual_monitor_active())
+        {
+            lstrcpynW( devmode->dmDeviceName, wine_display_driverW, ARRAY_SIZE(devmode->dmDeviceName) );
+            devmode->dmSpecVersion = DM_SPECVERSION;
+            devmode->dmDriverVersion = DM_SPECVERSION;
+            devmode->dmSize = offsetof(DEVMODEW, dmICMMethod);
+            devmode->dmDriverExtra = 0;
+            return ios_virtual_enum_display_settings( index, devmode, flags );
+        }
+#endif
+        return FALSE;
+    }
 
     lstrcpynW( devmode->dmDeviceName, wine_display_driverW, ARRAY_SIZE(devmode->dmDeviceName) );
     devmode->dmSpecVersion = DM_SPECVERSION;

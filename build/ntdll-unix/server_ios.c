@@ -1211,7 +1211,8 @@ int wine_server_receive_fd( obj_handle_t *handle )
     for (;;)
     {
 #ifdef WINE_IOS
-        if ((ret = recvmsg( ios_current_fd_socket(), &msghdr, MSG_CMSG_CLOEXEC )) > 0)
+        int recv_sock = ios_current_fd_socket();
+        if ((ret = recvmsg( recv_sock, &msghdr, MSG_CMSG_CLOEXEC )) > 0)
 #else
         if ((ret = recvmsg( fd_socket, &msghdr, MSG_CMSG_CLOEXEC )) > 0)
 #endif
@@ -1229,12 +1230,39 @@ int wine_server_receive_fd( obj_handle_t *handle )
                 }
 #endif
             }
+#ifdef WINE_IOS
+            /* task #24 wedge probe: a client retry-looped get_handle_fd while
+             * the server sendmsg'd successfully every time — the fd right is
+             * getting lost between the two ends. Log the receive when the fd
+             * is missing (MSG_CTRUNC = kernel stripped the right, e.g. fd
+             * table exhaustion) and the first few successes for baseline. */
+            {
+                static volatile int fd_recv_logged = 0;
+                int fdl = fd_recv_logged;
+                if (fd == -1 || fdl < 8 || (msghdr.msg_flags & MSG_CTRUNC))
+                {
+                    if (fdl < 40)
+                    {
+                        __sync_add_and_fetch(&fd_recv_logged, 1);
+                        dprintf(2, "[fd-recv] sock=%d peb=%p ret=%d fd=%d handle=%x msg_flags=%x%s\n",
+                                recv_sock, ios_jit_current_peb(), ret, fd, *handle,
+                                msghdr.msg_flags,
+                                (msghdr.msg_flags & MSG_CTRUNC) ? "  <-- CTRUNC: fd right stripped" :
+                                (fd == -1) ? "  <-- NO FD in message" : "");
+                    }
+                }
+            }
+#endif
             if (fd != -1) fcntl( fd, F_SETFD, FD_CLOEXEC ); /* in case MSG_CMSG_CLOEXEC is not supported */
             return fd;
         }
         if (!ret) break;
         if (errno == EINTR) continue;
         if (errno == EPIPE) break;
+#ifdef WINE_IOS
+        dprintf(2, "[fd-recv] recvmsg FAILED sock=%d peb=%p ret=%d errno=%d\n",
+                recv_sock, ios_jit_current_peb(), ret, errno);
+#endif
         server_protocol_perror("recvmsg");
     }
     /* the server closed the connection; time to die... */
@@ -1414,12 +1442,30 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
                 access = reply->access;
                 if ((fd = wine_server_receive_fd( &fd_handle )) != -1)
                 {
+                    /* task #24: the settings-freeze loop showed a handle
+                     * whose fd never reaches the requester. If the received
+                     * handle doesn't match the requested one, we'd silently
+                     * mis-cache (assert is compiled out) — log it. */
+                    if (wine_server_ptr_handle(fd_handle) != handle)
+                        dprintf(2, "[fd-recv] HANDLE MISMATCH: asked %p got %p (fd=%d peb=%p)\n",
+                                handle, wine_server_ptr_handle(fd_handle), fd,
+                                ios_jit_current_peb());
                     assert( wine_server_ptr_handle(fd_handle) == handle );
                     *needs_close = (!reply->cacheable ||
                                     !add_fd_to_cache( handle, fd, reply->type,
                                                       reply->access, reply->options ));
                 }
-                else ret = STATUS_TOO_MANY_OPENED_FILES;
+                else
+                {
+                    static volatile int nofd_logged = 0;
+                    if (nofd_logged < 20)
+                    {
+                        __sync_add_and_fetch(&nofd_logged, 1);
+                        dprintf(2, "[fd-recv] get_unix_fd: NO FD for handle %p (peb=%p) -> TOO_MANY_OPENED_FILES\n",
+                                handle, ios_jit_current_peb());
+                    }
+                    ret = STATUS_TOO_MANY_OPENED_FILES;
+                }
             }
             else if (reply->cacheable)
             {
