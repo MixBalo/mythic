@@ -385,6 +385,49 @@ const struct ios_ntdll_funcs *ios_cur_ntdll_funcs(void)
                 return ios_proc_idents[i].ntdll_module ? &ios_proc_idents[i].funcs : NULL;
     return NULL;
 }
+
+/* Thing B probe: a thread wedged in an EC ntdll exit thunk after
+ * `blr x16` with x16==1 — the ldr read the ARM64X dispatch global
+ * __os_arm64x_dispatch_call_no_redirect and got 1 instead of a code
+ * pointer. RVA 0xC4480 in the current arm64ec-windows/ntdll.dll build
+ * (adrp 0x1800c4000 + ldr #0x480 against preferred base 0x180000000).
+ * Dump the 16-qword neighborhood in EVERY private EC ntdll copy so we
+ * can see which copies were initialized (ExitToX64 pointer) and which
+ * still hold the on-disk sentinel. lr_va is the wedged thread's lr
+ * pre-translated to a module VA (or raw if translation failed). */
+void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 )
+{
+    int i, n = ios_proc_ident_count;
+    dprintf(2, "[thunk-slot] idents=%d lr_va=0x%llx x9=0x%llx\n", n, lr_va, x9);
+    for (i = 0; i < n; i++)
+    {
+        const unsigned char *base = ios_proc_idents[i].ntdll_module;
+        unsigned int e_lfanew, size_img = 0;
+        const unsigned long long *q;
+        if (!base)
+        {
+            dprintf(2, "[thunk-slot] ident %d peb=%p ntdll=SESSION\n",
+                    i, ios_proc_idents[i].peb);
+            continue;
+        }
+        if (base[0] == 'M' && base[1] == 'Z' &&
+            (e_lfanew = *(const unsigned int *)(base + 0x3c)) < 0x1000)
+            size_img = *(const unsigned int *)(base + e_lfanew + 0x50);
+        dprintf(2, "[thunk-slot] ident %d peb=%p ntdll=%p size=0x%x machine=0x%x%s\n",
+                i, ios_proc_idents[i].peb, base, size_img,
+                ios_proc_idents[i].info.Machine,
+                (lr_va >= (unsigned long long)(uintptr_t)base &&
+                 lr_va < (unsigned long long)(uintptr_t)base + size_img)
+                    ? "  <-- lr IS IN THIS IMAGE" : "");
+        q = (const unsigned long long *)(base + 0xC4440);
+        dprintf(2, "[thunk-slot]   +C4440: %016llx %016llx %016llx %016llx\n"
+                   "[thunk-slot]   +C4460: %016llx %016llx %016llx %016llx\n"
+                   "[thunk-slot]   +C4480: %016llx %016llx %016llx %016llx  <- +0x480 = dispatch_call_no_redirect\n"
+                   "[thunk-slot]   +C44A0: %016llx %016llx %016llx %016llx\n",
+                q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
+                q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+    }
+}
 #endif
 
 /* iOS host runs ARM64 natively. When loading an x86_64 (AMD64) main image

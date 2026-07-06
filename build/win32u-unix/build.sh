@@ -81,6 +81,10 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
 
     # Per-file iOS overrides (analogous to ntdll-unix's pattern).
     case "$name" in
+        class)
+            compile_one "$BUILD_DIR/class_ios.c" "class"
+            continue
+            ;;
         winstation)
             compile_one "$BUILD_DIR/winstation_ios.c" "winstation"
             continue

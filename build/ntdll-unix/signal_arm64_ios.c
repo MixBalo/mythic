@@ -281,7 +281,12 @@ unsigned long long ios_get_real_usd(void)
  * the module-copy pool ranges holding that value to its pool equivalent.
  * Each stale pointer faults once, then never again. FEX CodeBuffer ranges
  * are NOT scanned (guest-RIP constants live there). */
-#define IOS_STALE_VA_MAX 64
+/* 64 → 256 (2026-07-07): with a desktop + several pseudo-processes the
+ * boot one-shot VAs alone overflowed 64 slots, and the two-cube DXMT
+ * fault storm's VA (child winemetal IAT → child EC ntdll map VA,
+ * 315K faults) arrived late and was silently dropped — never tracked,
+ * never healed. */
+#define IOS_STALE_VA_MAX 256
 /* Only heal a VA once it has exec-faulted this many times. Boot-time
  * one-shot redirects (thread entry points, DLL entry calls) fault a
  * handful of times and must NOT be healed — pool slots legitimately hold
@@ -314,7 +319,21 @@ static void ios_stale_va_enqueue( uint64_t va )
             return;
         }
     }
-    if (n >= IOS_STALE_VA_MAX) return;
+    if (n >= IOS_STALE_VA_MAX)
+    {
+        /* Table full: evict the coldest entry (boot one-shots sit at a
+         * handful of hits) so pathological late-comers — a new child's
+         * DXMT IAT — still get tracked. Only the single mach-handler
+         * thread calls this, so the read-modify-write is safe. */
+        int min_i = 0;
+        uint32_t min_h = ios_stale_va_hits[0];
+        for (i = 1; i < n; i++)
+            if (ios_stale_va_hits[i] < min_h) { min_h = ios_stale_va_hits[i]; min_i = i; }
+        if (min_h >= IOS_STALE_VA_HEAL_THRESHOLD) return;  /* everything hot — drop */
+        ios_stale_va_seen[min_i] = va;
+        ios_stale_va_hits[min_i] = 1;
+        return;
+    }
     ios_stale_va_seen[n] = va;
     ios_stale_va_hits[n] = 1;
     ios_stale_va_seen_count = n + 1;
@@ -323,14 +342,14 @@ static void ios_stale_va_enqueue( uint64_t va )
 static void *ios_stale_va_scanner( void *arg )
 {
     extern int ios_jit_patch_stale_pointer( unsigned long long stale_va );
-    /* Healing is OPT-IN (MYTHIC_HEAL=1). Even gated at 256 faults, blind
-     * pointer rewriting broke boot twice (2026-07-04): rewrote ntdll
-     * arm64x metadata slots whose consumers need PE VAs (identity/range
-     * comparisons, not just branches) → C000001D in libplatform. Until
-     * per-slot semantics are understood (dump forensics), this thread
-     * only reports WHICH VAs cross the threshold — free targeting data
-     * with zero behavior change. */
-    int do_heal = getenv( "MYTHIC_HEAL" ) != NULL;
+    /* Healing default-ON since 2026-07-07: the patcher now rewrites ONLY
+     * IAT/delay-IAT slots (parsed from each pool copy's PE headers), so
+     * the 2026-07-04 breakage class — arm64x metadata slots whose
+     * consumers need PE VAs for identity/range comparisons — can't be
+     * touched. Import slots hold nothing but call targets; rewriting
+     * them is the same transform the NtProtect-time IAT-sync applies.
+     * MYTHIC_NO_HEAL=1 reverts to dry-run reporting. */
+    int do_heal = getenv( "MYTHIC_NO_HEAL" ) == NULL;
     pthread_setname_np( "wine-stale-heal" );
     for (;;)
     {
@@ -342,7 +361,7 @@ static void *ios_stale_va_scanner( void *arg )
             if (do_heal)
                 ios_jit_patch_stale_pointer( va );
             else
-                fprintf( stderr, "[stale-heal] (dry-run) hot stale VA 0x%llx — heal skipped (set MYTHIC_HEAL=1 to enable)\n",
+                fprintf( stderr, "[stale-heal] (dry-run) hot stale VA 0x%llx — heal skipped (MYTHIC_NO_HEAL set)\n",
                          (unsigned long long)va );
         }
     }
@@ -1502,6 +1521,99 @@ static void *ios_mach_exception_thread( void *arg )
                                     "[mach_exc] fn+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                                     w * 4, fp[w], fp[w+1], fp[w+2], fp[w+3],
                                     fp[w+4], fp[w+5], fp[w+6], fp[w+7]);
+                        }
+                    }
+                    /* Thing B one-shot: a zero-page pc crawl means a thread
+                     * took `blr x16` with x16==1 from an EC exit thunk
+                     * ($iexit_thunk$ at EC ntdll+0x73040: adrp x8,+0x51
+                     * pages; ldr x16,[x8,#0x480]; blr x16). Dump (a) the
+                     * ARM64X dispatch slots of every private EC ntdll copy,
+                     * (b) the qword the adrp ACTUALLY dereferenced computed
+                     * from the execution-address lr (catches link-vs-exec
+                     * address skew in pool copies), (c) x9 — exit-thunk
+                     * convention: x9 = the x64 target being called — and
+                     * (d) an fp-chain backtrace with PE attribution so the
+                     * call path INTO the thunk names itself. */
+                    static volatile int thunk_probe_shots = 0;
+                    if (fault_pc < 0x1000 && thunk_probe_shots < 3)
+                    {
+                        extern void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 );
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        uint64_t lr_exec = state.__lr & 0x0000007fffffffffull;
+                        uint64_t lr_mod = 0, lr_va = ios_jit_reverse_translate( lr_exec, &lr_mod );
+                        uint64_t fp_walk;
+                        int fr;
+                        __sync_add_and_fetch(&thunk_probe_shots, 1);
+                        dprintf(STDERR_FILENO,
+                            "[thunk-slot] WEDGE pc=0x%llx lr_exec=0x%llx lr_va=0x%llx (%.32s) "
+                            "x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx "
+                            "x8=0x%llx x9=0x%llx x10=0x%llx x11=0x%llx fp=0x%llx\n",
+                            (unsigned long long)fault_pc,
+                            (unsigned long long)lr_exec, (unsigned long long)lr_va,
+                            lr_mod ? ios_pe_module_name(lr_mod) : "?",
+                            (unsigned long long)state.__x[0], (unsigned long long)state.__x[1],
+                            (unsigned long long)state.__x[2], (unsigned long long)state.__x[3],
+                            (unsigned long long)state.__x[4], (unsigned long long)state.__x[8],
+                            (unsigned long long)state.__x[9], (unsigned long long)state.__x[10],
+                            (unsigned long long)state.__x[11], (unsigned long long)state.__fp);
+                        ios_dump_ec_dispatch_slots( lr_va ? lr_va : lr_exec,
+                                                    state.__x[9] );
+                        /* Exec-relative adrp target: adrp sits at lr-0xc;
+                         * its immediate is +0x51 pages, ldr offset 0x480
+                         * (fixed by the thunk's encoding — see disasm of
+                         * arm64ec-windows/ntdll.dll +0x73048). */
+                        {
+                            uint64_t adrp_tgt = ((lr_exec - 0xc) & ~0xFFFULL) + 0x51000 + 0x480;
+                            uint64_t slot_val = 0;
+                            mach_vm_size_t got_sv = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)adrp_tgt, 8,
+                                    (mach_vm_address_t)&slot_val, &got_sv) == KERN_SUCCESS && got_sv == 8)
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] exec-relative slot @0x%llx = 0x%llx\n",
+                                    (unsigned long long)adrp_tgt, (unsigned long long)slot_val);
+                            else
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] exec-relative slot @0x%llx UNREADABLE\n",
+                                    (unsigned long long)adrp_tgt);
+                        }
+                        fp_walk = state.__fp;
+                        for (fr = 0; fr < 16 && fp_walk; fr++)
+                        {
+                            uint64_t frame_buf[2];
+                            mach_vm_size_t got_fw = 0;
+                            uint64_t ret_pc, bt_mod, bt_va;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)fp_walk, 16,
+                                    (mach_vm_address_t)frame_buf, &got_fw) != KERN_SUCCESS || got_fw != 16)
+                                break;
+                            ret_pc = frame_buf[1] & 0x0000007fffffffffull;
+                            if (ret_pc <= 0x4000) break;
+                            bt_mod = 0;
+                            bt_va = ios_jit_reverse_translate( ret_pc, &bt_mod );
+                            if (bt_va)
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] bt[%d] 0x%llx PE %.32s+0x%llx (base=0x%llx)\n",
+                                    fr, (unsigned long long)ret_pc,
+                                    ios_pe_module_name(bt_mod),
+                                    (unsigned long long)(bt_va - bt_mod),
+                                    (unsigned long long)bt_mod);
+                            else
+                            {
+                                Dl_info di_t;
+                                const char *t_img = "?", *t_sym = "?";
+                                uint64_t t_off = ret_pc;
+                                if (dladdr((void*)(uintptr_t)ret_pc, &di_t))
+                                {
+                                    if (di_t.dli_fname) { t_img = strrchr(di_t.dli_fname, '/'); t_img = t_img ? t_img + 1 : di_t.dli_fname; }
+                                    if (di_t.dli_sname) { t_sym = di_t.dli_sname; t_off = ret_pc - (uint64_t)(uintptr_t)di_t.dli_saddr; }
+                                }
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] bt[%d] 0x%llx %s`%s+0x%llx\n",
+                                    fr, (unsigned long long)ret_pc, t_img, t_sym,
+                                    (unsigned long long)t_off);
+                            }
+                            fp_walk = frame_buf[0];
                         }
                     }
                     /* One-shot dump: on the first UNHANDLED exec fault, dump the
@@ -2822,7 +2934,28 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->sp   = frame->sp;
     stack->pc   = frame->pc;
     memcpy( stack->args_data, args, len );
-    return call_user_mode_callback( sp, ret_ptr, ret_len, IOS_PFUNC(KiUserCallbackDispatcher), NtCurrentTeb() );
+    {
+        /* Thing B (#16) diag: which dispatcher does this thread's callback
+         * resolve to? A SESSION-peb thread resolving to a child's EC
+         * dispatcher is the wedge precursor (explorer executing the child
+         * EC ntdll's exit thunks → blr x16=1). Log the first few callbacks
+         * per boot for context plus EVERY session-thread/child-dispatcher
+         * cross-resolution (should never happen). */
+        extern PEB *peb;
+        void *disp = IOS_PFUNC(KiUserCallbackDispatcher);
+        int cross = (disp != pKiUserCallbackDispatcher) && (NtCurrentTeb()->Peb == peb);
+        static volatile int kcb_logged = 0;
+        if ((kcb_logged < 5 || cross) && kcb_logged < 40)
+        {
+            __sync_add_and_fetch(&kcb_logged, 1);
+            dprintf(2, "[kcb] tid=%04x teb=%p peb=%p id=%u disp=%p session_disp=%p%s\n",
+                    (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                    (void *)NtCurrentTeb(), (void *)NtCurrentTeb()->Peb, id,
+                    disp, pKiUserCallbackDispatcher,
+                    cross ? "  <-- SESSION THREAD, CHILD DISPATCHER (BUG)" : "");
+        }
+        return call_user_mode_callback( sp, ret_ptr, ret_len, disp, NtCurrentTeb() );
+    }
 }
 
 

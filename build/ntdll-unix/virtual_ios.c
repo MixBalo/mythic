@@ -542,19 +542,94 @@ void *ios_jit_translate_addr(void *addr)
     return ios_jit_translate_addr_for_owner(addr, ios_jit_current_peb());
 }
 
-/* Self-heal one stale PE-VA pointer: rewrite every 8-byte-aligned slot in
- * the module-copy pool ranges that holds `stale_va` to its pool-VA
- * equivalent. Called from the heal scanner thread (signal_arm64_ios.c)
- * for addresses that actually took an exec fault — i.e. values being
- * BRANCHED to, not arbitrary lookalikes. Scans only registered module
- * copies (never the FEX CodeBuffer tail, which embeds guest RIPs as
- * data). Writes go to the RW alias; concurrent readers that still load
- * the old value just take one more fault-redirect, which is benign. */
+/* IAT-range collector for the stale-pointer heal. The 2026-07-04 boot
+ * breakage came from rewriting EVERY 8-byte slot holding the stale value
+ * — that clobbered arm64x metadata slots whose consumers need PE VAs for
+ * identity/range comparisons. IAT / delay-IAT slots hold nothing but call
+ * targets, so restricting the rewrite to them is semantically safe (it's
+ * the same transform the NtProtect-time IAT-sync applies). Headers are
+ * read from the pool RW copy; RVAs are relocation-invariant. */
+struct ios_iat_range { unsigned int rva, size; };
+
+static int ios_collect_iat_ranges( const unsigned char *img, size_t img_size,
+                                   struct ios_iat_range *out, int max_out )
+{
+    unsigned int e_lfanew, ndirs;
+    const unsigned char *opt;
+    const unsigned int *dir;
+    int n = 0;
+
+    if (img_size < 0x400 || img[0] != 'M' || img[1] != 'Z') return 0;
+    e_lfanew = *(const unsigned int *)(img + 0x3c);
+    if (e_lfanew < 0x40 || e_lfanew > img_size - 0x200) return 0;
+    if (memcmp(img + e_lfanew, "PE\0\0", 4)) return 0;
+    opt = img + e_lfanew + 24;
+    if (*(const unsigned short *)opt != 0x20b) return 0;      /* PE32+ only */
+    ndirs = *(const unsigned int *)(opt + 108);
+    dir = (const unsigned int *)(opt + 112);                  /* {rva,size} pairs */
+
+    /* Data directory 12: the IAT proper. */
+    if (ndirs > 12 && dir[12*2] && dir[12*2+1] &&
+        (size_t)dir[12*2] + dir[12*2+1] <= img_size && n < max_out)
+    {
+        out[n].rva = dir[12*2]; out[n].size = dir[12*2+1]; n++;
+    }
+    /* Directory 1: walk each import descriptor's FirstThunk array —
+     * covers images whose dir-12 entry is absent or incomplete. */
+    if (ndirs > 1 && dir[1*2] && dir[1*2] < img_size)
+    {
+        const unsigned char *desc = img + dir[1*2];
+        while (desc + 20 <= img + img_size && n < max_out)
+        {
+            unsigned int oft = *(const unsigned int *)(desc + 0);
+            unsigned int ft  = *(const unsigned int *)(desc + 16);
+            if (!ft && !oft) break;
+            if (ft && ft < img_size)
+            {
+                const uint64_t *t = (const uint64_t *)(img + ft);
+                unsigned int cnt = 0;
+                while ((const unsigned char *)(t + cnt + 1) <= img + img_size && t[cnt]) cnt++;
+                if (cnt) { out[n].rva = ft; out[n].size = cnt * 8; n++; }
+            }
+            desc += 20;
+        }
+    }
+    /* Directory 13: delay-load descriptors (ImportAddressTableRVA at +12). */
+    if (ndirs > 13 && dir[13*2] && dir[13*2] < img_size)
+    {
+        const unsigned char *dd = img + dir[13*2];
+        while (dd + 32 <= img + img_size && n < max_out)
+        {
+            unsigned int iat_rva = *(const unsigned int *)(dd + 12);
+            unsigned int int_rva = *(const unsigned int *)(dd + 16);
+            if (!iat_rva && !int_rva) break;
+            if (iat_rva && iat_rva < img_size)
+            {
+                const uint64_t *t = (const uint64_t *)(img + iat_rva);
+                unsigned int cnt = 0;
+                while ((const unsigned char *)(t + cnt + 1) <= img + img_size && t[cnt]) cnt++;
+                if (cnt) { out[n].rva = iat_rva; out[n].size = cnt * 8; n++; }
+            }
+            dd += 32;
+        }
+    }
+    return n;
+}
+
+/* Self-heal one stale PE-VA pointer: rewrite IAT/delay-IAT slots in the
+ * module-copy pool ranges that hold `stale_va` to its pool-VA equivalent.
+ * Called from the heal scanner thread (signal_arm64_ios.c) for addresses
+ * that exec-faulted 256+ times — i.e. values being BRANCHED to through
+ * import slots the NtProtect-time IAT-sync missed (the two-cube DXMT
+ * storm: child winemetal's pool IAT held the child EC ntdll's map VA for
+ * __wine_unix_call → one Mach exception per Metal call). Scans only
+ * registered module copies (never the FEX CodeBuffer tail). Writes go to
+ * the RW alias; concurrent readers that still load the old value just
+ * take one more fault-redirect, which is benign. */
 int ios_jit_patch_stale_pointer(unsigned long long stale_va)
 {
     int i, patched = 0;
     void *target = ios_jit_translate_addr_for_owner((void *)(uintptr_t)stale_va, NULL);
-    if (target == (void *)(uintptr_t)stale_va) return 0;
     if (!ios_jit_rw_base_global || !ios_jit_rx_base_global) return 0;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
@@ -566,22 +641,29 @@ int ios_jit_patch_stale_pointer(unsigned long long stale_va)
             (void *)(uintptr_t)stale_va, ios_jit_mappings[i].owner_peb);
         uintptr_t pool_off = (uintptr_t)ios_jit_mappings[i].jit_base
                            - (uintptr_t)ios_jit_rx_base_global;
-        uint64_t *p = (uint64_t *)((char *)ios_jit_rw_base_global + pool_off);
-        uint64_t *end = (uint64_t *)((char *)p + (ios_jit_mappings[i].size & ~(size_t)7));
+        unsigned char *rw_img = (unsigned char *)ios_jit_rw_base_global + pool_off;
+        struct ios_iat_range ranges[64];
+        int nr, r;
         if (range_target == (void *)(uintptr_t)stale_va) continue;
-        for (; p < end; p++)
+        nr = ios_collect_iat_ranges(rw_img, ios_jit_mappings[i].size, ranges, 64);
+        for (r = 0; r < nr; r++)
         {
-            if (*p == stale_va)
+            uint64_t *p = (uint64_t *)(rw_img + ranges[r].rva);
+            uint64_t *end = (uint64_t *)(rw_img + ranges[r].rva + (ranges[r].size & ~7u));
+            for (; p < end; p++)
             {
-                *p = (uint64_t)(uintptr_t)range_target;
-                patched++;
+                if (*p == stale_va)
+                {
+                    *p = (uint64_t)(uintptr_t)range_target;
+                    patched++;
+                }
             }
         }
     }
     /* fprintf, not ERR — the perf WINEDEBUG default mutes err+virtual and
      * this MUST stay visible (silent healing hid the 2026-07-04 boot
      * breakage). */
-    fprintf(stderr, "[stale-heal] 0x%llx -> %p, rewrote %d slot(s)\n",
+    fprintf(stderr, "[stale-heal] 0x%llx -> %p, rewrote %d IAT slot(s)\n",
             stale_va, target, patched);
     return patched;
 }
