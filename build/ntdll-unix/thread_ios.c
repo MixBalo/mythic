@@ -1062,19 +1062,22 @@ static void contexts_to_server( struct context_data server_contexts[2], CONTEXT 
     unsigned int count = 0;
     void *native_context = get_native_context( context );
     void *wow_context = get_wow_context( context );
+    /* Owner-aware (X3): context machine follows the calling pseudo-process. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    USHORT image_machine = ios_cur_image_info()->Machine;
 
     if (native_context)
     {
         context_to_server( &server_contexts[count++], native_machine, native_context, native_machine );
-        if (wow_context) context_to_server( &server_contexts[count++], main_image_info.Machine,
-                                            wow_context, main_image_info.Machine );
-        else if (native_machine != main_image_info.Machine)
-            context_to_server( &server_contexts[count++], main_image_info.Machine,
+        if (wow_context) context_to_server( &server_contexts[count++], image_machine,
+                                            wow_context, image_machine );
+        else if (native_machine != image_machine)
+            context_to_server( &server_contexts[count++], image_machine,
                                native_context, native_machine );
     }
     else
         context_to_server( &server_contexts[count++], native_machine,
-                           wow_context, main_image_info.Machine );
+                           wow_context, image_machine );
 
     if (count < 2) memset( &server_contexts[1], 0, sizeof(server_contexts[1]) );
 }
@@ -1087,16 +1090,19 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
 {
     void *native_context = get_native_context( context );
     void *wow_context = get_wow_context( context );
+    /* Owner-aware (X3): context machine follows the calling pseudo-process. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    USHORT image_machine = ios_cur_image_info()->Machine;
 
     if (native_context)
     {
         context_from_server( native_context, &server_contexts[0], native_machine );
         if (wow_context)
-            context_from_server( wow_context, &server_contexts[1], main_image_info.Machine );
+            context_from_server( wow_context, &server_contexts[1], image_machine );
         else
             context_from_server( native_context, &server_contexts[1], native_machine );
     }
-    else context_from_server( wow_context, &server_contexts[0], main_image_info.Machine );
+    else context_from_server( wow_context, &server_contexts[0], image_machine );
 }
 
 
@@ -1284,7 +1290,13 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     }
 
 #ifdef __aarch64__
-    if (is_arm64ec())
+    /* Owner-aware (X3): key the CHPE cpu_area on the process the TEB
+     * belongs to, not the session's main exe — x64 children in an aarch64
+     * desktop need it, aarch64 threads must not get it. */
+    extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+    const SECTION_IMAGE_INFORMATION *ios_ii = ios_image_info_for_peb( teb->Peb );
+    if (current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+        ios_ii->Machine == IMAGE_FILE_MACHINE_AMD64)
     {
         CHPE_V2_CPU_AREA_INFO *cpu_area;
         const SIZE_T chpev2_stack_size = 0x40000;
@@ -1304,8 +1316,8 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     }
     else
     {
-        ERR("iOS arm64ec: NOT setting cpu_area (is_arm64ec=%d main_machine=0x%x)\n",
-            is_arm64ec(), main_image_info.Machine);
+        ERR("iOS arm64ec: NOT setting cpu_area (owner machine=0x%x session is_arm64ec=%d)\n",
+            ios_ii->Machine, is_arm64ec());
     }
 #endif
 

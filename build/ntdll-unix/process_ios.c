@@ -899,9 +899,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     if (!machine)
     {
+        /* Owner-aware (X3): the SPAWNER's identity decides hybrid-image
+         * machine promotion — an x64 child spawning from an aarch64
+         * session must not consult the session's main exe. */
+        extern int ios_is_arm64ec_cur(void);
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         machine = pe_info.machine;
-        if (is_arm64ec() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
-            machine = main_image_info.Machine;
+        if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
+            machine = ios_cur_image_info()->Machine;
     }
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;

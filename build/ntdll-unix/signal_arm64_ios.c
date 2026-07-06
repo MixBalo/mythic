@@ -2096,13 +2096,14 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
  */
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
+    extern int ios_is_arm64ec_cur(void);
     struct syscall_frame *frame = get_syscall_frame();
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
 
-    if (is_arm64ec() && !is_ec_code( frame->pc ))
+    if (ios_is_arm64ec_cur() && !is_ec_code( frame->pc ))   /* owner-aware (X3) */
     {
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
 
@@ -2129,7 +2130,10 @@ void *get_native_context( CONTEXT *context )
  */
 void *get_wow_context( CONTEXT *context )
 {
-    return get_cpu_area( main_image_info.Machine );
+    /* Owner-aware (X3): the CPU area machine follows the current thread's
+     * pseudo-process, not the session's main exe. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    return get_cpu_area( ios_cur_image_info()->Machine );
 }
 
 

@@ -486,6 +486,13 @@ void *ios_jit_current_peb(void)
     return ((TEB *)cur_teb)->Peb;
 }
 
+/* Owner-aware main-image machine (X3 mixed-mode); registry in loader_ios.c. */
+USHORT ios_cur_image_info_machine(void)
+{
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    return ios_cur_image_info()->Machine;
+}
+
 /* Translate a PE address to a JIT pool address for a specific process.
  * An entry owned by `owner_peb` wins; otherwise the NULL-owner (parent)
  * entry applies. Child processes only own copies of ntdll — every other
@@ -5137,7 +5144,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     {
         if (image_info->machine == IMAGE_FILE_MACHINE_ARM64 &&
             (machine == IMAGE_FILE_MACHINE_AMD64 ||
-             (!machine && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)))
+             (!machine && ios_cur_image_info_machine() == IMAGE_FILE_MACHINE_AMD64)))
         {
             update_arm64x_mapping( view, nt, dir, sec );
             /* reload changed machine from NT header */
@@ -6402,8 +6409,14 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     sigset_t sigset;
     SIZE_T size;
 
-    if (!reserve_size) reserve_size = main_image_info.MaximumStackSize;
-    if (!commit_size) commit_size = main_image_info.CommittedStackSize;
+    {
+        /* Owner-aware (X3): default stack sizes come from the calling
+         * pseudo-process's main exe, not the session's. */
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+        const SECTION_IMAGE_INFORMATION *ios_ii = ios_cur_image_info();
+        if (!reserve_size) reserve_size = ios_ii->MaximumStackSize;
+        if (!commit_size) commit_size = ios_ii->CommittedStackSize;
+    }
 
     size = max( reserve_size, commit_size );
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */

@@ -2171,8 +2171,9 @@ void server_init_process_done(void)
     {
         extern void *pLdrInitializeThunk;
         extern void *pRtlUserThreadStart;
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
-            NtCurrentTeb(), peb, main_image_info.TransferAddress, suspend);
+            NtCurrentTeb(), peb, ios_cur_image_info()->TransferAddress, suspend);
 
         /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {
@@ -2454,7 +2455,13 @@ void server_init_process_done(void)
         }
     }
 #endif
-    signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
+    {
+        /* Owner-aware (X3): a child's first thread must start at the CHILD
+         * exe's entry — main_image_info is restored to the session's exe
+         * right after child startup-info init (see wine_ios_child_main). */
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+        signal_start_thread( ios_cur_image_info()->TransferAddress, peb, suspend, NtCurrentTeb() );
+    }
 }
 
 

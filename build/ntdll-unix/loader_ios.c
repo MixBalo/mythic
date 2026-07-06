@@ -288,23 +288,90 @@ static const char *get_so_dir( WORD machine )
     }
 }
 
+#ifdef WINE_IOS
+/* X3 mixed-mode pseudo-processes: per-process main-image identity.
+ *
+ * is_arm64ec() and main_image_info are session globals, but each child
+ * pseudo-process has its own main exe: an AMD64 child under an ARM64
+ * desktop session must see is_arm64ec()=TRUE (arm64ec-windows pe_dir,
+ * CHPE cpu_area on its threads, EC fault dispatch) while the parent and
+ * its siblings keep seeing FALSE. Worse, unix_init_startup_info()
+ * OVERWRITES the main_image_info global with each child's exe info,
+ * retroactively flipping the whole session's identity — parent threads
+ * run concurrently, so that flip poisons their fault handling and DLL
+ * resolution. wine_ios_child_main registers the child's info here and
+ * restores the global (S1 registry pattern, same as fd_socket).
+ *
+ * Readers are lock-free (fault handlers call this): slots are fully
+ * written before the count is published. Audit 2026-07-06: every
+ * is_arm64ec/main_image_info consumer lives in forked files; unforked
+ * wine unix files have zero users. */
+#define IOS_MAX_PROC_IDENTS 64
+struct ios_proc_ident
+{
+    void *peb;                        /* NULL = free slot */
+    SECTION_IMAGE_INFORMATION info;   /* this pseudo-process's main exe */
+};
+static struct ios_proc_ident ios_proc_idents[IOS_MAX_PROC_IDENTS];
+static int ios_proc_ident_count;
+
+extern void *ios_jit_current_peb(void);
+
+const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id )
+{
+    int i, n = ios_proc_ident_count;
+    if (peb_id)
+        for (i = 0; i < n; i++)
+            if (ios_proc_idents[i].peb == peb_id) return &ios_proc_idents[i].info;
+    return &main_image_info;
+}
+
+const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void)
+{
+    return ios_image_info_for_peb( ios_jit_current_peb() );
+}
+
+int ios_is_arm64ec_cur(void)
+{
+    return current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+           ios_cur_image_info()->Machine == IMAGE_FILE_MACHINE_AMD64;
+}
+
+void ios_register_proc_ident( void *peb_id, const SECTION_IMAGE_INFORMATION *info )
+{
+    int idx = ios_proc_ident_count;
+    if (idx >= IOS_MAX_PROC_IDENTS)
+    {
+        dprintf(2, "[proc-ident] registry FULL — %p keeps session identity\n", peb_id);
+        return;
+    }
+    ios_proc_idents[idx].info = *info;
+    ios_proc_idents[idx].peb = peb_id;
+    __sync_synchronize();
+    ios_proc_ident_count = idx + 1;
+    dprintf(2, "[proc-ident] peb=%p Machine=0x%x (slot %d)\n",
+            peb_id, info->Machine, idx);
+}
+#endif
+
 /* iOS host runs ARM64 natively. When loading an x86_64 (AMD64) main image
  * on ARM64 (= ARM64EC mode), system DLLs live in `arm64ec-windows/` as
  * hybrid PEs (Machine=AMD64 with native ARM64 code via CHPEMetadata).
  * Plain `aarch64-windows/` is for ARM64-only PEs.
  *
- * Uses Wine's is_arm64ec() helper from unix_private.h. */
+ * Owner-aware: an x64 child in an aarch64 session resolves arm64ec-windows
+ * for its own loads while the session default stays aarch64-windows. */
 static const char *get_pe_dir( WORD machine )
 {
     switch(machine)
     {
     case IMAGE_FILE_MACHINE_I386:  return "/i386-windows";
     case IMAGE_FILE_MACHINE_AMD64:
-        if (is_arm64ec()) return "/arm64ec-windows";
+        if (ios_is_arm64ec_cur()) return "/arm64ec-windows";
         return "/x86_64-windows";
     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-windows";
     case IMAGE_FILE_MACHINE_ARM64:
-        if (is_arm64ec()) return "/arm64ec-windows";
+        if (ios_is_arm64ec_cur()) return "/arm64ec-windows";
         return "/aarch64-windows";
     default: return "";
     }
@@ -1391,7 +1458,7 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
         loadorder = LO_BUILTIN;  /* builtin with no fallback since mapping a fake dll is not useful */
     }
 
-    if (is_arm64ec() && image_info->is_hybrid && search_machine == IMAGE_FILE_MACHINE_AMD64)
+    if (ios_is_arm64ec_cur() && image_info->is_hybrid && search_machine == IMAGE_FILE_MACHINE_AMD64)
         search_machine = current_machine;
 
     switch (loadorder)
@@ -2689,10 +2756,21 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         /* Register with wineserver using the child's socketfd */
         startup_info_size = server_init_process_child( child_fd_socket );
 
-        /* init_startup_info — reads startup info from wineserver, loads the child's PE */
-        unix_init_startup_info();
+        /* init_startup_info — reads startup info from wineserver, loads the
+         * child's PE. It OVERWRITES the main_image_info global with the
+         * child's exe info; snapshot the session's and restore it after
+         * registering the child's copy in the per-process identity registry
+         * (X3: an AMD64 child must not flip is_arm64ec() for the whole
+         * session — parent threads run concurrently). Everything on THIS
+         * thread reads identity owner-aware from here on. */
+        {
+            SECTION_IMAGE_INFORMATION session_image_info = main_image_info;
+            unix_init_startup_info();
+            ios_register_proc_ident( child_peb, &main_image_info );
+            main_image_info = session_image_info;
+        }
         dprintf(STDERR_FILENO, "[Wine child] PE loaded: Machine=0x%x TransferAddress=%p ImageBase=%p\n",
-                main_image_info.Machine, main_image_info.TransferAddress, peb->ImageBaseAddress);
+                ios_cur_image_info()->Machine, ios_cur_image_info()->TransferAddress, peb->ImageBaseAddress);
 
         /* Set DLL load order for child's exe */
         *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();

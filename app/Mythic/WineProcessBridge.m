@@ -306,6 +306,28 @@ static void *wine_process_thread(void *arg) {
             LOG("Symlinked %d DLLs from %{public}s to %{public}s", linked, bundle_subdir, sys32Dir.UTF8String);
             dprintf(STDERR_FILENO, "[WineProc] Symlinked %d DLLs from %s -> sys32\n", linked, bundle_subdir);
 
+            // X3 mixed-mode: also link NON-COLLIDING files from the other
+            // bundle arch so cross-arch child exes resolve by Win32 path
+            // (e.g. proc-test-x64.exe in an aarch64 desktop session).
+            // Canonical DLL names (ntdll.dll, ...) already link to the
+            // session's set above and are skipped here; children load their
+            // system DLLs arch-correctly via WINEDLLPATH + pe_dir probing.
+            {
+                const char *other_subdir = use_arm64ec ? "aarch64-windows" : "arm64ec-windows";
+                NSString *otherSource = [bundlePath stringByAppendingPathComponent:[NSString stringWithUTF8String:other_subdir]];
+                NSArray *others = [fm contentsOfDirectoryAtPath:otherSource error:nil];
+                int crossLinked = 0;
+                for (NSString *f in others) {
+                    NSString *dst = [sys32Dir stringByAppendingPathComponent:f];
+                    if ([fm fileExistsAtPath:dst]) continue;   // session set wins
+                    NSString *src = [otherSource stringByAppendingPathComponent:f];
+                    if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                        crossLinked++;
+                }
+                dprintf(STDERR_FILENO, "[WineProc] Cross-linked %d non-colliding files from %s -> sys32\n",
+                        crossLinked, other_subdir);
+            }
+
             // Layer Microsoft's real VC++ Runtime DLLs ON TOP of the ARM64EC
             // bundle (only for x86_64 guests). These overwrite Wine's stub
             // builtins — Wine then loads the real MS x86_64 implementation
