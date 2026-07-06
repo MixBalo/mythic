@@ -3620,29 +3620,44 @@ static void ios_jit_mark_ec_ranges_for_copy(char *rw_image, char *jit_base, size
         if (load_cfg_rva && load_cfg_size > 0xD0)
         {
             uint64_t chpe_meta_va = *(uint64_t *)(rw_image + load_cfg_rva + 0xC8);
+            uint64_t meta_rva = (uint64_t)-1;
+            /* This runs AFTER the child DIR64 pass, which rebases the
+             * CHPEMetadataPointer slot from the header ImageBase to the
+             * child's pool copy (jit_base). Accept either form — a failed
+             * lookup falls back to flat-marking the whole image as EC,
+             * which makes arm64x_check_call treat the raw x64 syscall
+             * stubs as ARM and BR into them (X1 child ILL storm). */
             if (chpe_meta_va >= pe_image_base && chpe_meta_va < pe_image_base + image_size)
+                meta_rva = chpe_meta_va - pe_image_base;
+            else if (chpe_meta_va >= (uint64_t)(uintptr_t)jit_base &&
+                     chpe_meta_va <  (uint64_t)(uintptr_t)jit_base + image_size)
+                meta_rva = chpe_meta_va - (uint64_t)(uintptr_t)jit_base;
+            if (meta_rva != (uint64_t)-1)
             {
-                char *meta = rw_image + (chpe_meta_va - pe_image_base);
+                char *meta = rw_image + meta_rva;
                 unsigned int code_map_rva = *(unsigned int *)(meta + 0x4);
                 unsigned int code_map_count = *(unsigned int *)(meta + 0x8);
                 if (code_map_rva && code_map_count)
                 {
                     char *code_map = rw_image + code_map_rva;
-                    unsigned int k;
+                    unsigned int k, ec_marked = 0;
                     for (k = 0; k < code_map_count; k++)
                     {
                         unsigned int start = *(unsigned int *)(code_map + k*8);
                         unsigned int len   = *(unsigned int *)(code_map + k*8 + 4);
                         if ((start & 0x3) == 1)  /* ARM64EC range */
+                        {
                             set_arm64ec_range(jit_base + (start & ~0x3u), len);
+                            ec_marked++;
+                        }
                     }
-                    found_codemap = 1;
+                    found_codemap = 1 + (int)ec_marked;
                 }
             }
         }
         if (!found_codemap) set_arm64ec_range(jit_base, image_size);
-        dprintf(2, "[child-ntdll] EC ranges marked for copy at %p (codemap=%d)\n",
-                jit_base, found_codemap);
+        dprintf(2, "[child-ntdll] EC ranges marked for copy at %p (codemap=%d ec_ranges=%d)\n",
+                jit_base, !!found_codemap, found_codemap ? found_codemap - 1 : 0);
     }
 }
 

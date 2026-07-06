@@ -10,6 +10,10 @@
  * spawn failed; 53 = grandchild wait/exit-code wrong; 7/8 = memory checks.
  */
 #include <windows.h>
+
+#ifndef CHILD_EXE_NAME
+#define CHILD_EXE_NAME "child-test.exe"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -70,7 +74,7 @@ int main(int argc, char **argv)
         memset(&si, 0, sizeof(si));
         si.cb = sizeof(si);
         snprintf(cmdline, sizeof(cmdline),
-                 "C:\\windows\\system32\\child-test.exe %d", depth - 1);
+                 "C:\\windows\\system32\\" CHILD_EXE_NAME " %d", depth - 1);
         out("[child-test] depth=%d spawning grandchild: %s\n", depth, cmdline);
 
         if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))

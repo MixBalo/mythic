@@ -676,6 +676,19 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
 
+                Button("Run x64 proc tree") {
+                    // X1 ladder rung 1: x86-64 parent (EC session, the
+                    // known-good Thumper config) spawns an x86-64 CHILD
+                    // pseudo-process — isolates FEX/EC child machinery
+                    // from mixed-session and GUI variables.
+                    setenv("MYTHIC_EXE", "proc-test-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+
                 Button("Run cmd /c proc tree") {
                     // Steam S1 ladder: wine's cmd runs the full test tree —
                     // cmd → proc-test → child(depth 1) → grandchild(depth 0).

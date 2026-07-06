@@ -2592,6 +2592,14 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     dprintf(STDERR_FILENO, "[Wine child] wine_ios_child_main: argc=%d argv[1]=%s fd=%d\n",
             argc, argc > 1 ? argv[1] : "(none)", child_fd_socket);
 
+    /* X1 recon: EC-ness is currently session-wide (main_image_info /
+     * current_machine are shared ntdll-unix globals). Log what this child
+     * inherits — an AMD64 child under an ARM64 session (or vice versa)
+     * resolves the WRONG pe_dir / dll set until these go per-process. */
+    dprintf(STDERR_FILENO, "[x64-child] session: is_arm64ec=%d main_machine=0x%x current_machine=0x%x exe=%s\n",
+            is_arm64ec(), main_image_info.Machine, current_machine,
+            argc > 1 ? argv[1] : "?");
+
     /* Allocate a new TEB for this child "process" thread */
     status = virtual_alloc_teb( &teb );
     if (status) {
@@ -2611,8 +2619,22 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
     /* Copy parent PEB — share heap, locks, etc. Clear LdrData so the child's
      * LdrInitializeThunk builds a fresh module list instead of traversing
      * the parent's (which crashes due to x18=0 zero-page corruption).
-     * With shared JIT pool (same addresses), __ulock_wait works correctly. */
-    memcpy( child_peb, peb, sizeof(PEB) );
+     * With shared JIT pool (same addresses), __ulock_wait works correctly.
+     *
+     * Clone from the INITIAL process's PEB, not the drifting global: child
+     * init leaves `peb` pointed at that child (by design, see end of this
+     * function), so the SECOND child used to inherit the FIRST child's
+     * LIVE PEB — regedit cloned winemine's and crashed dispatching its
+     * first window-proc callback (2026-07-06, blr x22=NULL from
+     * KiUserCallbackDispatcher's chain). Spawns are serialized by the
+     * parent's CreateProcess wait, so the one-time capture is safe. */
+    {
+        static PEB *ios_initial_peb;
+        if (!ios_initial_peb) ios_initial_peb = peb;
+        dprintf(STDERR_FILENO, "[Wine child] cloning PEB from initial %p (global peb=%p)\n",
+                ios_initial_peb, peb);
+        memcpy( child_peb, ios_initial_peb, sizeof(PEB) );
+    }
     child_peb->LdrData = NULL;            /* child builds fresh module list */
     child_peb->ImageBaseAddress = NULL;    /* set by init_startup_info */
     child_peb->ProcessParameters = NULL;   /* set by init_startup_info */

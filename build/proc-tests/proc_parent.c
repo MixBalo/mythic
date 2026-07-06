@@ -8,6 +8,10 @@
  * code → NtTerminateProcess → parent's process-handle wait wakes.
  */
 #include <windows.h>
+
+#ifndef CHILD_EXE_NAME
+#define CHILD_EXE_NAME "child-test.exe"
+#endif
 #include <stdio.h>
 
 static void out(const char *fmt, ...)
@@ -28,7 +32,7 @@ int main(void)
     PROCESS_INFORMATION pi;
     /* depth=1: the child spawns a grandchild (itself at depth 0). Exercises
      * a 3-process tree with two simultaneous pseudo-processes. */
-    char cmdline[] = "C:\\windows\\system32\\child-test.exe 1";
+    char cmdline[] = "C:\\windows\\system32\\" CHILD_EXE_NAME " 1";
     DWORD wait_rc, exit_code = 0xdeadbeef;
     int pass;
 

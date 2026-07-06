@@ -70,6 +70,9 @@
 #include "unix_private.h"
 #include "wine/debug.h"
 
+/* defined at the bottom of this file with the [thread-stacks] dumper */
+static const char *ios_pe_module_name( uint64_t base );
+
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
 #define NTDLL_DWARF_H_NO_UNWINDER
@@ -1423,6 +1426,21 @@ static void *ios_mach_exception_thread( void *arg )
                             "[mach_exc] sym pc=%s`%s+0x%llx lr=%s`%s+0x%llx\n",
                             pc_img, pc_sym, (unsigned long long)pc_off,
                             lr_img, lr_sym, (unsigned long long)lr_off);
+                        /* JIT-pool addresses: name the PE module + offset
+                         * (same machinery as [thread-stacks]) so faults in
+                         * copied PE code self-symbolize. */
+                        {
+                            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                            uint64_t mod, va;
+                            if ((va = ios_jit_reverse_translate( fault_pc, &mod )))
+                                dprintf(STDERR_FILENO, "[mach_exc] pc PE: %s+0x%llx (va=0x%llx)\n",
+                                        ios_pe_module_name(mod), (unsigned long long)(va - mod),
+                                        (unsigned long long)va);
+                            if ((va = ios_jit_reverse_translate( state.__lr, &mod )))
+                                dprintf(STDERR_FILENO, "[mach_exc] lr PE: %s+0x%llx (va=0x%llx)\n",
+                                        ios_pe_module_name(mod), (unsigned long long)(va - mod),
+                                        (unsigned long long)va);
+                        }
                         /* fp-chain backtrace of the faulting thread — names
                          * the exact native call path (which Metal call fed
                          * free() a garbage pointer). Native code has honest

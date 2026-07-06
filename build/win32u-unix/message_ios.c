@@ -468,6 +468,20 @@ static BOOL init_window_call_params( struct win_proc_params *params, HWND hwnd, 
     is_dialog = win->dlgInfo != NULL;
     release_win_ptr( win );
 
+    /* X-desktop probe: shared user32 .data means the 2nd GUI pseudo-process
+     * can resolve a NULL winproc (crash: blr NULL in call_window_proc).
+     * Log func + resolved procW for the first few calls per process. */
+    {
+        static int wp_cnt;
+        if (getenv("MYTHIC_DESKTOP") && wp_cnt++ < 30)
+        {
+            struct win_proc_params tmp = { .func = params->func, .ansi = ansi };
+            get_winproc_params( &tmp, TRUE );
+            fprintf( stderr, "[winproc-dbg] hwnd=%p msg=0x%x func=%p -> procA=%p procW=%p\n",
+                     hwnd, msg, params->func, tmp.procA, tmp.procW );
+        }
+    }
+
     params->hwnd = get_full_window_handle( hwnd );
     params->msg = msg;
     params->wparam = wParam;
