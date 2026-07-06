@@ -1135,8 +1135,13 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Allocate JIT pool (BRK suspends entire process)
             // 128 MB was enough for cube but Thumper exhausts it (more PE
-            // copies + larger FEX block cache). 256 MB gives headroom.
-            let poolSizeMB = 256
+            // copies + larger FEX block cache). Desktop mode holds the
+            // session's aarch64 image set AND every child's x64 set AND the
+            // FEX code buffers in ONE pool: Thumper-under-desktop hit 199MB
+            // of image copies alone (2026-07-06), leaving the FEX tail carve
+            // colliding with the head. 384 MB fits both plus slack; the pool
+            // is dual-map + NO_FOOTPRINT so unwritten pages cost nothing.
+            let poolSizeMB = 384
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

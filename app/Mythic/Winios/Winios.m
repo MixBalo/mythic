@@ -20,6 +20,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <ImageIO/ImageIO.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <Metal/Metal.h>
 #import <os/log.h>
 #include <stdarg.h>
 #include <pthread.h>
@@ -232,6 +234,9 @@ BOOL winios_pProcessEvents(DWORD mask) {
 static NSMutableDictionary<NSNumber *, CALayer *> *g_layers;
 static NSMutableDictionary<NSNumber *, NSValue *> *g_px_rects;  /* hwnd → last px rect */
 static NSMutableDictionary<NSNumber *, NSValue *> *g_surf_sizes; /* hwnd → surface px size */
+static NSMutableDictionary<NSNumber *, CAMetalLayer *> *g_metal_layers; /* hwnd → DXMT layer */
+static NSMutableDictionary<NSNumber *, NSValue *> *g_client_rects;      /* hwnd → client px rect */
+static void winios_place_metal_layer(NSNumber *key);
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
  * Crop the layer contents to the window's actual size or everything
@@ -283,6 +288,7 @@ static void winios_layout_compositor(void) {
         CGRect r = g_px_rects[key].CGRectValue;
         if (l) l.frame = winios_layer_rect((int)r.origin.x, (int)r.origin.y,
                                            (int)r.size.width, (int)r.size.height);
+        winios_place_metal_layer(key);
     }
     fprintf(stderr, "[winios] compositor layout: frame=(%.0f,%.0f %.0fx%.0f) desk=%dx%d px_to_pt=%.3f\n",
             frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
@@ -374,23 +380,97 @@ static void winios_remove_layer(HWND hwnd) {
             [g_layers removeObjectForKey:key];
             [g_px_rects removeObjectForKey:key];
         }
+        CAMetalLayer *ml = g_metal_layers[key];
+        if (ml) {
+            [ml removeFromSuperlayer];
+            [g_metal_layers removeObjectForKey:key];
+            [g_client_rects removeObjectForKey:key];
+            fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
+            fflush(stderr);
+        }
     });
 }
 
+/* ============================================================ *
+ * S2-7: DXMT presentation into desktop windows
+ * ============================================================
+ *
+ * In desktop mode a D3D11 app's swapchain gets a CAMetalLayer that is a
+ * SUBLAYER of its window's compositor CALayer, framed to the window's
+ * CLIENT rect. Sublayers render above the layer's own contents (the GDI
+ * DIB), so the title bar / borders stay visible around the game while
+ * the client area shows DXMT output. Core Animation composites the rest.
+ * Game (non-desktop) mode keeps the fullscreen singleton layer via
+ * IOSDisplayShim — none of this runs. */
+
+/* main thread only — frame the metal sublayer to the client rect in the
+ * parent (window) layer's coordinate space. Parent bounds are the window
+ * rect in points, so client offset = (client_px - window_px) * scale. */
+static void winios_place_metal_layer(NSNumber *key) {
+    CAMetalLayer *ml = g_metal_layers[key];
+    if (!ml) return;
+    NSValue *wv = g_px_rects[key], *cv = g_client_rects[key];
+    if (!wv || !cv) return;
+    CGRect w = wv.CGRectValue, c = cv.CGRectValue;
+    CGFloat s = g_px_to_pt;
+    ml.frame = CGRectMake((c.origin.x - w.origin.x) * s,
+                          (c.origin.y - w.origin.y) * s,
+                          c.size.width * s, c.size.height * s);
+}
+
+/* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
+ * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
+ * the shim CFRetains it for DXMT's lifetime handling. */
+CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
+    __block CAMetalLayer *result = nil;
+    void (^make)(void) = ^{
+        winios_ensure_compositor();
+        if (!g_compositor_view) return;
+        if (!g_metal_layers) g_metal_layers = [NSMutableDictionary new];
+        NSNumber *key = @((uintptr_t)hwnd);
+        CAMetalLayer *ml = g_metal_layers[key];
+        if (!ml) {
+            CALayer *win = winios_layer_for(hwnd, true);
+            ml = [CAMetalLayer layer];
+            ml.anchorPoint = CGPointMake(0, 0);
+            ml.device = MTLCreateSystemDefaultDevice();
+            ml.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            ml.opaque = YES;
+            g_metal_layers[key] = ml;
+            [win addSublayer:ml];
+            winios_place_metal_layer(key);
+            if (CGRectIsEmpty(ml.frame) && !CGRectIsEmpty(win.bounds))
+                ml.frame = win.bounds;   /* client rect not delivered yet */
+            fprintf(stderr, "[winios] metal layer created for hwnd=%p frame=(%.0f,%.0f %.0fx%.0f)\n",
+                    hwnd, ml.frame.origin.x, ml.frame.origin.y,
+                    ml.frame.size.width, ml.frame.size.height);
+            fflush(stderr);
+        }
+        result = ml;
+    };
+    if ([NSThread isMainThread]) make();
+    else dispatch_sync(dispatch_get_main_queue(), make);
+    return result;
+}
+
 /* Called from win32u's pWindowPosChanged wrapper (wine thread).
- * x/y/w/h in desktop pixels. */
-void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible) {
+ * x/y/w/h = visible rect, cx/cy/cw/ch = client rect, desktop pixels. */
+void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
+                         int cx, int cy, int cw, int ch) {
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         CALayer *l = winios_layer_for(hwnd, true);
         NSNumber *key = @((uintptr_t)hwnd);
         g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
+        if (!g_client_rects) g_client_rects = [NSMutableDictionary new];
+        g_client_rects[key] = [NSValue valueWithCGRect:CGRectMake(cx, cy, cw, ch)];
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         l.frame = winios_layer_rect(x, y, w, h);
         l.hidden = !visible;
         winios_apply_contents_rect(key, l);
+        winios_place_metal_layer(key);
         [CATransaction commit];
     });
 }

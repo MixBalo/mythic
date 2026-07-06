@@ -56,7 +56,7 @@ index b87d40516f7..6e61598081d 100644
  
  # Debugging
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index a6e1dcfeca8..6deab0bf5f7 100644
+index a6e1dcfeca8..41383726f5c 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -189,6 +189,29 @@ void *__attribute__((naked)) xlate_ios_jit( void *ptr )
@@ -89,7 +89,28 @@ index a6e1dcfeca8..6deab0bf5f7 100644
  
  void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METADATA *metadata )
  {
-@@ -1217,6 +1240,11 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT_ARM64EC *dispatch
+@@ -415,13 +438,19 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+ 
+     enter_syscall_callback();
+     if (pProcessInit) status = pProcessInit();
++    ERR( "arm64ec_process_init: pProcessInit -> %lx (info=%p)\n", status, info );
+     if (!status)
+     {
+         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
+             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
+         status = create_cross_process_work_list( info );
++        ERR( "arm64ec_process_init: create_cross_process_work_list -> %lx\n", status );
++    }
++    if (!status && pThreadInit)
++    {
++        status = pThreadInit();
++        ERR( "arm64ec_process_init: pThreadInit -> %lx\n", status );
+     }
+-    if (!status && pThreadInit) status = pThreadInit();
+     leave_syscall_callback();
+     __os_arm64x_check_call = arm64x_check_call;
+     __os_arm64x_check_icall = arm64x_check_call;
+@@ -1217,6 +1246,11 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT_ARM64EC *dispatch
      DWORD64 pc = context->Pc;
      int i;
  
@@ -101,7 +122,7 @@ index a6e1dcfeca8..6deab0bf5f7 100644
      dispatch->ScopeIndex = 0;
      dispatch->ControlPc  = pc;
      dispatch->ControlPcIsUnwound = (context->ContextFlags & CONTEXT_UNWOUND_TO_CALL) != 0;
-@@ -1352,6 +1380,21 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -1352,6 +1386,21 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
      ULONG_PTR frame;
      DWORD res;
  
@@ -123,7 +144,7 @@ index a6e1dcfeca8..6deab0bf5f7 100644
      context.AMD64_Context = *orig_context;
      context.ContextFlags &= ~0x40; /* Clear xstate flag. */
  
-@@ -1360,6 +1403,18 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -1360,6 +1409,18 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
      dispatch.HistoryTable  = &table;
      dispatch.NonVolatileRegisters = nonvol_regs.Buffer;
  
@@ -142,7 +163,7 @@ index a6e1dcfeca8..6deab0bf5f7 100644
      for (;;)
      {
          status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context );
-@@ -1368,6 +1423,17 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -1368,6 +1429,17 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
      unwind_done:
          if (!dispatch.EstablisherFrame) break;
  
@@ -160,7 +181,7 @@ index a6e1dcfeca8..6deab0bf5f7 100644
          if (!is_valid_arm64ec_frame( dispatch.EstablisherFrame ))
          {
              ERR( "invalid frame %I64x (%p-%p)\n", dispatch.EstablisherFrame,
-@@ -1439,6 +1505,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -1439,6 +1511,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
  
          if (context.Sp == (ULONG64)NtCurrentTeb()->Tib.StackBase) break;
      }
@@ -168,7 +189,7 @@ index a6e1dcfeca8..6deab0bf5f7 100644
      return STATUS_UNHANDLED_EXCEPTION;
  }
  
-@@ -1848,6 +1915,21 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
+@@ -1848,6 +1921,21 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
  
      rec->ExceptionFlags |= EXCEPTION_UNWINDING | (end_frame ? 0 : EXCEPTION_EXIT_UNWIND);
  

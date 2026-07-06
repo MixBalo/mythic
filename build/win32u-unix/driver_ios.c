@@ -216,7 +216,8 @@ void winios_dump_window_tree(void)
  * bits before returning and uploads on the main thread. */
 extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
-extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible ) __attribute__((weak));
+extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
+                                 int cx, int cy, int cw, int ch ) __attribute__((weak));
 extern void winios_cursor_set( unsigned int id, int w, int h, int hot_x, int hot_y,
                                const void *bgra ) __attribute__((weak));
 extern void winios_cursor_show( int show ) __attribute__((weak));
@@ -405,8 +406,10 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
     if (winios_window_frame && winios_desktop_mode())
     {
         const RECT *v = &new_rects->visible;
+        const RECT *c = &new_rects->client;
         int visible = !IsRectEmpty( v ) && !(swp_flags & SWP_HIDEWINDOW);
-        winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible );
+        winios_window_frame( hwnd, v->left, v->top, v->right - v->left, v->bottom - v->top, visible,
+                             c->left, c->top, c->right - c->left, c->bottom - c->top );
     }
     if (winios_pWindowPosChanged)
         winios_pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, new_rects, surface );

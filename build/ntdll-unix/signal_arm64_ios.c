@@ -2111,6 +2111,26 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
 
+    /* iOS-Mythic diag (Thumper desktop ILL): the crash pc is entered with no
+     * branch/register/immediate trail = a context restore. Log every resume
+     * targeting the FEX tail-carve region (top 128MB of the pool) whose
+     * first word is a data-word/NOP — plus the is_ec_code verdict, since
+     * non-EC resumes get bounced through KiUserEmulationDispatcher. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
+        if (rx && psz && frame->pc >= rx + psz / 2 && frame->pc < rx + psz)
+        {
+            uint32_t w = *(uint32_t *)frame->pc;
+            if ((w >> 16) == 0 || w == 0xd503201fu)
+                dprintf(2, "[set-ctx] SUSPICIOUS resume: pc=%p first_insn=0x%08x is_ec=%d lr=%p sp=%p (Pc from context=%p)\n",
+                        (void *)frame->pc, w, is_ec_code( frame->pc ),
+                        (void *)frame->lr, (void *)frame->sp, (void *)context->Pc);
+        }
+    }
+
     if (ios_is_arm64ec_cur() && !is_ec_code( frame->pc ))   /* owner-aware (X3) */
     {
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
@@ -2157,6 +2177,24 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
 
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
+
+    /* iOS-Mythic diag: companion to [set-ctx] in signal_set_full_context —
+     * catch cross-thread PC rewrites into the FEX tail carve that land on
+     * data words (suspend/invalidate machinery redirecting threads). */
+    if (flags & CONTEXT_CONTROL)
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
+        if (rx && psz && context->Pc >= rx + psz / 2 && context->Pc < rx + psz)
+        {
+            uint32_t w = *(uint32_t *)context->Pc;
+            if ((w >> 16) == 0 || w == 0xd503201fu)
+                dprintf(2, "[set-ctx] SUSPICIOUS NtSetContextThread: self=%d pc=%p first_insn=0x%08x lr=%p\n",
+                        self, (void *)context->Pc, w, (void *)context->Lr);
+        }
+    }
 
     if (!self)
     {
@@ -3009,9 +3047,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * BUT: if the faulting PC is itself in low/unmapped memory (i.e. we
          * jumped to an unrelocated RVA), restoring x18 doesn't help — the
          * next SEGV will fire at the same PC. Fall through to the diagnostic
-         * dump so the real cause is visible. */
+         * dump so the real cause is visible.
+         *
+         * AND (2026-07-06): only retry when the faulting instruction's base
+         * register IS x18 (Rn==18, the same discriminator the Mach handler's
+         * [x18,#imm] emulation uses). A fault with any other base register is
+         * NOT x18-caused — retrying it swallows genuine guest access
+         * violations in an infinite loop (Thumper desktop: `ldrh w7,[x7,...]`
+         * on guest pointer 0x3f800018 = float 1.0 bits spun 6.8M times here
+         * instead of being delivered to the game as an AV). */
         if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
-            && (uintptr_t)pc >= 0x100000000ULL)
+            && (uintptr_t)pc >= 0x100000000ULL
+            && ((*(uint32_t *)pc >> 5) & 31) == 18)
         {
             REGn_sig(18, context) = ios_teb_for_signals;
             return;
@@ -3420,6 +3467,90 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             if (prev_fp <= fp) break;
             fp = prev_fp;
         }
+        /* iOS-Mythic 2026-07-06 (Thumper desktop ILL): both crashes were the
+         * FEX dispatcher's ExitFunctionLinker thunk doing `ldr x2,[x28,#0x630];
+         * blr x2` with a corrupted Pointers.ExitFunctionLink (pointed into a
+         * mid-emission block tail instead of the C++ resolver). Dump the
+         * evidence at crash time: x28 (STATE), x1 (link Record ptr), x2 (the
+         * loaded target), the CpuStateFrame Pointers region around +0x630,
+         * and the Record bytes — distinguishes single-field corruption vs
+         * wild-store span vs corrupt Record. */
+        {
+            uint64_t x1  = (uint64_t)REGn_sig(1,  context);
+            uint64_t x2  = (uint64_t)REGn_sig(2,  context);
+            uint64_t x28 = (uint64_t)REGn_sig(28, context);
+            uint64_t x6  = (uint64_t)REGn_sig(6,  context);
+            uint64_t x10 = (uint64_t)REGn_sig(10, context);
+            uint64_t x11 = (uint64_t)REGn_sig(11, context);
+            ERR("ILL diag: x1=0x%llx x2=0x%llx x28=0x%llx\n",
+                (unsigned long long)x1, (unsigned long long)x2, (unsigned long long)x28);
+            /* x6 = guest RIP and x11 = branch target in FEX's inline exit
+             * dispatch (`ret x11`); x10 = dispatcher's CompileBlock-return
+             * target (`br x10`). Whichever equals pc names the faulting
+             * branch. */
+            ERR("ILL diag: x6=0x%llx x10=0x%llx x11=0x%llx (pc==x11? %d pc==x10? %d)\n",
+                (unsigned long long)x6, (unsigned long long)x10, (unsigned long long)x11,
+                x11 == pc, x10 == pc);
+            /* FEX inline L1 exit-dispatch reads {L1Ptr, L1Mask} at STATE+0xa0
+             * and the entry pair {host, guest} at L1Ptr + (rip & mask)<<?.
+             * Dump the entry for x6 so a torn pair is visible at crash time.
+             * Windows-heap frames live at 0x70xxxxxxxx — include them. */
+            if (x28 >= 0x100000000ULL && x28 < 0x8000000000ULL)
+            {
+                uint64_t l1pair[2] = {0, 0}, entry[2] = {0, 0};
+                vm_size_t osz = sizeof(l1pair);
+                if (vm_read_overwrite(mach_task_self(), x28 + 0xa0, sizeof(l1pair),
+                                      (vm_address_t)l1pair, &osz) == KERN_SUCCESS)
+                {
+                    /* mask is pre-shifted per dispatcher code: and x11, mask, rip<<4 */
+                    uint64_t eaddr = l1pair[0] + ((x6 << 4) & l1pair[1]);
+                    ERR("ILL diag: L1ptr=0x%llx L1mask=0x%llx entry@0x%llx\n",
+                        (unsigned long long)l1pair[0], (unsigned long long)l1pair[1],
+                        (unsigned long long)eaddr);
+                    osz = sizeof(entry);
+                    if (l1pair[0] &&
+                        vm_read_overwrite(mach_task_self(), eaddr, sizeof(entry),
+                                          (vm_address_t)entry, &osz) == KERN_SUCCESS)
+                        ERR("ILL diag: L1 entry: host=0x%llx guest=0x%llx (guest==x6? %d host==pc? %d)\n",
+                            (unsigned long long)entry[0], (unsigned long long)entry[1],
+                            entry[1] == x6, entry[0] == pc);
+                }
+            }
+            if (x28 >= 0x100000000ULL && x28 < 0x800000000ULL)
+            {
+                uint64_t words[32];
+                vm_size_t outsz = sizeof(words);
+                if (vm_read_overwrite(mach_task_self(), x28 + 0x5c0, sizeof(words),
+                                      (vm_address_t)words, &outsz) == KERN_SUCCESS)
+                {
+                    for (int w = 0; w < 32; w += 4)
+                        ERR("ILL diag: STATE+0x%03x: %016llx %016llx %016llx %016llx\n",
+                            0x5c0 + w * 8,
+                            (unsigned long long)words[w],   (unsigned long long)words[w+1],
+                            (unsigned long long)words[w+2], (unsigned long long)words[w+3]);
+                }
+                /* State.rip lives in the first 0x100 of the frame */
+                outsz = sizeof(words);
+                if (vm_read_overwrite(mach_task_self(), x28, 0x40,
+                                      (vm_address_t)words, &outsz) == KERN_SUCCESS)
+                    ERR("ILL diag: STATE+0: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                        (unsigned long long)words[0], (unsigned long long)words[1],
+                        (unsigned long long)words[2], (unsigned long long)words[3],
+                        (unsigned long long)words[4], (unsigned long long)words[5],
+                        (unsigned long long)words[6], (unsigned long long)words[7]);
+            }
+            if (x1 >= 0x100000000ULL && x1 < 0x800000000ULL)
+            {
+                uint64_t rec[6];
+                vm_size_t outsz = sizeof(rec);
+                if (vm_read_overwrite(mach_task_self(), x1, sizeof(rec),
+                                      (vm_address_t)rec, &outsz) == KERN_SUCCESS)
+                    ERR("ILL diag: Record@x1: %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                        (unsigned long long)rec[0], (unsigned long long)rec[1],
+                        (unsigned long long)rec[2], (unsigned long long)rec[3],
+                        (unsigned long long)rec[4], (unsigned long long)rec[5]);
+            }
+        }
         /* iOS-Mythic: also dump JIT pool here (the Mach UNHANDLED path may not
          * fire for ILL since we deliver via setup_exception). One-shot. */
         {
@@ -3751,6 +3882,20 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
     CONTEXT ctx;
 #ifdef WINE_IOS
+    /* StikDebug protocol BRK #0xf00d with no debugger left to catch it —
+     * e.g. the detach BRK re-executing after StikDebug lets go, on a
+     * TEB-less app thread. Check at ENTRY, before any si_code dispatch:
+     * iOS delivers BRK-derived SIGTRAPs with varying si_code, and letting
+     * this fall into the wine exception path wedges the thread inside
+     * nested fault logging (2026-07-06). Skip the insn, x0=0 (failure). */
+    if (!(PC_sig( context ) & 3) && *(ULONG *)PC_sig( context ) == 0xd43e01a0)
+    {
+        dprintf(2, "[brk-f00d] skipped stray StikDebug BRK at pc=%p (si_code=%d)\n",
+                (void *)PC_sig( context ), siginfo->si_code);
+        REGn_sig( 0, context ) = 0;
+        PC_sig( context ) += 4;
+        return;
+    }
     ios_track_signal( signal, context );
 #endif
 
@@ -3770,6 +3915,17 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ULONG imm = (*(ULONG *)PC_sig( context ) >> 5) & 0xffff;
             switch (imm)
             {
+            case 0xf00d:
+                /* StikDebug JIT-protocol BRK (detach/prepare_region) with no
+                 * debugger left to catch it — e.g. the detach BRK re-executes
+                 * after StikDebug lets go, on a TEB-less app thread. This is
+                 * an app-side handshake, never a guest exception: skip the
+                 * insn, report failure in x0, and get out before any wine
+                 * exception machinery (which wedged the detach thread inside
+                 * dbg logging, 2026-07-06). */
+                REGn_sig( 0, context ) = 0;
+                PC_sig( context ) += 4;
+                return;
             case 0xf000:
                 ctx.Pc += 4;  /* skip the brk instruction */
                 rec.ExceptionCode = EXCEPTION_BREAKPOINT;

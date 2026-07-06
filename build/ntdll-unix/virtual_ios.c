@@ -124,7 +124,11 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
  * images; cube ~12-15). Silent overflow at 16 was costing us hours of
  * debugging — late modules' addresses fell through ios_jit_translate_addr
  * unchanged, leaking unix-mapped (non-executable) addresses to BLR. */
-#define IOS_JIT_MAX_MAPPINGS 64
+/* 512: desktop mode holds the session's full aarch64 image set PLUS every
+ * pseudo-process child's x64/EC set in one table. 64 overflowed at exactly
+ * the 65th image (Thumper under desktop, 2026-07-06): concrt140 copied but
+ * never registered → raw-VA DllMain call → unfixable exec-fault loop. */
+#define IOS_JIT_MAX_MAPPINGS 512
 struct ios_jit_mapping {
     void *pe_base;      /* Original PE image base address (unix mapping) */
     void *jit_base;     /* JIT pool RX address */
@@ -153,6 +157,16 @@ static int ios_jit_mapping_count = 0;
  * EC_CODE buffers. Static: internal linkage, no wineserver-style symbol
  * collision risk. */
 static size_t jit_pool_offset = 0;
+
+/* Total bytes reserved from the pool TAIL by NtAllocateVirtualMemoryEx for
+ * FEX EC_CODE buffers. File-scope so head and tail allocators can refuse to
+ * cross each other: on 2026-07-06 (Thumper under desktop) the head cursor
+ * grew past the bottom of a live tail-carved FEX CodeBuffer and late DLL
+ * image copies memcpy'd over compiled blocks — neither side checked the
+ * other. Reads of the opposing cursor are racy-but-monotonic: both only
+ * grow, so a stale read can only make the check conservative late, never
+ * un-refuse. */
+static volatile size_t ios_jit_tail_reserved = 0;
 
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 void *ios_jit_rx_base_global = NULL;
@@ -261,11 +275,14 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 
     if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
     {
-        /* Hard-ERR (was silent return) — overflow leaks unix addresses through
-         * ios_jit_translate_addr unchanged, breaking dispatch. Bump
-         * IOS_JIT_MAX_MAPPINGS instead of suffering this silently. */
-        ERR("iOS JIT: mapping table FULL (%d slots) — DLL pe_base=%p jit_base=%p WILL FAIL TO TRANSLATE\n",
-            IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
+        /* dprintf, NOT ERR: this file's ERRs are on the `virtual` channel,
+         * which the app's perf-default WINEDEBUG mutes (err-virtual) — the
+         * 64-slot overflow of 2026-07-06 was invisible for exactly that
+         * reason. Overflow leaks raw PE addresses through
+         * ios_jit_translate_addr unchanged → unfixable exec-fault loop. */
+        dprintf(2, "[jit-pool] mapping table FULL (%d slots) — image pe_base=%p jit_base=%p "
+                "WILL FAIL TO TRANSLATE (exec-fault loop incoming) — bump IOS_JIT_MAX_MAPPINGS!\n",
+                IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
         return;
     }
     ios_jit_mappings[ios_jit_mapping_count].pe_base = pe_base;
@@ -3102,10 +3119,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 size_t page_size = 0x4000;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
                 size_t offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
-                if (offset + alloc_size > jit_pool_size)
+                if (offset + alloc_size > jit_pool_size - ios_jit_tail_reserved)
                 {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
                         base, (unsigned long)size);
+                    dprintf(2, "[jit-pool] EXHAUSTED (anon RWX): want=0x%lx used=0x%lx/0x%lx tail_resv=0x%lx — pages left R-only!\n",
+                            (unsigned long)alloc_size, (unsigned long)offset, (unsigned long)jit_pool_size,
+                            (unsigned long)ios_jit_tail_reserved);
                     mprotect( base, size, PROT_READ );
                     return 0;
                 }
@@ -3172,6 +3192,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     base, (unsigned long)alloc_size, (unsigned long)offset,
                     (char *)jit_rx_base + offset, (char *)jit_rw_base + offset,
                     cur_prot, max_prot);
+                dprintf(2, "[jit-pool] anon RWX %p size=0x%lx → used=0x%lx/0x%lx\n",
+                        base, (unsigned long)alloc_size,
+                        (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
                 return 0;
             }
 
@@ -3180,9 +3203,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             size_t alloc_size = (image_size + page_size - 1) & ~(page_size - 1);
             size_t offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
 
-            if (offset + alloc_size > jit_pool_size)
+            if (offset + alloc_size > jit_pool_size - ios_jit_tail_reserved)
             {
                 ERR("iOS JIT: pool exhausted\n");
+                dprintf(2, "[jit-pool] EXHAUSTED (image %p+0x%lx): want=0x%lx used=0x%lx/0x%lx tail_resv=0x%lx — image stays R-only, calls into it WILL exec-fault!\n",
+                        image_base, (unsigned long)image_size, (unsigned long)alloc_size,
+                        (unsigned long)offset, (unsigned long)jit_pool_size,
+                        (unsigned long)ios_jit_tail_reserved);
                 mprotect( base, size, PROT_READ );
                 return 0;
             }
@@ -3199,6 +3226,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+            dprintf(2, "[jit-pool] image %p+0x%lx → pool %p used=0x%lx/0x%lx\n",
+                    image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
+                    (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
 
             /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap —
              * but ONLY for ARM64EC hybrid PEs. ARM64EC binaries have
@@ -3710,11 +3740,12 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
 
     alloc_size = (m->size + pg - 1) & ~(pg - 1);
     offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
-    if (offset + alloc_size > ios_jit_pool_size_global)
+    if (offset + alloc_size > ios_jit_pool_size_global - ios_jit_tail_reserved)
     {
-        dprintf(2, "[child-ntdll] JIT pool exhausted (need 0x%lx at 0x%lx of 0x%lx)\n",
+        dprintf(2, "[child-ntdll] JIT pool exhausted (need 0x%lx at 0x%lx of 0x%lx, tail_resv=0x%lx)\n",
                 (unsigned long)alloc_size, (unsigned long)offset,
-                (unsigned long)ios_jit_pool_size_global);
+                (unsigned long)ios_jit_pool_size_global,
+                (unsigned long)ios_jit_tail_reserved);
         return -1;
     }
 
@@ -3928,7 +3959,12 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         if ((view->protect & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
-    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
+    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
+    {
+        dprintf(2, "[vmem-denied] set_vprot failed: base=%p size=%p protect=0x%x\n",
+                base, (void *)size, (unsigned)protect);
+        return STATUS_ACCESS_DENIED;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -4332,7 +4368,12 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
             break;
         case EACCES:
         case EPERM:  /* access error, fall back to read() */
-            if (vprot & VPROT_WRITE) return STATUS_ACCESS_DENIED;
+            if (vprot & VPROT_WRITE)
+            {
+                dprintf(2, "[vmem-denied] shared-writable mmap EACCES/EPERM: addr=%p size=%p\n",
+                        map_addr, (void *)map_size);
+                return STATUS_ACCESS_DENIED;
+            }
             break;
         default:
             ERR( "mmap error %s, range %p-%p, unix_prot %#x\n",
@@ -5533,7 +5574,12 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 
     res = get_mapping_info( handle, access, &sec_flags, &full_size, &shared_file,
                             &image_info, &nt_name, &exp_name );
-    if (res) return res;
+    if (res)
+    {
+        dprintf(2, "[map-sec] get_mapping_info handle=%p access=0x%x -> 0x%x\n",
+                handle, (unsigned)access, res);
+        return res;
+    }
 
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
@@ -5582,7 +5628,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
 
-    if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+    if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL )))
+    {
+        dprintf(2, "[map-sec] server_get_unix_fd handle=%p -> 0x%x\n", handle, res);
+        return res;
+    }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
@@ -5624,6 +5674,8 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (needs_close) close( unix_handle );
+    if (res) dprintf(2, "[map-sec] virtual_map_section handle=%p prot=0x%x size=%p -> 0x%x\n",
+                     handle, (unsigned)protect, (void *)size, res);
     return res;
 }
 
@@ -7451,16 +7503,21 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         ios_jit_rx_base_global && ios_jit_rw_base_global &&
         ios_jit_pool_size_global)
     {
-        static volatile size_t ios_jit_alloc_ex_offset = 0;
         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
         /* Reserve from the END of the JIT pool to avoid colliding with
-         * mprotect_exec's PE-image copies which take from the start. */
-        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_alloc_ex_offset, alloc_size);
+         * mprotect_exec's PE-image copies which take from the start.
+         * ios_jit_tail_reserved is the shared file-scope counter so the
+         * head allocators can refuse to grow into tail-carved buffers. */
+        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_tail_reserved, alloc_size);
         size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;
-        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2)
+        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2 ||
+            pool_tail_off < jit_pool_offset)
         {
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
+            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — falling to normal alloc (likely fatal for FEX)\n",
+                    (unsigned long)alloc_size, (unsigned long)(reserve_offset + alloc_size),
+                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
             /* Fall through to normal allocation */
         }
         else
@@ -7500,6 +7557,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * arm64x_check_call, so EC marking is unneeded. */
             ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p NOP-prefilled\n",
                 alloc_size, jit_rx, jit_rw);
+            dprintf(2, "[jit-pool] tail EC_CODE rx=%p size=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx\n",
+                    jit_rx, (unsigned long)alloc_size,
+                    (unsigned long)(reserve_offset + alloc_size),
+                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
             return STATUS_SUCCESS;
         }
     }
@@ -8627,7 +8688,11 @@ NTSTATUS WINAPI NtLockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size, 
     *addr = ROUND_ADDR( *addr, page_mask );
 
     if (mlock( ROUND_ADDR( *addr, host_page_mask ), ROUND_SIZE( *addr, *size, host_page_mask ) ))
+    {
+        dprintf(2, "[vmem-denied] mlock failed: addr=%p size=%p errno=%d\n",
+                *addr, (void *)*size, errno);
         status = STATUS_ACCESS_DENIED;
+    }
     return status;
 }
 
