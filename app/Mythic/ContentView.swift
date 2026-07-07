@@ -815,6 +815,33 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)
 
+                Button("🎮 Run Steam (S3 smoke test)") {
+                    // Steam S3 first boot: virtual desktop (Steam needs a
+                    // window manager) + services.exe (SCM → rpcss for Steam's
+                    // COM, the chain proven in the rpcss milestone) + steam.exe
+                    // itself, all launched by C:\steam-launch.bat (pushed to
+                    // the prefix). Batch avoids quote-escaping hell; combase's
+                    // 5s OpenSCManager retry covers the services-vs-steam race.
+                    // Steam install = CrossOver copy at C:\Program Files (x86)\
+                    // Steam (all boot binaries verified x86-64; steamwebhelper
+                    // /libcef = 209MB → watch pool: first webhelper may fit,
+                    // multiples need .text sharing). Flags: -no-cef-sandbox
+                    // (sandbox can't work in Wine), -cef-disable-gpu (software
+                    // render), -console (Steam's own log → our stderr). Steam
+                    // WILL try to self-update through our GnuTLS stack — that
+                    // attempt is itself an informative S0 re-test.
+                    let deskW = 1024, deskH = 768
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
                 Button("Run cmd /c proc tree") {
                     // Steam S1 ladder: wine's cmd runs the full test tree —
                     // cmd → proc-test → child(depth 1) → grandchild(depth 0).
