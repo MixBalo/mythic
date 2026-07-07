@@ -492,6 +492,11 @@ static NTSTATUS get_shared_class( CLASS *class, struct object_lock *lock, const 
     if (!lock->id || !shared_object_release_seqlock( object, lock->seq ))
     {
         shared_object_acquire_seqlock( object, &lock->seq );
+        /* iOS (task #21): a freed class shared object (id==0, from a dead
+         * pseudo-process's class) leaves lock->id==0 forever → caller's
+         * while(==PENDING) spins under user_lock → whole-desktop freeze
+         * (repro: close regedit, then a Run-dialog class lookup). Fail out. */
+        if (!object->id) return STATUS_INVALID_HANDLE;
         *class_shm = &object->shm.class;
         lock->id = object->id;
         return STATUS_PENDING;
@@ -517,6 +522,8 @@ static NTSTATUS get_shared_window_class( HWND hwnd, struct object_lock *lock, co
     if (!lock->id || !shared_object_release_seqlock( object, lock->seq ))
     {
         shared_object_acquire_seqlock( object, &lock->seq );
+        /* iOS (task #21): freed-object guard — see get_shared_class. */
+        if (!object->id) return STATUS_INVALID_HANDLE;
         *class_shm = &object->shm.class;
         lock->id = object->id;
         return STATUS_PENDING;
@@ -559,18 +566,40 @@ static CLASS *find_class( HINSTANCE module, UNICODE_STRING *name )
     ULONG_PTR instance = (UINT_PTR)module;
     CLASS *class;
     int is_win16;
+    /* Task #21: class_list is a SINGLE win32u global shared by every
+     * pseudo-process in our single-Mach-task model (same shared-state class
+     * as Thing B). A pseudo-process exiting without cleaning its class
+     * entries can leave the shared list cyclic — and an unbounded walk of a
+     * corrupt shared list hangs FOREVER holding user_lock, freezing the
+     * whole desktop (observed: close regedit → next Run-dialog class lookup
+     * spins in NtUserGetClassInfoEx). Bound the walk: a real class_list is
+     * at most a few hundred entries even with many processes; >8192 = the
+     * list is corrupt, so bail (as "not found") instead of hanging. This
+     * makes the corruption survivable + loud rather than fatal. */
+    unsigned walked = 0;
+    extern int dprintf(int fd, const char *fmt, ...);
 
     user_lock();
     LIST_FOR_EACH_ENTRY( class, &class_list, CLASS, entry )
     {
-        UINT_PTR class_instance = get_class_instance( class );
-        if (!class_name_matches( class, name )) continue;
-        is_win16 = !(class_instance >> 16);
-        if (!instance || !class->local || class_instance == instance ||
-            (!is_win16 && ((class_instance & ~0xffff) == (instance & ~0xffff))))
+        if (++walked > 8192)
         {
-            TRACE( "%s %lx -> %p\n", debugstr_us(name), instance, class );
-            return class;
+            static int logged;
+            if (!logged++)
+                dprintf( 2, "[class-cycle] find_class walked >8192 entries — class_list "
+                         "corrupt (cyclic?), bailing to avoid user_lock hang\n" );
+            break;
+        }
+        {
+            UINT_PTR class_instance = get_class_instance( class );
+            if (!class_name_matches( class, name )) continue;
+            is_win16 = !(class_instance >> 16);
+            if (!instance || !class->local || class_instance == instance ||
+                (!is_win16 && ((class_instance & ~0xffff) == (instance & ~0xffff))))
+            {
+                TRACE( "%s %lx -> %p\n", debugstr_us(name), instance, class );
+                return class;
+            }
         }
     }
     user_unlock();

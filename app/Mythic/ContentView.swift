@@ -1253,13 +1253,21 @@ struct ContentView: View {
                     lastHeartbeat = now
                     logStore.log("detach-wait: presents=\(mythic_get_present_count()) running=\(wine_process_is_running()) elapsed=\(Int(now - pollStart))s")
                 }
-                if presentingSince == nil && mythic_get_present_count() >= 1 {
-                    presentingSince = now
-                    logStore.log("Game is presenting (#1, splash) — early detach in \(Int(settleAfterFirstPresent))s")
-                }
-                if let t = presentingSince, now - t > settleAfterFirstPresent {
-                    logStore.log("Early detach: game presenting and settled", level: .success)
-                    break
+                // Task #25: the present heuristic is meaningless in desktop
+                // mode — ANY child presenting (cube, a game window) trips it
+                // mid-session, and later program launches still need the
+                // attached-debugger facilities. Desktop sessions stay
+                // attached until the desktop exits (or the safety cap).
+                let isDesktopSession = getenv("MYTHIC_DESKTOP").map { $0.pointee == 49 } ?? false
+                if !isDesktopSession {
+                    if presentingSince == nil && mythic_get_present_count() >= 1 {
+                        presentingSince = now
+                        logStore.log("Game is presenting (#1, splash) — early detach in \(Int(settleAfterFirstPresent))s")
+                    }
+                    if let t = presentingSince, now - t > settleAfterFirstPresent {
+                        logStore.log("Early detach: game presenting and settled", level: .success)
+                        break
+                    }
                 }
                 if now - pollStart > maxWait {
                     logStore.log("Wine still running after \(Int(maxWait))s, proceeding with detach", level: .error)

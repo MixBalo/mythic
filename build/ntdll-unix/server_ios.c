@@ -1896,10 +1896,17 @@ void process_exit_wrapper( int status )
     int i = ios_proc_socket_index();
     if (i >= 0)
     {
+        extern void ios_jit_reclaim_process( void *peb );
+        void *dead_peb = ios_proc_sockets[i].peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
+        /* Task #25: release this pseudo-process's JIT pool allocations
+         * (module copies, trampolines, FEX CodeBuffers). Children only —
+         * the session (else-branch) lives as long as the app. Reuse is
+         * grace-delayed inside the allocator for laggard exit threads. */
+        ios_jit_reclaim_process( dead_peb );
     }
     else close( fd_socket );
 #else
@@ -2346,8 +2353,22 @@ void server_init_process_done(void)
                 static uint32_t prof_lr_counts[PROF_SLOTS];
                 uint64_t total = 0;
                 mach_port_t prof_thread = prof_thread_initial;
+                /* Task #25 [susp]: whole-task suspension detector. Three
+                 * desktop "freezes" showed a ~53.7s stall where even the 2s
+                 * watchdog missed ticks — consistent with the DEBUGGER
+                 * suspending the task (StikDebug death/timeout), not a wedge.
+                 * A 2ms sleep that takes >3s = the task was stopped; log the
+                 * exact wall gap so freeze reports self-diagnose. */
+                uint64_t susp_last_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
                 for (;;) {
                     usleep(2000);
+                    {
+                        uint64_t now_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                        if (now_ns - susp_last_ns > 3000000000ull)
+                            wine_log_write("[susp] TASK WAS SUSPENDED/STALLED for %.1fs (2ms sleep gap)",
+                                           (now_ns - susp_last_ns) / 1e9);
+                        susp_last_ns = now_ns;
+                    }
                     if ((prof_iter++ & 0x3FF) == 0) {
                         thread_act_array_t tlist;
                         mach_msg_type_number_t tcount;
