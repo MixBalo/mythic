@@ -583,6 +583,33 @@ static void *ios_mach_exception_thread( void *arg )
                          * address only ever faults once. */
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                             ios_stale_va_enqueue((uint64_t)fault_pc);
+                        /* [xlate-exec] pseudo-process forensics: every
+                         * image-VA exec fault is an ownership decision —
+                         * log which copy the thread was routed to. A child
+                         * thread landing in a session-owned copy (owner=0
+                         * while its teb->peb is a child peb) is the
+                         * cross-copy migration that kills thread exit. */
+                        {
+                            extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                            /* Child threads only — the session's own boot
+                             * takes thousands of these and drowned the
+                             * budget (2026-07-07 run: all 128 entries spent
+                             * before services.exe even spawned). */
+                            if (fault_owner_peb && peb && fault_owner_peb != (void *)peb)
+                            {
+                                static volatile int xe_count = 0;
+                                int xe = __sync_add_and_fetch(&xe_count, 1);
+                                if (xe <= 256 || (xe % 1024) == 0)
+                                {
+                                    void *copy_pe = NULL;
+                                    void *copy_owner = ios_jit_pool_copy_owner(jit_pc, &copy_pe);
+                                    dprintf(STDERR_FILENO,
+                                        "[xlate-exec] #%d teb=%p owner=%p pc=%p -> %p (copy pe=%p copy_owner=%p)\n",
+                                        xe, (void *)thread_teb, fault_owner_peb,
+                                        (void *)(uintptr_t)fault_pc, jit_pc, copy_pe, copy_owner);
+                                }
+                            }
+                        }
                         if (jit_pc == (void *)(uintptr_t)fault_pc)
                         {
                             /* iOS-Mythic: if PC is in JIT pool RW alias range,
@@ -1421,6 +1448,18 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
                             (void*)lr_p, *lr_p);
                     }
+                    /* Which pool COPY is pc in, and who owns it? Names the
+                     * session-vs-child copy — the PE attribution below can't
+                     * (all copies share PE VAs). owner=-1 = not pool. */
+                    {
+                        extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                        void *copy_pe = NULL;
+                        void *copy_owner = ios_jit_pool_copy_owner((void *)(uintptr_t)fault_pc, &copy_pe);
+                        void *cur_teb_peb = thread_teb ? ((TEB *)thread_teb)->Peb : NULL;
+                        dprintf(STDERR_FILENO,
+                            "[mach_exc] pc pool-copy pe=%p owner=%p; thread teb=%p peb=%p\n",
+                            copy_pe, copy_owner, (void *)thread_teb, cur_teb_peb);
+                    }
                     if ((uintptr_t)fault_pc >= 0x100000000ULL)
                     {
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
@@ -1504,6 +1543,43 @@ static void *ios_mach_exception_thread( void *arg )
                                     if (ret_pc <= 0x4000) break;
                                 }
                                 fp_walk = frame_buf[0];
+                            }
+                        }
+                        /* Stack scan ([term-stack] pattern): the exit-path
+                         * crashers have no walkable fp chain, so reconstruct
+                         * call history from return addresses left on the
+                         * stack. Copy attribution per hit — the frame where
+                         * copy_owner flips from a child peb to 0 (session)
+                         * is where the thread crossed ntdll copies. */
+                        if (cnt <= 3)
+                        {
+                            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                            extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                            uint64_t sp_scan = __darwin_arm_thread_state64_get_sp(state);
+                            int w2, hits = 0;
+                            for (w2 = 0; w2 < 512 && hits < 24; w2++)
+                            {
+                                uint64_t slot_val;
+                                mach_vm_size_t got_sv = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(sp_scan + 8ull * w2), 8,
+                                        (mach_vm_address_t)&slot_val, &got_sv)
+                                        != KERN_SUCCESS || got_sv != 8)
+                                    break;
+                                {
+                                    uint64_t mod3, va3;
+                                    if ((va3 = ios_jit_reverse_translate( slot_val, &mod3 )) && va3 != slot_val)
+                                    {
+                                        void *cp3 = NULL;
+                                        void *co3 = ios_jit_pool_copy_owner((void *)(uintptr_t)slot_val, &cp3);
+                                        dprintf(STDERR_FILENO,
+                                            "[exit-stk] sp+0x%x: 0x%llx = %s+0x%llx copy_owner=%p\n",
+                                            w2 * 8, (unsigned long long)slot_val,
+                                            ios_pe_module_name(mod3),
+                                            (unsigned long long)(va3 - mod3), co3);
+                                        hits++;
+                                    }
+                                }
                             }
                         }
                         /* One-shot: dump the faulting native function's

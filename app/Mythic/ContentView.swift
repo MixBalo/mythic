@@ -770,6 +770,51 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
 
+                Button("Run rpcss (R1 boot test)") {
+                    // S3-pre R1: boot rpcss.exe standalone as a pseudo-process
+                    // to prove it comes up, binds its epmapper named-pipe
+                    // endpoint (\\.\pipe\lrpc\epmapper via wineserver), and
+                    // idles alive — de-risks the COM server before wiring the
+                    // launch trigger (R2) and re-adding actxprxy (R3).
+                    setenv("MYTHIC_EXE", "rpcss.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button("Run Desktop + services (R2v2)") {
+                    // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
+                    // its wmain unconditionally StartServiceCtrlDispatcherW's
+                    // (rpcss_main.c:282), which RPCs back to the SCM; without
+                    // services.exe it raised + wedged in
+                    // service_run_main_thread, and explorer's
+                    // CoRegisterClassObject wedged behind it (seq-3680 run).
+                    // Proper bootstrap: explorer's cmdline child = services.exe
+                    // (SCM host, windows-subsystem = no console). It creates
+                    // \pipe\svcctl early, runs auto-start services (MountMgr/
+                    // Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay
+                    // are bundled; failures tolerated), and combase's
+                    // start_rpcss then demand-starts RpcSs through the SCM
+                    // with a 30s start-pending wait → rpcss runs as services'
+                    // child (3-deep tree, proven depth) with a proper
+                    // dispatcher connection → epmapper up → real COM.
+                    // Known risk: if shellwindows_init beats services.exe's
+                    // RPC_Init, OpenSCManager fails → watch whether that
+                    // fails fast or hits the RaiseException→CS wedge again.
+                    let deskW = 960, deskH = 540
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
+
                 Button("Run cmd /c proc tree") {
                     // Steam S1 ladder: wine's cmd runs the full test tree —
                     // cmd → proc-test → child(depth 1) → grandchild(depth 0).

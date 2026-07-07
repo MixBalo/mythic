@@ -685,6 +685,26 @@ unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned lo
     return 0;
 }
 
+/* [xlate-exec] forensics: which mapping's pool range contains `addr`, and
+ * who owns it. Names the COPY a thread is executing (session vs child),
+ * which reverse_translate alone can't — copies share PE VAs. */
+void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out)
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t a = (uintptr_t)addr;
+        uintptr_t jit_base = (uintptr_t)ios_jit_mappings[i].jit_base;
+        if (a >= jit_base && a < jit_base + ios_jit_mappings[i].size)
+        {
+            if (pe_base_out) *pe_base_out = ios_jit_mappings[i].pe_base;
+            return ios_jit_mappings[i].owner_peb;
+        }
+    }
+    if (pe_base_out) *pe_base_out = NULL;
+    return (void *)(uintptr_t)-1;  /* not in any pool mapping */
+}
+
 /* Reverse-translate a JIT pool address back to the original PE address.
  * Used when PE code passes ADRP-computed addresses to syscalls. */
 void *ios_jit_reverse_translate_addr(const void *addr)
@@ -8061,6 +8081,18 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                      * which has unix_base-relative pointers. These must become
                      * jit_base-relative to match the DIR64-fixuped JIT copy. */
                     {
+                        /* OWNER-AWARE (2026-07-07): ntdll's image VA range
+                         * matches the session copy AND every same-arch child
+                         * copy — the old first-match scan always picked the
+                         * session's entry, so child modules' ntdll imports
+                         * pointed at the SESSION pool copy. services.exe's
+                         * rpcrt4 IAT got session-copy Tp* → threadpool
+                         * workers born executing the wrong ntdll → exit
+                         * crash in LdrShutdownThread holding the session
+                         * loader lock → rpcss never answered explorer's
+                         * CoRegisterClassObject. The sync runs on the owning
+                         * process's thread, so current-peb is the owner. */
+                        void *sync_owner = ios_jit_current_peb();
                         uint64_t *p = (uint64_t *)jit_rw_dest;
                         uint64_t *end_p = (uint64_t *)(jit_rw_dest + (size & ~7));
                         int fixup_count = 0;
@@ -8069,24 +8101,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                             uint64_t val = *p;
                             if (val)
                             {
-                                int j;
-                                for (j = 0; j < ios_jit_mapping_count; j++)
+                                void *nv = ios_jit_translate_addr_for_owner(
+                                        (void *)(uintptr_t)val, sync_owner);
+                                if (nv != (void *)(uintptr_t)val)
                                 {
-                                    uintptr_t mbase = (uintptr_t)ios_jit_mappings[j].pe_base;
-                                    if (val >= mbase && val < mbase + ios_jit_mappings[j].size)
-                                    {
-                                        uintptr_t off_in_img = val - mbase;
-                                        *p = (uintptr_t)ios_jit_mappings[j].jit_base + off_in_img;
-                                        fixup_count++;
-                                        break;
-                                    }
+                                    *p = (uint64_t)(uintptr_t)nv;
+                                    fixup_count++;
                                 }
                             }
                             p++;
                         }
+                        /* dprintf, not ERR — the perf WINEDEBUG default mutes
+                         * err+virtual and this is the owner-routing evidence. */
                         if (fixup_count)
-                            ERR("iOS JIT: synced IAT region %p+0x%lx → JIT, translated %d pointers\n",
-                                base, (unsigned long)size, fixup_count);
+                            dprintf(2, "[iat-sync] region %p+0x%lx: translated %d pointers (owner=%p)\n",
+                                    base, (unsigned long)size, fixup_count, sync_owner);
                     }
                     break;
                 }

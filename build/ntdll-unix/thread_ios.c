@@ -1421,6 +1421,55 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     if (flags & ~supported_flags)
         FIXME( "Unsupported flags %#x.\n", flags );
 
+    /* [thr-create] pseudo-process forensics: services threadpool workers
+     * were born with a SESSION-copy threadpool_worker_proc as their start
+     * routine (2026-07-07 [exit-stk]) — log every creation with the start
+     * address's copy attribution to catch the creator red-handed. */
+    {
+        extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+        extern void *ios_jit_current_peb(void);
+        extern unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out);
+        void *cp = NULL;
+        void *co = ios_jit_pool_copy_owner((void *)start, &cp);
+        dprintf(2, "[thr-create] creator_teb=%p creator_peb=%p start=%p (copy pe=%p owner=%p) param=%p\n",
+                (void *)NtCurrentTeb(), ios_jit_current_peb(), (void *)start, cp, co, param);
+        /* [create-stk]: the creator's PE call chain, with per-frame copy
+         * attribution — names the frame where a services thread crossed
+         * into session-copy Tp code before spawning the doomed worker. */
+        {
+            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+            static volatile int cs_count;
+            if (__sync_add_and_fetch(&cs_count, 1) <= 20)
+            {
+                char *frame = (char *)get_syscall_frame();
+                uint64_t pe_sp = frame ? *(uint64_t *)(frame + 0xf8) : 0;
+                uint64_t pe_lr = frame ? *(uint64_t *)(frame + 0xf0) : 0;
+                uint64_t pe_pc = frame ? *(uint64_t *)(frame + 0x100) : 0;
+                int w, hits = 0;
+                dprintf(2, "[create-stk] frame pc=%p lr=%p sp=%p\n",
+                        (void *)(uintptr_t)pe_pc, (void *)(uintptr_t)pe_lr, (void *)(uintptr_t)pe_sp);
+                for (w = 0; w < 384 && hits < 12 && pe_sp; w++)
+                {
+                    uint64_t val = 0, mod, va;
+                    mach_vm_size_t got = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(),
+                            (mach_vm_address_t)(pe_sp + 8ull * w), 8,
+                            (mach_vm_address_t)&val, &got) != KERN_SUCCESS || got != 8)
+                        break;
+                    if ((va = ios_jit_reverse_translate(val, &mod)) && va != val)
+                    {
+                        void *fcp = NULL;
+                        void *fco = ios_jit_pool_copy_owner((void *)(uintptr_t)val, &fcp);
+                        dprintf(2, "[create-stk] sp+0x%x: 0x%llx pe=%p+0x%llx copy_owner=%p\n",
+                                w * 8, (unsigned long long)val, (void *)(uintptr_t)mod,
+                                (unsigned long long)(va - mod), fco);
+                        hits++;
+                    }
+                }
+            }
+        }
+    }
+
     if (zero_bits > 21 && zero_bits < 32) return STATUS_INVALID_PARAMETER_3;
 #ifndef _WIN64
     if (!is_old_wow64() && zero_bits >= 32) return STATUS_INVALID_PARAMETER_3;
