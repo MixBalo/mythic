@@ -7240,6 +7240,43 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     return ret;
 }
 
+/* Steam S3 (task #29): when virtual_handle_fault can't service a fault,
+ * dump the target's memory picture — is it in a Wine file_view (Wine should
+ * manage it → our commit/vprot has a gap), or is it a FEX/foreign mapping
+ * Wine doesn't know about? Plus vprot of the page and its neighbors (a
+ * page-crossing write into an uncommitted next-page shows as this/next
+ * differing). Decides whether the fix is Wine-side commit-on-fault or a
+ * FEX guest-memory issue. */
+void ios_dump_fault_region( void *addr )
+{
+    char *page = ROUND_ADDR( addr, host_page_mask );
+    BYTE vp_prev, vp, vp_next;
+    struct file_view *view;
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t a = (uintptr_t)addr, rx = (uintptr_t)ios_jit_rx_base_global,
+              rw = (uintptr_t)ios_jit_rw_base_global, sz = ios_jit_pool_size_global;
+    const char *region = "unknown/foreign";
+
+    mutex_lock( &virtual_mutex );
+    vp_prev = get_host_page_vprot( page - host_page_size );
+    vp      = get_host_page_vprot( page );
+    vp_next = get_host_page_vprot( page + host_page_size );
+    view = find_view( addr, 1 );
+    if (rx && a >= rx && a < rx + sz) region = "JIT-POOL-RX (exec, RO)";
+    else if (rw && a >= rw && a < rw + sz) region = "JIT-POOL-RW (alias)";
+    dprintf( 2, "[fault-rgn] addr=%p page=%p vprot prev/this/next=%02x/%02x/%02x region=%s\n",
+             addr, page, vp_prev, vp, vp_next, region );
+    if (view)
+        dprintf( 2, "[fault-rgn]   IN WINE VIEW base=%p size=0x%lx protect=0x%x off=0x%lx end=%p\n",
+                 view->base, (unsigned long)view->size, view->protect,
+                 (unsigned long)((char *)addr - (char *)view->base),
+                 (char *)view->base + view->size );
+    else
+        dprintf( 2, "[fault-rgn]   NO wine view — Wine doesn't own this addr (FEX/foreign mmap)\n" );
+    mutex_unlock( &virtual_mutex );
+}
+
 
 /***********************************************************************
  *           virtual_setup_exception

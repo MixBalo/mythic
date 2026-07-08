@@ -1369,6 +1369,56 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* iOS-Mythic RECLAIM RECOVERY (FEX-2607 Thumper): a page that Wine/FEX
+             * consider committed can be reclaimed by iOS under memory pressure —
+             * 2607's per-thread 96MB LookupCaches push the app over the jetsam
+             * limit, so committed L1/L2/code pages get dropped and the re-access
+             * faults with no other handler -> terminate. Force the page back with
+             * mprotect(RW); it returns zero-filled, which is functionally correct
+             * for FEX's caches (a zero L1/L2 slot reads as "empty" -> FEX
+             * recompiles). Gated to the FEX host-arena band (~0x7Cxx..0x80xx) so
+             * it can't mask guest/dyld/null-deref faults, with a 16-slot per-page
+             * repeat guard so an ineffective mprotect can't spin forever. */
+            {
+                uint64_t fa = (uint64_t)fault_addr;
+                if (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
+                {
+                    if (!handled)
+                    {
+                        static volatile uint64_t rr_pg[16] = {0};
+                        static volatile uint32_t rr_n[16]  = {0};
+                        /* iOS uses 16KB host pages. NOTE: `host_page_size` in this
+                         * file resolves to the Mach *function*, not a size — using
+                         * it as a value gave a garbage mask (mprotect EINVAL). */
+                        enum { RR_PAGE = 0x4000 };
+                        uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
+                        int s = (int)((pg >> 14) & 15);
+                        int giveup = 0;
+                        if (rr_pg[s] == pg) { if (++rr_n[s] > 4) giveup = 1; }
+                        else { rr_pg[s] = pg; rr_n[s] = 1; }
+                        if (!giveup)
+                        {
+                            int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
+                            int errno_save = errno;
+                            int used_mmap = 0;
+                            if (mpr != 0)   /* page may be UNMAPPED, not just PROT_NONE — remap fresh */
+                            {
+                                void *r = mmap( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE,
+                                                MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
+                                used_mmap = (r == (void *)(uintptr_t)pg);
+                            }
+                            static volatile int rc = 0;
+                            if (__sync_fetch_and_add(&rc, 1) < 80)
+                                dprintf(STDERR_FILENO,
+                                    "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d retry#%u\n",
+                                    (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
+                                    used_mmap, rr_n[s]);
+                            if (mpr == 0 || used_mmap) handled = 1;
+                        }
+                    }
+                }
+            }
+
             if (handled)
                 thread_set_state( thread, ARM_THREAD_STATE64,
                                   (thread_state_t)&state, count );
@@ -1441,6 +1491,26 @@ static void *ios_mach_exception_thread( void *arg )
                         (void*)(uintptr_t)__darwin_arm_thread_state64_get_sp(state),
                         (void*)(uintptr_t)state.__x[16],
                         (void*)(uintptr_t)state.__x[17]);
+                    /* [ec-fault-regs] the faulting insn f8686928 = ldr x8,[x9,x8]:
+                     * addr = x9(base) + x8(index). Dump x8..x11 so we can name the
+                     * table (EC bitmap? syscall-frame? LookupCache?) and why it's bad. */
+                    if (cnt <= 3)
+                    {
+                        void *peb_ecbm = NULL; void *peb_p = NULL;
+                        if (thread_teb) {
+                            peb_p = ((TEB *)thread_teb)->Peb;
+                            /* PEB->EcCodeBitMap read DIRECTLY (same struct is_ec_code
+                             * uses). If this != 0 but x9==0, is_ec_code read a wrong
+                             * offset / wrong peb; if this == 0, the field is really null
+                             * for this thread's peb (timing / peb not wired). */
+                            if (peb_p) peb_ecbm = ((PEB *)peb_p)->EcCodeBitMap;
+                        }
+                        dprintf(STDERR_FILENO, "[ec-fault-regs] x8=%p x9=%p x10=%p x11=%p x0=%p x2=%p | teb=%p peb=%p peb->EcCodeBitMap=%p\n",
+                            (void*)(uintptr_t)state.__x[8], (void*)(uintptr_t)state.__x[9],
+                            (void*)(uintptr_t)state.__x[10], (void*)(uintptr_t)state.__x[11],
+                            (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
+                            (void *)thread_teb, peb_p, peb_ecbm);
+                    }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
                     {
@@ -1459,6 +1529,25 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf(STDERR_FILENO,
                             "[mach_exc] pc pool-copy pe=%p owner=%p; thread teb=%p peb=%p\n",
                             copy_pe, copy_owner, (void *)thread_teb, cur_teb_peb);
+                        /* [nls-probe] The first fault is upcase_unicode_to_utf8 (ntdll RVA
+                         * 0x38aa8) reading the NLS upcase-table pointer at ntdll .data RVA
+                         * 0xc04e0 via `adrp x16,0xc0000; ldr x7,[x16,#0x4e0]` — and getting
+                         * NULL. Compare the value the POOL copy read (x16+0x4e0) against the
+                         * PE mapping's own .data (copy_pe+0xc04e0). If PE!=0 && pool==0 the
+                         * pool copy's .data is stale (fix = sync/share ntdll .data); if both
+                         * 0 the PE global was never populated (fix is upstream NLS init). */
+                        if (cnt <= 2 && copy_pe && (uintptr_t)copy_pe >= 0x100000000ULL)
+                        {
+                            uint64_t x16v = (uint64_t)state.__x[16];
+                            uint64_t pool_v = (x16v >= 0x100000000ULL)
+                                ? *(volatile uint64_t *)(uintptr_t)(x16v + 0x4e0) : 0xdead1;
+                            uint64_t pe_v = *(volatile uint64_t *)((uintptr_t)copy_pe + 0xc04e0);
+                            dprintf(STDERR_FILENO,
+                                "[nls-probe] upcase ptr: pool[x16+0x4e0]=0x%llx  PE[pe+0xc04e0]=0x%llx  (x16=0x%llx pe=%p rva_pc=0x%llx)\n",
+                                (unsigned long long)pool_v, (unsigned long long)pe_v,
+                                (unsigned long long)x16v, copy_pe,
+                                (unsigned long long)((uintptr_t)fault_pc - ((uintptr_t)fault_pc & ~0xfffffULL)));
+                        }
                     }
                     if ((uintptr_t)fault_pc >= 0x100000000ULL)
                     {
@@ -1502,10 +1591,160 @@ static void *ios_mach_exception_thread( void *arg )
                                 dprintf(STDERR_FILENO, "[mach_exc] pc PE: %s+0x%llx (va=0x%llx)\n",
                                         ios_pe_module_name(mod), (unsigned long long)(va - mod),
                                         (unsigned long long)va);
+                            /* [bucketscan-probe] Thumper dies in FEXCore GuestToHostMap::BlockList
+                             * (ankerl unordered_dense) do_find (libarm64ecfex ~RVA 0x1d140-0x1d280,
+                             * caller LookupCache::FindBlock) scanning its bucket array OFF THE END:
+                             * loop `add x17,x11,w12,uxtw#3; ldr w1,[x17]` => x11=buckets base,
+                             * w12=index, x17=x11+w12*8 walks unmapped guest mem. Dump base/index/
+                             * scan-distance/key (NO deref — stay signal-safe) to tell UNINITIALIZED
+                             * (x11 garbage/tiny, no valid array) from TORN-READ (x11 a valid heap
+                             * ptr but distance huge => bounds/mask stale from a concurrent swap). */
+                            {
+                                uint64_t bs_mod, bs_va;
+                                if ((bs_va = ios_jit_reverse_translate( fault_pc, &bs_mod )))
+                                {
+                                    uint64_t bs_rva = bs_va - bs_mod;
+                                    /* [findblock-probe] LookupCache::FindBlock(x0=this=LookupCache*, x1=Thread,
+                                     * x2=Address). Its L1 lookup faults at ~0x18c90: ldp x8,x9,[x0,#0x30] (x0[0x30]=
+                                     * L1 base, x0[0x38]=L1 mask), x25=x8+(x9&x2)<<4, ldr [x25]. Capture x0 (the LIVE
+                                     * LookupCache ptr — dead by do_find) + L1 fields to tell a BOGUS x0 (garbage/
+                                     * guest ptr from the dispatcher/StateFrame) from a valid-but-corrupted cache. */
+                                    if (bs_rva >= 0x18c70 && bs_rva < 0x18e20)
+                                    {
+                                        static volatile int fb_seen = 0;
+                                        if (__sync_fetch_and_add(&fb_seen, 1) < 6)
+                                        {
+                                            uint64_t x0v = (uint64_t)state.__x[0];
+                                            uint64_t l1base = 0xdead, l1mask = 0xdead;
+                                            int host = (x0v >= 0x100000000ULL && x0v < 0x800000000000ULL);
+                                            if (host) {
+                                                l1base = *(volatile uint64_t *)(uintptr_t)(x0v + 0x30);
+                                                l1mask = *(volatile uint64_t *)(uintptr_t)(x0v + 0x38);
+                                            }
+                                            dprintf(STDERR_FILENO,
+                                                "[findblock-probe] rva=0x%llx x0(LookupCache)=0x%llx host=%d x1(Thread)=0x%llx x2(rip)=0x%llx L1base[0x30]=0x%llx L1mask[0x38]=0x%llx\n",
+                                                (unsigned long long)bs_rva, (unsigned long long)x0v, host,
+                                                (unsigned long long)state.__x[1], (unsigned long long)state.__x[2],
+                                                (unsigned long long)l1base, (unsigned long long)l1mask);
+                                        }
+                                    }
+                                    if (bs_rva >= 0x1d100 && bs_rva < 0x1d300)
+                                    {
+                                        static volatile int bs_seen = 0;
+                                        if (__sync_fetch_and_add(&bs_seen, 1) < 6)
+                                        {
+                                            uint64_t x8v  = (uint64_t)state.__x[8];
+                                            uint64_t x11v = (uint64_t)state.__x[11];
+                                            uint64_t x12v = (uint64_t)state.__x[12];
+                                            uint64_t x15v = (uint64_t)state.__x[15];
+                                            uint64_t x17v = (uint64_t)state.__x[17];
+                                            dprintf(STDERR_FILENO,
+                                                "[bucketscan-probe] do_find rva=0x%llx x11(base)=0x%llx x17(cur)=0x%llx scan_dist=0x%llx(%llu buckets) x8=0x%llx x12(idx)=0x%llx x15(key)=0x%llx\n",
+                                                (unsigned long long)bs_rva, (unsigned long long)x11v,
+                                                (unsigned long long)x17v, (unsigned long long)(x17v - x11v),
+                                                (unsigned long long)((x17v - x11v) / 8), (unsigned long long)x8v,
+                                                (unsigned long long)x12v, (unsigned long long)x15v);
+                                            /* Dump the actual bucket CONTENTS at x11 (m_buckets). This range is
+                                             * mapped (the scan reads it up to x17). Each ankerl bucket = 8 bytes
+                                             * {u32 dist_and_fingerprint, u32 value_idx}. All-zero => empty (do_find
+                                             * would have stopped); small ascending d_a_f => a real map; random
+                                             * huge values => uninitialized/torn/UAF backing store. Also dump
+                                             * callee-saved regs so we can recover `this` (do_find: this[0x18]==
+                                             * m_buckets, this[0x3e]=m_shifts) offline. */
+                                            {
+                                                uint64_t bk[6] = {0,0,0,0,0,0};
+                                                if (x11v >= 0x100000000ULL && x11v < 0x800000000000ULL)
+                                                    for (int bi = 0; bi < 6; bi++)
+                                                        bk[bi] = *(volatile uint64_t *)(uintptr_t)(x11v + (uint64_t)bi * 8);
+                                                dprintf(STDERR_FILENO,
+                                                    "[bucketscan-probe] buckets@x11: %016llx %016llx %016llx %016llx %016llx %016llx | x0=%llx x9=%llx x10=%llx x19=%llx x20=%llx x21=%llx x22=%llx\n",
+                                                    (unsigned long long)bk[0], (unsigned long long)bk[1],
+                                                    (unsigned long long)bk[2], (unsigned long long)bk[3],
+                                                    (unsigned long long)bk[4], (unsigned long long)bk[5],
+                                                    (unsigned long long)state.__x[0], (unsigned long long)state.__x[9],
+                                                    (unsigned long long)state.__x[10], (unsigned long long)state.__x[19],
+                                                    (unsigned long long)state.__x[20], (unsigned long long)state.__x[21],
+                                                    (unsigned long long)state.__x[22]);
+                                                /* Recover the map `this`: do_find has this[0x18]==m_buckets(x11v).
+                                                 * Whichever candidate reg, at +0x18, holds x11v is `this`. Then dump
+                                                 * its ankerl fields to tell a real-but-corrupted map (sane values
+                                                 * ptrs, only m_buckets bad) from a wrong/guest `this`. Guarded reads. */
+                                                {
+                                                    uint64_t cands[4] = { (uint64_t)state.__x[10], (uint64_t)state.__x[19],
+                                                                          (uint64_t)state.__x[21], (uint64_t)state.__x[0] };
+                                                    int found = 0;
+                                                    for (int ci = 0; ci < 4 && !found; ci++) {
+                                                        uint64_t th = cands[ci];
+                                                        if (th < 0x100000000ULL || th >= 0x800000000000ULL) continue;
+                                                        uint64_t mb = *(volatile uint64_t *)(uintptr_t)(th + 0x18);
+                                                        if (mb != x11v) continue;
+                                                        found = 1;
+                                                        uint64_t vb  = *(volatile uint64_t *)(uintptr_t)(th + 0x0);
+                                                        uint64_t ve  = *(volatile uint64_t *)(uintptr_t)(th + 0x8);
+                                                        uint64_t f20 = *(volatile uint64_t *)(uintptr_t)(th + 0x20);
+                                                        uint64_t f28 = *(volatile uint64_t *)(uintptr_t)(th + 0x28);
+                                                        uint8_t  sh  = *(volatile uint8_t  *)(uintptr_t)(th + 0x3e);
+                                                        dprintf(STDERR_FILENO,
+                                                            "[bucketscan-probe] THIS=0x%llx(reg%d) values.begin=0x%llx end=0x%llx [0x20]=0x%llx [0x28]=0x%llx m_shifts=0x%x\n",
+                                                            (unsigned long long)th, ci, (unsigned long long)vb,
+                                                            (unsigned long long)ve, (unsigned long long)f20,
+                                                            (unsigned long long)f28, sh);
+                                                    }
+                                                    if (!found)
+                                                        dprintf(STDERR_FILENO,
+                                                            "[bucketscan-probe] THIS not found in x0/x10/x19/x21 (map ptr not in loop regs)\n");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if ((va = ios_jit_reverse_translate( state.__lr, &mod )))
                                 dprintf(STDERR_FILENO, "[mach_exc] lr PE: %s+0x%llx (va=0x%llx)\n",
                                         ios_pe_module_name(mod), (unsigned long long)(va - mod),
                                         (unsigned long long)va);
+                            /* [nullfp-probe] When the fault is #arm64x_check_call with x11=0,
+                             * the EC indirect-call TARGET is null. The caller pattern is
+                             *   lr-0x1c: adrp xN, PAGE ;  lr-0xc: ldr x11,[xN,#OFF] ;  lr-4: blr x8
+                             * Decode adrp+ldr to recover the target-global address, then read it
+                             * from BOTH the pool COPY and the PE mapping. pool==0 && PE!=0 => the
+                             * pool copy's .data was never relocated/synced (same class as the NLS
+                             * casemap bug); both==0 => the static-init that populates it never ran. */
+                            if (cnt <= 3 && va && (uintptr_t)state.__x[11] == 0 &&
+                                (uintptr_t)state.__lr >= 0x100000000ULL)
+                            {
+                                uint64_t lr_rva = va - mod;
+                                uint64_t pool_base = (uint64_t)state.__lr - lr_rva;
+                                uint32_t *cp = (uint32_t *)(uintptr_t)state.__lr;
+                                uint32_t adrp_i = cp[-7];   /* lr-0x1c */
+                                uint32_t ldr_i  = cp[-3];   /* lr-0xc  */
+                                int is_adrp = ((adrp_i >> 24) & 0x9f) == 0x90;
+                                int is_ldr  = ((ldr_i  >> 22) & 0x3ff) == 0x3e5; /* LDR imm,64 unsigned */
+                                if (is_adrp && is_ldr)
+                                {
+                                    int64_t immlo = (adrp_i >> 29) & 0x3;
+                                    int64_t immhi = (adrp_i >> 5) & 0x7ffff;
+                                    int64_t imm = (immhi << 2) | immlo;
+                                    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
+                                    uint64_t adrp_pc = (uint64_t)state.__lr - 0x1c;
+                                    uint64_t page = (adrp_pc & ~0xfffULL) + ((uint64_t)imm << 12);
+                                    uint64_t off  = (uint64_t)((ldr_i >> 10) & 0xfff) << 3;
+                                    uint64_t g_pool = page + off;
+                                    uint64_t g_rva  = g_pool - pool_base;
+                                    uint64_t gv_pool = *(volatile uint64_t *)(uintptr_t)g_pool;
+                                    uint64_t gv_pe   = *(volatile uint64_t *)(uintptr_t)(mod + g_rva);
+                                    dprintf(STDERR_FILENO,
+                                        "[nullfp-probe] tgt-global rva=0x%llx pool[0x%llx]=0x%llx PE[0x%llx]=0x%llx mod=%s lr_rva=0x%llx\n",
+                                        (unsigned long long)g_rva,
+                                        (unsigned long long)g_pool, (unsigned long long)gv_pool,
+                                        (unsigned long long)(mod + g_rva), (unsigned long long)gv_pe,
+                                        ios_pe_module_name(mod), (unsigned long long)lr_rva);
+                                }
+                                else
+                                    dprintf(STDERR_FILENO,
+                                        "[nullfp-probe] caller not adrp+ldr: adrp_i=0x%08x ldr_i=0x%08x lr_rva=0x%llx mod=%s\n",
+                                        adrp_i, ldr_i, (unsigned long long)(va - mod), ios_pe_module_name(mod));
+                            }
                         }
                         /* fp-chain backtrace of the faulting thread — names
                          * the exact native call path (which Metal call fed
@@ -3689,6 +3928,20 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #ifdef WINE_IOS
     ERR("setup_exception for SEGV at pc=%p addr=%p (virtual_handle_fault failed)\n",
         (void*)PC_sig(context), siginfo->si_addr);
+    /* Steam S3 (task #29): name the native faulting code + the target
+     * memory region so the unhandled-write fault is diagnosable. */
+    {
+        extern void ios_dump_fault_region( void *addr );
+        Dl_info di;
+        uint64_t pcv = (uint64_t)PC_sig(context);
+        if (dladdr( (void *)(uintptr_t)pcv, &di ) && di.dli_fname)
+            dprintf( 2, "[fault-pc] pc=%p = %s`%s+0x%llx (img base %p, slide-relative)\n",
+                     (void *)(uintptr_t)pcv, di.dli_fname,
+                     di.dli_sname ? di.dli_sname : "?",
+                     (unsigned long long)(pcv - (uint64_t)(uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)),
+                     di.dli_fbase );
+        ios_dump_fault_region( siginfo->si_addr );
+    }
 #endif
     setup_exception( context, &rec );
 }

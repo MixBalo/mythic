@@ -91,3 +91,9 @@ wine-ios-build/
 MeloNX.js
 build/gnutls-ios/src/
 build/gnutls-ios/obj/
+
+# Reference/scratch material — not build inputs
+research/
+*.bak
+photorec.se2
+.DS_Store

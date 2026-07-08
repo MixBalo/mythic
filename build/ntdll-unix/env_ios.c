@@ -2398,6 +2398,18 @@ NTSTATUS WINAPI NtGetNlsSectionPtr( ULONG type, ULONG id, void *unknown, void **
     HANDLE handle, file;
     NTSTATUS status;
 
+    /* [nls-getptr probe] Does the x64 CHILD (private EC ntdll) request the
+     * CASEMAP (type=NLS_SECTION_CASEMAP) section? If we only ever see this
+     * called from the SESSION peb and never the child's, the child's
+     * init_locale is skipped and its casemap global stays null (the
+     * upcase_unicode_to_utf8 fault). Match the child peb from the earlier
+     * "[Wine child] child_peb=..." line. */
+    {
+        TEB *cur_teb = NtCurrentTeb();
+        dprintf( 2, "[nls-getptr] type=%u id=%u peb=%p\n",
+                 type, id, cur_teb ? (void *)cur_teb->Peb : NULL );
+    }
+
     if ((status = get_nls_section_name( type, id, name ))) return status;
 
     init_unicode_string( &nameW, name );
