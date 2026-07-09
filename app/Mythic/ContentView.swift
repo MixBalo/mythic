@@ -1213,7 +1213,19 @@ struct ContentView: View {
             // of image copies alone (2026-07-06), leaving the FEX tail carve
             // colliding with the head. 384 MB fits both plus slack; the pool
             // is dual-map + NO_FOOTPRINT so unwritten pages cost nothing.
-            let poolSizeMB = 384
+            //
+            // 2026-07-10 (Steam S3): 384 MB is VIRTUAL-exhausted by Steam's
+            // pseudo-process fan-out — steam.exe + services + rpcss + cmd +
+            // conhost + steamerrorreporter64 each copy their whole DLL set
+            // (owner-keyed, no .text sharing yet) → 138 image copies hit
+            // ~365 MB and the crash reporter's ntdll can't fit → the load
+            // fails and execution BUS-faults on the un-committed image. Since
+            // the pool is jetsam-exempt + demand-committed (unwritten pages
+            // cost nothing), raising the VIRTUAL cap is a cheap, safe unblock.
+            // 640 MB clears the current fan-out with headroom to reach the
+            // ole32 delay-load (FEX riprel probe) and beyond. The real fix for
+            // the PHYSICAL duplication is .text sharing (deferred project).
+            let poolSizeMB = 640
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

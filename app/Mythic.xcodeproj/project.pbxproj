@@ -7,59 +7,56 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A1000001 /* MythicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001; };
-		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002; };
-		A1000003 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003; };
-		A1000200 /* LogPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000200; };
-		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201; };
-		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202; };
-		A1000004 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004; };
-		A1000005 /* EntitlementChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000A; };
-		A1000006 /* FEXBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A200000B; };
-		A1000010 /* libFEXCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000010; };
-		A1000011 /* libFEXCore_Base.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000011; };
-		A1000012 /* libfmt.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000012; };
-		A1000013 /* libcephes_128bit.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000013; };
-		A1000014 /* libxxhash.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000014; };
-		A1000015 /* libsoftfloat_3e.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000015; };
-		A1000016 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000016; };
-		A1000017 /* libJemallocLibs.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000017; };
-		A1000020 /* WineServerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A200001E; };
-		A1000021 /* libwineserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020; };
-		A1000022 /* nls in Resources */ = {isa = PBXBuildFile; fileRef = A2000021; };
-		A1000030 /* WineProcessBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000030; };
-		A1000031 /* libntdll_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000032; };
-		A1000032 /* aarch64-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000033; };
-		A1000080 /* arm64ec-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000080; };
-		A1000081 /* x86_64-vcruntime in Resources */ = {isa = PBXBuildFile; fileRef = A2000081; };
-		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034; };
-		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035; };
-		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036; };
-		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040; };
-		A1000094 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = A2000094; };
-		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041; };
-		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042; };
-		A1000050 /* IOSDisplayShim.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000050; };
-		A1000051 /* libdxmt_combined.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000051; };
-		A1000052 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000052; };
-		A1000053 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000053; };
-		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054; };
-		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055; };
-		A1000060 /* libwin32u_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000060; };
-		A1000090 /* libgnutls.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000090; };
-		A1000091 /* libhogweed.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000091; };
-		A1000092 /* libnettle.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000092; };
-		A1000093 /* libgmp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000093; };
-		A1000070 /* Winios.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000070; };
+		A1000001 /* MythicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* MythicApp.swift */; };
+		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
+		A1000003 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003 /* LogStore.swift */; };
+		A1000004 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004 /* JITAllocator.c */; };
+		A1000005 /* EntitlementChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000A /* EntitlementChecker.swift */; };
+		A1000006 /* FEXBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A200000B /* FEXBridge.mm */; };
+		A1000010 /* libFEXCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000010 /* libFEXCore.a */; };
+		A1000011 /* libFEXCore_Base.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000011 /* libFEXCore_Base.a */; };
+		A1000012 /* libfmt.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000012 /* libfmt.a */; };
+		A1000013 /* libcephes_128bit.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000013 /* libcephes_128bit.a */; };
+		A1000014 /* libxxhash.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000014 /* libxxhash.a */; };
+		A1000015 /* libsoftfloat_3e.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000015 /* libsoftfloat_3e.a */; };
+		A1000016 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000016 /* libc++.tbd */; };
+		A1000017 /* libJemallocLibs.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000017 /* libJemallocLibs.a */; };
+		A1000020 /* WineServerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A200001E /* WineServerBridge.m */; };
+		A1000021 /* libwineserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020 /* libwineserver.a */; };
+		A1000022 /* nls in Resources */ = {isa = PBXBuildFile; fileRef = A2000021 /* nls */; };
+		A1000030 /* WineProcessBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000030 /* WineProcessBridge.m */; };
+		A1000031 /* libntdll_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000032 /* libntdll_unix.a */; };
+		A1000032 /* aarch64-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000033 /* aarch64-windows */; };
+		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034 /* wine_stubs.c */; };
+		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035 /* IOKit.framework */; };
+		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036 /* StikJITHelper.swift */; };
+		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040 /* prefix-template.tar.gz */; };
+		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041 /* PrefixExtractor.c */; };
+		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042 /* libz.tbd */; };
+		A1000050 /* IOSDisplayShim.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000050 /* IOSDisplayShim.m */; };
+		A1000051 /* libdxmt_combined.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000051 /* libdxmt_combined.a */; };
+		A1000052 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000052 /* Metal.framework */; };
+		A1000053 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000053 /* QuartzCore.framework */; };
+		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054 /* MetalFX.framework */; };
+		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055 /* libsqlite3.tbd */; };
+		A1000060 /* libwin32u_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000060 /* libwin32u_unix.a */; };
+		A1000070 /* Winios/Winios.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000070 /* Winios/Winios.m */; };
+		A1000080 /* arm64ec-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000080 /* arm64ec-windows */; };
+		A1000081 /* x86_64-vcruntime in Resources */ = {isa = PBXBuildFile; fileRef = A2000081 /* x86_64-vcruntime */; };
+		A1000090 /* libgnutls.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000090 /* libgnutls.a */; };
+		A1000091 /* libhogweed.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000091 /* libhogweed.a */; };
+		A1000092 /* libnettle.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000092 /* libnettle.a */; };
+		A1000093 /* libgmp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000093 /* libgmp.a */; };
+		A1000094 /* cacert.pem in Resources */ = {isa = PBXBuildFile; fileRef = A2000094 /* cacert.pem */; };
+		A1000200 /* LogPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000200 /* LogPattern.swift */; };
+		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201 /* LogTail.swift */; };
+		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A2000001 /* MythicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MythicApp.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A2000003 /* LogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogStore.swift; sourceTree = "<group>"; };
-		A2000200 /* LogPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogPattern.swift; sourceTree = "<group>"; };
-		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
-		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		A2000004 /* JITAllocator.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = JITAllocator.c; sourceTree = "<group>"; };
 		A2000005 /* JITAllocator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = JITAllocator.h; sourceTree = "<group>"; };
 		A2000006 /* Mythic-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Mythic-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -85,30 +82,33 @@
 		A2000031 /* WineProcessBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineProcessBridge.h; sourceTree = "<group>"; };
 		A2000032 /* libntdll_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libntdll_unix.a; sourceTree = "<group>"; };
 		A2000033 /* aarch64-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "aarch64-windows"; sourceTree = "<group>"; };
-		A2000080 /* arm64ec-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "arm64ec-windows"; sourceTree = "<group>"; };
-		A2000081 /* x86_64-vcruntime */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "x86_64-vcruntime"; sourceTree = "<group>"; };
 		A2000034 /* wine_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wine_stubs.c; sourceTree = "<group>"; };
 		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
 		A2000040 /* prefix-template.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = "prefix-template.tar.gz"; sourceTree = "<group>"; };
-		A2000094 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
 		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
+		A2000042 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libz.tbd; path = usr/lib/libz.tbd; sourceTree = SDKROOT; };
 		A2000043 /* PrefixExtractor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PrefixExtractor.h; sourceTree = "<group>"; };
-		A2000042 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libz.tbd"; path = "usr/lib/libz.tbd"; sourceTree = SDKROOT; };
 		A2000050 /* IOSDisplayShim.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IOSDisplayShim.m; sourceTree = "<group>"; };
-		A2000056 /* IOSDisplayShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSDisplayShim.h; sourceTree = "<group>"; };
 		A2000051 /* libdxmt_combined.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libdxmt_combined.a; sourceTree = "<group>"; };
 		A2000052 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		A2000053 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
-		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libsqlite3.tbd"; path = "usr/lib/libsqlite3.tbd"; sourceTree = SDKROOT; };
+		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		A2000056 /* IOSDisplayShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSDisplayShim.h; sourceTree = "<group>"; };
 		A2000060 /* libwin32u_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwin32u_unix.a; sourceTree = "<group>"; };
+		A2000070 /* Winios/Winios.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Winios/Winios.m; sourceTree = "<group>"; };
+		A2000071 /* Winios/Winios.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Winios/Winios.h; sourceTree = "<group>"; };
+		A2000080 /* arm64ec-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "arm64ec-windows"; sourceTree = "<group>"; };
+		A2000081 /* x86_64-vcruntime */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "x86_64-vcruntime"; sourceTree = "<group>"; };
 		A2000090 /* libgnutls.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libgnutls.a; sourceTree = "<group>"; };
 		A2000091 /* libhogweed.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libhogweed.a; sourceTree = "<group>"; };
 		A2000092 /* libnettle.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libnettle.a; sourceTree = "<group>"; };
 		A2000093 /* libgmp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libgmp.a; sourceTree = "<group>"; };
-		A2000070 /* Winios.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Winios/Winios.m; sourceTree = "<group>"; };
-		A2000071 /* Winios.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Winios/Winios.h; sourceTree = "<group>"; };
+		A2000094 /* cacert.pem */ = {isa = PBXFileReference; lastKnownFileType = text; path = cacert.pem; sourceTree = "<group>"; };
+		A2000200 /* LogPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogPattern.swift; sourceTree = "<group>"; };
+		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
+		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -182,8 +182,8 @@
 				A2000043 /* PrefixExtractor.h */,
 				A2000050 /* IOSDisplayShim.m */,
 				A2000056 /* IOSDisplayShim.h */,
-				A2000070 /* Winios.m */,
-				A2000071 /* Winios.h */,
+				A2000070 /* Winios/Winios.m */,
+				A2000071 /* Winios/Winios.h */,
 				A2000034 /* wine_stubs.c */,
 				A2000006 /* Mythic-Bridging-Header.h */,
 				A2000007 /* Mythic.entitlements */,
@@ -317,7 +317,7 @@
 				A1000033 /* wine_stubs.c in Sources */,
 				A1000041 /* PrefixExtractor.c in Sources */,
 				A1000050 /* IOSDisplayShim.m in Sources */,
-				A1000070 /* Winios.m in Sources */,
+				A1000070 /* Winios/Winios.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -391,9 +391,10 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Mythic/Mythic.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = UT49TA9TA4;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = UT49TA9TA4;
 				GENERATE_INFOPLIST_FILE = NO;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
@@ -411,6 +412,10 @@
 				INFOPLIST_FILE = Mythic/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
@@ -420,13 +425,10 @@
 					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
 					"$(SRCROOT)/Mythic",
 				);
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.mythic.emulator;
+				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythic;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -461,6 +463,10 @@
 				INFOPLIST_FILE = Mythic/Info.plist;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				LIBRARY_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
@@ -470,12 +476,8 @@
 					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
 					"$(SRCROOT)/Mythic",
 				);
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-				);
 				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.mythic.emulator;
+				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythic;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -508,7 +510,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
 	};
 	rootObject = A6000001 /* Project object */;
 }

@@ -1369,8 +1369,45 @@ static void register_builtins(void)
  */
 void register_builtin_classes(void)
 {
-    static pthread_once_t init_once = PTHREAD_ONCE_INIT;
-    pthread_once( &init_once, register_builtins );
+    /* iOS-Mythic: all pseudo-processes share this unix-side image, so a
+     * pthread_once here registers the builtin classes only for the FIRST
+     * process — but the wineserver tracks window classes per process, so
+     * every later pseudo-process fails any builtin-control create with
+     * STATUS_INVALID_HANDLE (grab_class).  Steam's update UI (STATIC/
+     * BUTTON/msctls_progress32 children) was the first victim.
+     * Register once per pseudo-process instead, keyed on (pid, peb) so a
+     * reused PEB address or ptid alone can't false-positive.  On table
+     * overflow we simply re-register: the server rejects duplicates with
+     * CLASS_ALREADY_EXISTS, which register_builtin tolerates.
+     * The mutex is held across register_builtins to mirror pthread_once's
+     * blocking semantics for concurrent first callers (dedicated lock —
+     * winproc_lock is taken inside NtUserRegisterClassExWOW). */
+    static pthread_mutex_t builtin_lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { DWORD pid; void *peb; } done[128];
+    static unsigned int done_count;
+    DWORD pid = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+    void *peb = NtCurrentTeb()->Peb;
+    unsigned int i;
+
+    pthread_mutex_lock( &builtin_lock );
+    for (i = 0; i < done_count; i++)
+    {
+        if (done[i].pid == pid && done[i].peb == peb)
+        {
+            pthread_mutex_unlock( &builtin_lock );
+            return;
+        }
+    }
+    register_builtins();
+    if (done_count < ARRAYSIZE(done))
+    {
+        done[done_count].pid = pid;
+        done[done_count].peb = peb;
+        done_count++;
+    }
+    else dprintf(2, "[builtin-classes] registry FULL — pid=%04x will re-register per call\n", (int)pid);
+    dprintf(2, "[builtin-classes] registered builtin classes for pid=%04x peb=%p\n", (int)pid, peb);
+    pthread_mutex_unlock( &builtin_lock );
 }
 
 /***********************************************************************
