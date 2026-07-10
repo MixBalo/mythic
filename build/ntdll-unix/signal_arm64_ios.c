@@ -1391,10 +1391,19 @@ static void *ios_mach_exception_thread( void *arg )
                          * file resolves to the Mach *function*, not a size — using
                          * it as a value gave a garbage mask (mprotect EINVAL). */
                         enum { RR_PAGE = 0x4000 };
+#ifndef MADV_FREE_REUSE
+#define MADV_FREE_REUSE 8
+#endif
                         uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
                         int s = (int)((pg >> 14) & 15);
                         int giveup = 0;
-                        if (rr_pg[s] == pg) { if (++rr_n[s] > 4) giveup = 1; }
+                        /* Task #22: was >4 — Steam's download pressure re-harvested
+                         * the same still-volatile page 5+ times and the give-up
+                         * escalated into a 24k-exception BUS storm (freeze →
+                         * StikDebug detach → terminate). MADV_FREE_REUSE below
+                         * makes each recovery permanent, so repeats should stop;
+                         * the higher cap is a belt for volatility we can't clear. */
+                        if (rr_pg[s] == pg) { if (++rr_n[s] > 64) giveup = 1; }
                         else { rr_pg[s] = pg; rr_n[s] = 1; }
                         if (!giveup)
                         {
@@ -1407,12 +1416,19 @@ static void *ios_mach_exception_thread( void *arg )
                                                 MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
                                 used_mmap = (r == (void *)(uintptr_t)pg);
                             }
+                            /* Clear the volatile mark that let iOS take the page in
+                             * the first place (pool freelist MADV_FREE, task #25) —
+                             * without this the SAME page gets re-harvested after FEX
+                             * repopulates it (observed retry#1..4, identical fault
+                             * address, 2026-07-10). */
+                            int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
                             static volatile int rc = 0;
-                            if (__sync_fetch_and_add(&rc, 1) < 80)
+                            int rcn = __sync_fetch_and_add(&rc, 1);
+                            if (rcn < 40 || (rcn % 50) == 0)
                                 dprintf(STDERR_FILENO,
-                                    "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d retry#%u\n",
+                                    "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u\n",
                                     (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
-                                    used_mmap, rr_n[s]);
+                                    used_mmap, reuse, rr_n[s]);
                             if (mpr == 0 || used_mmap) handled = 1;
                         }
                     }

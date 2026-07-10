@@ -880,6 +880,36 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 #ifdef WINE_IOS
     ERR("NtCreateUserProcess: image=%s cmdline=%s\n",
         debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ));
+
+    /* TEMP HACK (Steam S3 2026-07-10, task #29): refuse to spawn Steam's
+     * minidump reporter. The reporter child hits the deep guest-exception-
+     * DISPATCH wall ("exception frame is not in stack limits") and — worse —
+     * its NtTerminateProcess currently takes the whole app down (open bug).
+     * Steam explicitly tolerates a failed spawn ("Failed spawning steam
+     * error reporter process." → continues), verified run 9. Remove once
+     * (a) exception dispatch at guest faults works and (b) the pseudo-proc
+     * terminate path no longer kills the session. */
+    {
+        static const char blocked[] = "steamerrorreporter";
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        int bl = sizeof(blocked) - 1, k, j;
+        for (k = 0; k + bl <= ip_len; k++)
+        {
+            for (j = 0; j < bl; j++)
+            {
+                WCHAR c = ip[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)blocked[j]) break;
+            }
+            if (j == bl)
+            {
+                dprintf(2, "[proc-gate] REFUSING spawn of %s (steamerrorreporter TEMP gate)\n",
+                        debugstr_us( &params->ImagePathName ));
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+    }
 #endif
 
     unixdir = get_unix_curdir( params );
@@ -1102,7 +1132,12 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 #ifdef WINE_IOS
     {
         static int term_log_count = 0;
-        if (term_log_count < 3) {
+        /* iOS-Mythic [term-stack] (task#29): also fire on ANY nonzero exit_code
+         * (capped) so Steam's deliberate ExitProcess(-104) bootstrapper bail is
+         * captured — the first-3 slots are consumed by early exit-0 procs
+         * (cmd/start.exe) before steam.exe ever runs. The dump below (guest RIP +
+         * emulator-stack code-address scan) names which steam.exe code path bails. */
+        if (term_log_count < 3 || (exit_code != 0 && term_log_count < 24)) {
             term_log_count++;
             extern volatile uint64_t g_wine_dispatcher_count;
             extern volatile uint64_t g_wine_unix_call_count;

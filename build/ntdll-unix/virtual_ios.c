@@ -187,6 +187,11 @@ static int ios_pool_ledger_count;
 
 #define IOS_POOL_FREE_MAX 256
 #define IOS_POOL_REUSE_GRACE_SEC 3
+/* Darwin madvise: MADV_FREE marks pages volatile; MADV_FREE_REUSE is the
+ * documented cancel. Guard for older SDK headers. */
+#ifndef MADV_FREE_REUSE
+#define MADV_FREE_REUSE 8
+#endif
 struct ios_pool_free
 {
     size_t off;
@@ -200,16 +205,48 @@ static int ios_pool_free_count;
 void *ios_jit_current_peb(void);
 extern void *ios_jit_rw_base_global;  /* defined below */
 
+/* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
+ * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
+ * RX, writes via user_VA fault and the STR fault emulator looks up the RW
+ * alias here. Execution faults at user_VA are redirected to the RX alias
+ * (which is the only address that's actually executable on iOS TXM).
+ * Declared above ios_pool_alloc_range so the allocator can purge stale
+ * entries when it recycles a pool range. */
+#define IOS_JIT_MAX_ANON_ALIASES 32
+struct ios_jit_anon_alias {
+    uintptr_t user_va;
+    uintptr_t user_va_end;
+    uintptr_t jit_rw_alias;
+    uintptr_t jit_rx_alias;
+};
+static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
+static volatile int ios_jit_anon_alias_count = 0;
+
 /* Allocate a page-aligned range from the pool head: free list first
  * (grace-expired first-fit; remainder returned to the list), bump second.
  * Returns (size_t)-1 on exhaustion WITHOUT consuming any pool space (the
  * old fetch_and_add-then-check burned the offset on every failed retry).
- * `pool_limit` = usable head bytes (pool size minus tail reservation). */
-static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
+ * `pool_limit` = usable head bytes (pool size minus tail reservation).
+ *
+ * anchor_off/max_dist (Steam S3 run 11 ROOT CAUSE): the x18 patcher emits
+ * B/BL from a module's .text to its trampoline range — ARM64 imm26 reaches
+ * only ±128MB, and with the 640MB pool + freelist fragmentation SHELL32's
+ * tramps landed 230MB below its image. The encoder silently truncated the
+ * offset (mod 256MB) → branches into untouched pool → the entire
+ * "poison pointer / zeroed tramp" crash family (runs 7-11, proven by
+ * imm26 0x90A311 == truncation of -0xDBD73BC). Pass anchor_off = the
+ * image's pool offset and max_dist to force the range within branch
+ * reach; (size_t)-1 anchor = unconstrained (old behavior). */
+static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
+                                       size_t anchor_off, size_t max_dist )
 {
     size_t off = (size_t)-1;
     time_t now = time( NULL );
     int i;
+
+#define IOS_POOL_IN_REACH(o) \
+    (anchor_off == (size_t)-1 || \
+     ((o) > anchor_off ? (o) + alloc_size - anchor_off : anchor_off - (o)) <= max_dist)
 
     pthread_mutex_lock( &ios_pool_lock );
 
@@ -233,6 +270,7 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
     {
         if (ios_pool_freelist[i].size < alloc_size) continue;
         if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        if (!IOS_POOL_IN_REACH(ios_pool_freelist[i].off)) continue;
         off = ios_pool_freelist[i].off;
         if (ios_pool_freelist[i].size > alloc_size)
         {
@@ -243,22 +281,73 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
         {
             ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
         }
-        dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges)\n",
-                (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count);
+        /* Task #22 root cause (2026-07-10 Steam): the sweep above marked this
+         * range volatile (MADV_FREE) and on Darwin that mark is NOT reliably
+         * cleared by rewriting these entry-backed pages — reused ranges kept
+         * getting harvested under the Steam download's memory pressure,
+         * zeroing LIVE FEX LookupCache/CodeBuffer data (same page reclaimed
+         * 4x at the same fault address, then the give-up → 24k-exception BUS
+         * storm = the "freeze", which drowned StikDebug = the "detach", then
+         * steam.exe died). MADV_FREE_REUSE is the documented cancel — apply
+         * it BEFORE handing the range out so the new owner's writes stick. */
+        {
+            int mr = -1;
+            if (ios_jit_rw_base_global)
+                mr = madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
+            dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges) reuse-cancel=%d%s\n",
+                    (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count,
+                    mr, mr ? " FAILED (still volatile!)" : "");
+        }
         break;
     }
 
     if (off == (size_t)-1)
     {
-        if (jit_pool_offset + alloc_size <= pool_limit)
+        if (jit_pool_offset + alloc_size <= pool_limit
+            && IOS_POOL_IN_REACH(jit_pool_offset))
         {
             off = jit_pool_offset;
             jit_pool_offset += alloc_size;
+            /* Same volatility belt as the freelist path — virgin pages
+             * shouldn't be MADV_FREE-marked, but under Steam-boot pressure
+             * we've seen freshly written pool content read back zero. */
+            if (ios_jit_rw_base_global)
+                madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
         }
     }
+#undef IOS_POOL_IN_REACH
 
     if (off != (size_t)-1)
     {
+        /* Steam S3 run 9/10: purge STALE anon-alias entries whose pool range
+         * overlaps the handed-out range. Aliases are only cleared on process
+         * EXIT — a live process (steam.exe) that guest-frees an anon RWX
+         * region leaves its entry behind, and once the pool range is
+         * recycled (user32's x18 trampolines in the errorreporter child) any
+         * guest MEM_DECOMMIT of the old user VA memsets the NEW occupant to
+         * zero via decommit_pages' alias path → blr into zeros → fault storm. */
+        {
+            uintptr_t new_rw_start = (uintptr_t)ios_jit_rw_base_global + off;
+            uintptr_t new_rw_end   = new_rw_start + alloc_size;
+            for (i = 0; i < ios_jit_anon_alias_count; i++)
+            {
+                uintptr_t a_start, a_end;
+                if (!ios_jit_anon_aliases[i].user_va) continue;
+                a_start = ios_jit_anon_aliases[i].jit_rw_alias;
+                a_end   = a_start + (ios_jit_anon_aliases[i].user_va_end
+                                     - ios_jit_anon_aliases[i].user_va);
+                if (a_start < new_rw_end && a_end > new_rw_start)
+                {
+                    dprintf(2, "[jit-pool] STALE alias purged on handout: user_va=%p rw=%p+0x%lx overlaps new range off=0x%lx+0x%lx\n",
+                            (void *)ios_jit_anon_aliases[i].user_va, (void *)a_start,
+                            (unsigned long)(a_end - a_start),
+                            (unsigned long)off, (unsigned long)alloc_size);
+                    ios_jit_anon_aliases[i].user_va_end = 0;
+                    __sync_synchronize();
+                    ios_jit_anon_aliases[i].user_va = 0;
+                }
+            }
+        }
         if (ios_pool_ledger_count < IOS_POOL_LEDGER_MAX)
         {
             ios_pool_ledger[ios_pool_ledger_count].off  = off;
@@ -272,6 +361,11 @@ static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
 
     pthread_mutex_unlock( &ios_pool_lock );
     return off;
+}
+
+static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
+{
+    return ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
 }
 
 /* Total bytes reserved from the pool TAIL by NtAllocateVirtualMemoryEx for
@@ -467,21 +561,6 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
         ios_jit_mapping_count);
     return STATUS_SUCCESS;
 }
-
-/* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
- * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
- * RX, writes via user_VA fault and the STR fault emulator looks up the RW
- * alias here. Execution faults at user_VA are redirected to the RX alias
- * (which is the only address that's actually executable on iOS TXM). */
-#define IOS_JIT_MAX_ANON_ALIASES 32
-struct ios_jit_anon_alias {
-    uintptr_t user_va;
-    uintptr_t user_va_end;
-    uintptr_t jit_rw_alias;
-    uintptr_t jit_rx_alias;
-};
-static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
-static volatile int ios_jit_anon_alias_count = 0;
 
 void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
 {
@@ -1118,6 +1197,24 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     int skipped = 0;
     int lit_skipped = 0;
     unsigned char *data_map = NULL;
+
+    /* B/BL reach guard (Steam S3 run 11 root cause): imm26 spans ±128MB.
+     * The patcher used to encode out-of-range tramp offsets silently
+     * truncated mod 256MB → branches into untouched pool (the run 7-11
+     * "poison pointer" crash family). The allocator now anchors tramp
+     * ranges near the image; this guard makes an out-of-reach pair a hard
+     * REFUSAL (unpatched x18 insns degrade to recoverable runtime faults,
+     * a truncated branch is fatal). */
+    {
+        intptr_t d1 = (tramp_rx + tramp_size) - text_rx;
+        intptr_t d2 = tramp_rx - (text_rx + text_size);
+        if (d1 > 0x7C00000 || d1 < -0x7C00000 || d2 > 0x7C00000 || d2 < -0x7C00000)
+        {
+            dprintf(2, "[x18-tramp] REFUSED: tramp %p+0x%lx out of B/BL reach of text %p+0x%lx\n",
+                    tramp_rx, (unsigned long)tramp_size, text_rx, (unsigned long)text_size);
+            return 0;
+        }
+    }
 
     /* Literal-pool guard (2026-07-07, conhost boot-death): .text embeds
      * DATA — every syscall stub ends `ldr x16, <lit>; ldr x16,[x16]; blr
@@ -2054,6 +2151,36 @@ static NTSTATUS ios_stub_unix_call(void *args) {
     return STATUS_NOT_SUPPORTED;
 }
 
+static NTSTATUS ios_stub_unix_call_ok(void *args) {
+    return STATUS_SUCCESS;
+}
+
+/* iOS-Mythic 2026-07-10: the unixlib "funcs" value handed back to the PE
+ * side is a TABLE that __wine_unix_call_dispatcher indexes as
+ * funcs[code](args) — storing a bare function there makes UNIX_CALL read
+ * the stub's own instruction bytes as a pointer and blr to garbage (the
+ * Steam vgui2/opengl32 crash). The no-unix-side fallback must therefore
+ * be a table of stubs. 4096 slots covers the largest builtin enum
+ * (opengl32 funcs_count = 3107). */
+#define IOS_STUB_TABLE_SIZE 4096
+static unixlib_entry_t ios_stub_unix_call_table[IOS_STUB_TABLE_SIZE];
+/* opengl32 variant: process_attach / thread_attach / process_detach
+ * (codes 0-2 in dlls/opengl32/unixlib.h) return SUCCESS so DllMain lets
+ * the DLL load; every real wgl/gl call fails with NOT_SUPPORTED (no host
+ * GL on iOS — DXMT is D3D-only, callers must treat GL as absent). */
+static unixlib_entry_t ios_gl_stub_unix_call_table[IOS_STUB_TABLE_SIZE];
+
+static pthread_once_t ios_stub_tables_once = PTHREAD_ONCE_INIT;
+static void ios_init_stub_tables(void)
+{
+    unsigned int i;
+    for (i = 0; i < IOS_STUB_TABLE_SIZE; i++)
+        ios_stub_unix_call_table[i] = ios_gl_stub_unix_call_table[i] = ios_stub_unix_call;
+    ios_gl_stub_unix_call_table[0] = ios_stub_unix_call_ok;  /* process_attach */
+    ios_gl_stub_unix_call_table[1] = ios_stub_unix_call_ok;  /* thread_attach */
+    ios_gl_stub_unix_call_table[2] = ios_stub_unix_call_ok;  /* process_detach */
+}
+
 /* DXMT's unix call table, statically linked into Mythic.app via
  * libdxmt_combined.a (originally __wine_unix_call_funcs, renamed in
  * winemetal_unix.c to avoid collision with our own ntdll table). */
@@ -2164,20 +2291,28 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
              * Activating this causes user32 process_attach to crash until
              * wineserver shared-memory bringup is complete; gated on the
              * MYTHIC_WIN32U env var so we can flip it on for debugging. */
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
             if (getenv("MYTHIC_WIN32U")) {
                 NTSTATUS s = win32u_unix_lib_init();
-                *funcs = (const void *)ios_stub_unix_call;
+                *funcs = (const void *)ios_stub_unix_call_table;
                 WARN_(module)("iOS: module %p (%s) -> win32u_unix_lib_init() = 0x%x (ACTIVE)\n",
                               module, match, s);
             } else {
-                *funcs = (const void *)ios_stub_unix_call;
+                *funcs = (const void *)ios_stub_unix_call_table;
                 WARN_(module)("iOS: module %p (%s) -> win32u unix lib linked but dormant\n",
                               module, match);
             }
             status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "opengl32")) {
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
+            *funcs = (const void *)ios_gl_stub_unix_call_table;
+            WARN_(module)("iOS: module %p (%s) -> GL-absent stub table (attach ok, wgl/gl NOT_SUPPORTED)\n",
+                          module, match);
+            status = STATUS_SUCCESS;
         } else {
-            *funcs = (const void *)ios_stub_unix_call;
-            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub\n",
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
+            *funcs = (const void *)ios_stub_unix_call_table;
+            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub table\n",
                           module, up ? up : "(null)", modname ? modname : "(null)");
             status = STATUS_SUCCESS;
         }
@@ -4069,7 +4204,12 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
                         size_t tramp_budget = ios_jit_x18_tramp_need((char *)jit_rw_base + offset + text_off, text_sz);
                         size_t tramp_alloc = (tramp_budget + page_size - 1) & ~(page_size - 1);
-                        size_t tramp_pool_off = ios_pool_alloc_range(tramp_alloc, jit_pool_size - ios_jit_tail_reserved);
+                        /* Anchored within B/BL imm26 reach of the image (root
+                         * cause of the Steam run 7-11 crash family: tramps
+                         * 230MB from .text → silently truncated branches). */
+                        size_t tramp_pool_off = ios_pool_alloc_range_ex(tramp_alloc,
+                                jit_pool_size - ios_jit_tail_reserved,
+                                offset, 0x5000000 /* 80MB; text ≤32MB keeps worst case <128MB */);
 
                         if (tramp_pool_off != (size_t)-1)
                         {
@@ -4356,7 +4496,10 @@ int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
         extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
         size_t tramp_need = ios_jit_x18_tramp_need(rw_dest + m->text_offset, m->text_size);
         size_t tramp_alloc = (tramp_need + pg - 1) & ~(pg - 1);
-        size_t tramp_off = ios_pool_alloc_range(tramp_alloc, ios_jit_pool_size_global - ios_jit_tail_reserved);
+        size_t tramp_off = ios_pool_alloc_range_ex(tramp_alloc,
+                ios_jit_pool_size_global - ios_jit_tail_reserved,
+                (size_t)(rx_dest - (char *)ios_jit_rx_base_global),
+                0x5000000 /* B/BL imm26 reach — see ios_pool_alloc_range_ex */);
         if (tramp_off != (size_t)-1)
         {
             int patched = ios_jit_patch_x18(
@@ -4971,7 +5114,43 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     }
     else host_end = ROUND_ADDR( base + size, host_page_mask );
 
-    if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+    /* iOS-Mythic (task #22 real root cause, 2026-07-10): FEX's Windows
+     * VirtualDontNeed() = MEM_DECOMMIT (often WITHOUT recommit — LookupCache
+     * uses it as a cheap bzero on every cache clear) and then touches the
+     * pages again assuming Linux MADV_DONTNEED semantics (still mapped,
+     * reads return zero). The upstream PROT_NONE mmap-over therefore turned
+     * every Steam module-load cache-clear into a recurring BUS-fault burst
+     * on the SAME pages (retry#1..63 in one run), and on anon-RWX ranges it
+     * silently DESTROYED the pool vm_remap alias (decoupled user VA from the
+     * pool RW/RX views). Give decommit Linux-like semantics instead:
+     *  - alias-backed range: memset the RW alias (zero contract), keep the
+     *    mapping and the alias intact;
+     *  - plain range: mmap-over RW (fresh zero pages, still accessible) and
+     *    zero the partial host pages at the edges by hand. */
+    {
+        extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
+        uintptr_t rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
+        if (rw_alias)
+        {
+            memset( (void *)rw_alias, 0, size );
+        }
+        else if (host_start < host_end)
+        {
+            anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+            /* Zero the guest sub-ranges on partial host pages the mmap-over
+             * couldn't cover — FEX relies on decommit-as-bzero, and stale
+             * LookupCache entries surviving at the edges would run wrong
+             * blocks. Edge pages belong to the same committed RW guest heap. */
+            if ((char *)base < host_start) memset( base, 0, host_start - (char *)base );
+            if (host_end < (char *)base + size) memset( host_end, 0, (char *)base + size - host_end );
+        }
+        else
+        {
+            /* Range lies within a single host page — no full page to remap;
+             * zero it in place to honour the decommit-as-bzero contract. */
+            memset( base, 0, size );
+        }
+    }
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
@@ -7811,7 +7990,16 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
+        else
+        {
+            /* iOS-Mythic (task #22): never MADV_DONTNEED an anon-RWX pool
+             * alias — discarding the shared entry pages silently zeroes the
+             * pool RX view too (live FEX code/data). MEM_RESET is advisory,
+             * so skipping it is legal. */
+            extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
+            if (!ios_jit_anon_alias_lookup( (uintptr_t)base ))
+                madvise( base, size, MADV_DONTNEED );
+        }
     }
     else  /* commit the pages */
     {

@@ -140,6 +140,7 @@ REPLACEMENTS=(
     "queue.o:queue.o"
     "mapping.o:mapping.o"
     "winstation.o:winstation.o"
+    "sock.o:sock.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do
