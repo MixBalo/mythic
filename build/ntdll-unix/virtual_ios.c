@@ -473,14 +473,38 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i;
 
-    /* Dedupe by pe_base: every PROT_EXEC section of an image triggers
-     * mprotect_exec → which copies the WHOLE image and calls this. Without
-     * this check we'd record N entries for a single DLL (one per exec
-     * section) and the first match in ios_jit_translate_addr would still
-     * win, but the table fills up uselessly. Skip duplicates silently. */
+    /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
+     * A fresh PE image at [pe_base, pe_base+size) proves any overlapping
+     * entry is STALE — two live images cannot occupy the same VA in the
+     * single shared address space. The old module was unmapped (FreeLibrary
+     * or pseudo-proc teardown) without this table hearing about it, and
+     * mmap reused its VA. A surviving stale entry shadows the new one on
+     * first-match: translate/sync_write of addresses in the overlap target
+     * the DEAD pool copy (observed: CEF child's EC-ntdll dispatcher slot
+     * synced into a dead copy while execution read the live copy's slot =
+     * 0 → blr x16=0 null-exec storm). The old exact-pe_base dedupe was the
+     * same disease — a LIVE image never reaches this call twice, because
+     * mprotect_exec's already-copied check early-outs; only a stale entry
+     * at the exact same VA could match, and returning kept translation on
+     * the dead copy. Tombstone write order matches reclaim (size=0 first —
+     * a zero-size entry matches no query — barrier, then pe_base=NULL) so
+     * the lock-free readers never see a half-dead entry. */
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
-        if (ios_jit_mappings[i].pe_base == pe_base) return;
+        uintptr_t eb = (uintptr_t)ios_jit_mappings[i].pe_base;
+        uintptr_t nb = (uintptr_t)pe_base;
+        if (!ios_jit_mappings[i].pe_base) continue;
+        if (eb < nb + size && nb < eb + ios_jit_mappings[i].size)
+        {
+            dprintf(2, "[jit-pool] STALE image mapping purged on add: pe=%p+0x%lx jit=%p owner=%p"
+                    " (overlaps new image %p+0x%lx)\n",
+                    (void *)eb, (unsigned long)ios_jit_mappings[i].size,
+                    ios_jit_mappings[i].jit_base, ios_jit_mappings[i].owner_peb,
+                    pe_base, (unsigned long)size);
+            ios_jit_mappings[i].size = 0;
+            __sync_synchronize();
+            ios_jit_mappings[i].pe_base = NULL;
+        }
     }
 
     /* Task #25: prefer a tombstoned slot (pe_base==NULL, left by pool
@@ -8105,7 +8129,89 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     else
         limit = 0;
 
+#ifdef WINE_IOS
+    {
+        NTSTATUS st;
+        /* task#29 CEF: PartitionAlloc (chrome_elf DllMain) reserves multi-GB
+         * pools (16GB pool + 16GB align slack = one 32GB kernel-pick). iOS
+         * caps user VA at 0x8000000000 (39-bit; the extended-VA entitlement
+         * is not available to free personal teams), and wine's furniture
+         * (PE images, TEBs, stacks, EC bitmap) clusters at the TOP of that
+         * space, so jumbo kernel-picks die of top-of-space fragmentation
+         * (probe ml59: 0x800000000 reserve -> c0000017 twice -> chrome_elf
+         * OOM immediate-crash) — while ~200GB sits empty in the middle.
+         * Steer jumbo (>=1GB) kernel-pick reserves into the middle zone
+         * [0x4000000000, 0x7800000000); fall back to the default search if
+         * the zone ever fills. */
+        if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) && !limit)
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          0x4000000000ULL, 0x77ffffffffULL, 0, 0 );
+            if (st)
+            {
+                dprintf(2, "[jumbo] middle-zone place failed (0x%x) for size=0x%lx — falling back to default search\n",
+                        (unsigned)st, (unsigned long)*size_ptr);
+                st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+            }
+        }
+        else
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+            /* task#29 CEF plan C: a HINTED jumbo reserve that fails placement
+             * is retried as kernel-pick. Windows semantics say fail on
+             * conflict, but PartitionAlloc-style callers use the returned
+             * pointer (the hint is just ASLR seasoning) and its hints are
+             * 47-bit randoms that can never fit under the iOS 512GB VA
+             * ceiling. Serving from wherever we have room lets PA take its
+             * aligned pool from the top hole instead of dying in the 32GB
+             * fallback. Jumbo-only, loudly logged. */
+            if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
+            {
+                void *hint = *ret;
+                void *pick = NULL;
+                SIZE_T sz = *size_ptr;
+                NTSTATUS st2 = STATUS_NO_MEMORY;
+                /* Preserve the hint's offset within its natural alignment:
+                 * PartitionAlloc hints (16GB boundary - 64KB) encode a
+                 * guard-before-pool layout and it REJECTS a redirect that is
+                 * merely 16GB-aligned (observed ml62: 0x7800000000 handed
+                 * back three times, freed each time, then the fatal 32GB
+                 * fallback). Walk the aligned slots in the usable top arena
+                 * and try hint_offset-preserving fixed placements first. */
+                ULONG_PTR align_unit = 0x400000000ULL;              /* 16GB */
+                ULONG_PTR off = (ULONG_PTR)hint & (align_unit - 1);
+                ULONG_PTR slot;
+                for (slot = 0x7C00000000ULL; slot >= 0x6800000000ULL && st2; slot -= align_unit)
+                {
+                    void *cand = (void *)(slot + off - (off ? align_unit : 0));
+                    SIZE_T csz = *size_ptr;
+                    if ((ULONG_PTR)cand < 0x6000000000ULL) break;
+                    pick = cand;
+                    st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                    if (!st2) sz = csz;
+                }
+                if (st2)
+                {
+                    pick = NULL;
+                    sz = *size_ptr;
+                    st2 = allocate_virtual_memory( &pick, &sz, type, protect, 0, 0, 0, 0 );
+                }
+                dprintf(2, "[jumbo] hinted reserve %p size=0x%lx failed (0x%x) — offset-preserving retry -> %p (0x%x)\n",
+                        hint, (unsigned long)*size_ptr, (unsigned)st, pick, (unsigned)st2);
+                if (!st2)
+                {
+                    *ret = pick;
+                    *size_ptr = sz;
+                    st = STATUS_SUCCESS;
+                }
+            }
+        }
+
+        return st;
+    }
+#else
     return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+#endif
 }
 
 
@@ -8335,8 +8441,31 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         return result.virtual_alloc_ex.status;
     }
 
+#ifdef WINE_IOS
+    {
+        NTSTATUS st;
+        /* task#29 CEF jumbo-reserve middle-zone steering — see
+         * NtAllocateVirtualMemory for the rationale. Only when the caller
+         * imposed no constraints of its own. */
+        if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) &&
+            !align && !limit_low && !limit_high)
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          0x4000000000ULL, 0x77ffffffffULL, 0, attributes );
+            if (st)
+                st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                              limit_low, limit_high, align, attributes );
+        }
+        else
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          limit_low, limit_high, align, attributes );
+
+        return st;
+    }
+#else
     return allocate_virtual_memory( ret, size_ptr, type, protect,
                                     limit_low, limit_high, align, attributes );
+#endif
 }
 
 
