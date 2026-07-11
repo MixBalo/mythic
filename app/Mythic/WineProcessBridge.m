@@ -14,6 +14,8 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <setjmp.h>
+#include <stdlib.h>
+#include <errno.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
@@ -26,6 +28,7 @@ _Thread_local jmp_buf wine_ios_exit_jmpbuf;
 _Thread_local volatile int wine_ios_exit_code = 0;
 _Thread_local pthread_t wine_ios_main_thread;
 _Thread_local int wine_ios_exit_initialized = 0;
+
 
 static os_log_t wine_proc_log(void) {
     static os_log_t log;

@@ -1381,56 +1381,114 @@ static void *ios_mach_exception_thread( void *arg )
              * repeat guard so an ineffective mprotect can't spin forever. */
             {
                 uint64_t fa = (uint64_t)fault_addr;
-                if (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+
+                /* task #34 (ml74): EXECUTE fault on a code page — the RW grant
+                 * below can never fix it (observed: retry#1..51 on
+                 * 0x7ecaf00000, RW mprotect "succeeds", same fault forever;
+                 * and the fatal walk in the pool RX view at 0x125115ce0 whose
+                 * page had become prot=RW max_prot=RW). Handle code ranges
+                 * FIRST: try to restore R|X — works when the pool/copy
+                 * mapping is intact and only lost its protection. If mprotect
+                 * RX fails, max_prot lost X = the mapping was REPLACED (see
+                 * [jit-tripwire] in virtual_ios.c) — nothing in-handler can
+                 * fix that; log the vm_region ground truth and fall through
+                 * so the fault surfaces instead of spinning. */
+                if (!handled && fa == (uint64_t)fault_pc)
                 {
-                    if (!handled)
+                    extern void *ios_jit_rx_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                    int in_pool_rx = rx && fa >= rx && fa < rx + ios_jit_pool_size_global;
+                    int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
+
+                    if (in_pool_rx || in_band)
                     {
-                        static volatile uint64_t rr_pg[16] = {0};
-                        static volatile uint32_t rr_n[16]  = {0};
-                        /* iOS uses 16KB host pages. NOTE: `host_page_size` in this
-                         * file resolves to the Mach *function*, not a size — using
-                         * it as a value gave a garbage mask (mprotect EINVAL). */
-                        enum { RR_PAGE = 0x4000 };
+                        enum { XR_PAGE = 0x4000 };
+                        uint64_t pg = fa & ~(uint64_t)(XR_PAGE - 1);
+                        static volatile uint64_t xr_pg[16] = {0};
+                        static volatile uint32_t xr_n[16]  = {0};
+                        int s = (int)((pg >> 14) & 15);
+                        int giveup = 0;
+                        if (xr_pg[s] == pg) { if (++xr_n[s] > 8) giveup = 1; }
+                        else { xr_pg[s] = pg; xr_n[s] = 1; }
 #ifndef MADV_FREE_REUSE
 #define MADV_FREE_REUSE 8
 #endif
-                        uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
-                        int s = (int)((pg >> 14) & 15);
-                        int giveup = 0;
-                        /* Task #22: was >4 — Steam's download pressure re-harvested
-                         * the same still-volatile page 5+ times and the give-up
-                         * escalated into a 24k-exception BUS storm (freeze →
-                         * StikDebug detach → terminate). MADV_FREE_REUSE below
-                         * makes each recovery permanent, so repeats should stop;
-                         * the higher cap is a belt for volatility we can't clear. */
-                        if (rr_pg[s] == pg) { if (++rr_n[s] > 64) giveup = 1; }
-                        else { rr_pg[s] = pg; rr_n[s] = 1; }
                         if (!giveup)
                         {
-                            int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
+                            /* Restore R|X. Works when the pool RX view / arm64ec
+                             * pool-copy mapping is intact and only lost protection
+                             * under reclaim. MADV_FREE_REUSE cancels any residual
+                             * volatility so the page isn't immediately re-harvested. */
+                            int mpr = mprotect( (void *)(uintptr_t)pg, XR_PAGE, PROT_READ | PROT_EXEC );
                             int errno_save = errno;
-                            int used_mmap = 0;
-                            if (mpr != 0)   /* page may be UNMAPPED, not just PROT_NONE — remap fresh */
-                            {
-                                void *r = mmap( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE,
-                                                MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
-                                used_mmap = (r == (void *)(uintptr_t)pg);
-                            }
-                            /* Clear the volatile mark that let iOS take the page in
-                             * the first place (pool freelist MADV_FREE, task #25) —
-                             * without this the SAME page gets re-harvested after FEX
-                             * repopulates it (observed retry#1..4, identical fault
-                             * address, 2026-07-10). */
-                            int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
-                            static volatile int rc = 0;
-                            int rcn = __sync_fetch_and_add(&rc, 1);
-                            if (rcn < 40 || (rcn % 50) == 0)
+                            int reuse = madvise( (void *)(uintptr_t)pg, XR_PAGE, MADV_FREE_REUSE );
+                            static volatile int xrc = 0;
+                            int xrcn = __sync_fetch_and_add(&xrc, 1);
+                            if (xrcn < 40 || (xrcn % 50) == 0)
                                 dprintf(STDERR_FILENO,
-                                    "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u\n",
+                                    "[exec-recover] pg=0x%llx fault=0x%llx mprotect_rx=%d(errno=%d) reuse-cancel=%d retry#%u %s\n",
                                     (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
-                                    used_mmap, reuse, rr_n[s]);
-                            if (mpr == 0 || used_mmap) handled = 1;
+                                    reuse, xr_n[s], in_pool_rx ? "pool-rx" : "band");
+                            if (mpr == 0) handled = 1;
+                            /* else: mprotect RX failed => max_prot lost EXECUTE =>
+                             * the code page was REPLACED by a plain RW mapping
+                             * ([jit-tripwire] names the culprit). Nothing here can
+                             * re-add X; leave handled=0 and fall through to the
+                             * unhandled path, which dumps vm_region ground truth
+                             * and surfaces the fault instead of spinning forever. */
                         }
+                    }
+                }
+
+                /* DATA fault reclaim recovery in the FEX host-arena band
+                 * (FEX-2607 Thumper path): a page Wine/FEX consider committed
+                 * gets reclaimed under memory pressure — 2607's per-thread 96MB
+                 * LookupCaches push over the jetsam limit, so L1/L2/cache pages
+                 * are dropped and the re-access faults with no other handler.
+                 * Force the page back with mprotect(RW); zero-filled is correct
+                 * for FEX's caches (a zero L1/L2 slot reads "empty" -> recompile).
+                 * Gated to the host-arena band AND to non-execute faults so it
+                 * can't shadow the R|X path above or mask guest/null-deref faults.
+                 * Task #22: cap was >4 — Steam's download pressure re-harvested
+                 * the same still-volatile page 5+ times; MADV_FREE_REUSE makes
+                 * recovery permanent, the higher cap is a belt for residual
+                 * volatility. */
+                if (!handled && fa != (uint64_t)fault_pc &&
+                    fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
+                {
+                    static volatile uint64_t rr_pg[16] = {0};
+                    static volatile uint32_t rr_n[16]  = {0};
+                    /* iOS uses 16KB host pages. NOTE: `host_page_size` in this
+                     * file resolves to the Mach *function*, not a size — using
+                     * it as a value gave a garbage mask (mprotect EINVAL). */
+                    enum { RR_PAGE = 0x4000 };
+                    uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
+                    int s = (int)((pg >> 14) & 15);
+                    int giveup = 0;
+                    if (rr_pg[s] == pg) { if (++rr_n[s] > 64) giveup = 1; }
+                    else { rr_pg[s] = pg; rr_n[s] = 1; }
+                    if (!giveup)
+                    {
+                        int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
+                        int errno_save = errno;
+                        int used_mmap = 0;
+                        if (mpr != 0)   /* page may be UNMAPPED, not just PROT_NONE — remap fresh */
+                        {
+                            void *r = mmap( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
+                            used_mmap = (r == (void *)(uintptr_t)pg);
+                        }
+                        int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
+                        static volatile int rc = 0;
+                        int rcn = __sync_fetch_and_add(&rc, 1);
+                        if (rcn < 40 || (rcn % 50) == 0)
+                            dprintf(STDERR_FILENO,
+                                "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u\n",
+                                (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
+                                used_mmap, reuse, rr_n[s]);
+                        if (mpr == 0 || used_mmap) handled = 1;
                     }
                 }
             }
@@ -1495,6 +1553,40 @@ static void *ios_mach_exception_thread( void *arg )
                             cnt, (unsigned long long)state_rip_q,
                             (unsigned long long)fault_pc_check,
                             first_seen ? " [first]" : "");
+                    }
+                    /* TEMP [rip-leak] task#34 ml64-class: guest RIP inside a
+                     * JIT-POOL mapping means a pool-translated pointer leaked
+                     * into guest control flow (guest must only ever see PE
+                     * VAs; ml64 ran away executing dbghelp's pool ARM64 .text
+                     * as x86). Name the module+RVA and dump the guest return
+                     * stack so the SOURCE of the poisoned pointer is
+                     * identifiable. Capped. STRIP BEFORE COMMIT. */
+                    if (first_seen && state_rip_q)
+                    {
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        uint64_t mod_base = 0;
+                        uint64_t pe = ios_jit_reverse_translate( state_rip_q, &mod_base );
+                        static int leak_n;
+                        if (pe && leak_n < 12)
+                        {
+                            uint64_t rsp = state.__x[23];  /* ARM64EC SRA: RSP=x23 */
+                            uint64_t stk[8] = { 0 };
+                            vm_size_t outsz = sizeof(stk);
+                            leak_n++;
+                            vm_read_overwrite( mach_task_self(), rsp, sizeof(stk),
+                                               (vm_address_t)stk, &outsz );
+                            dprintf(STDERR_FILENO,
+                                "[rip-leak] guest RIP 0x%llx IS POOL addr = PE 0x%llx (module base 0x%llx rva 0x%llx)\n"
+                                "[rip-leak] guest RSP=0x%llx stack: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                                (unsigned long long)state_rip_q, (unsigned long long)pe,
+                                (unsigned long long)mod_base,
+                                (unsigned long long)(pe - mod_base),
+                                (unsigned long long)rsp,
+                                (unsigned long long)stk[0], (unsigned long long)stk[1],
+                                (unsigned long long)stk[2], (unsigned long long)stk[3],
+                                (unsigned long long)stk[4], (unsigned long long)stk[5],
+                                (unsigned long long)stk[6], (unsigned long long)stk[7]);
+                        }
                     }
                 }
                 if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)
@@ -3056,6 +3148,25 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     CONTEXT context;
 
     rec->ExceptionAddress = (void *)PC_sig(sigcontext);
+#ifdef WINE_IOS
+    /* task#34 guest-exception-DISPATCH: when the faulting pc is inside a
+     * JIT-pool IMAGE COPY, the guest-visible record must carry the PE VA —
+     * handlers compare ExceptionAddress against module bounds and the SEH
+     * machinery resolves unwind info by module. (pcs inside FEX-emitted
+     * code translate to nothing here and are left alone — reconstructing
+     * the guest RIP for those is ResetToConsistentState's job on the PE
+     * side.) The resume context keeps the real host pc. */
+    {
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        uint64_t pe = ios_jit_reverse_translate( (uint64_t)PC_sig(sigcontext), NULL );
+        if (pe)
+        {
+            rec->ExceptionAddress = (void *)(uintptr_t)pe;
+            ERR( "setup_exception: pool pc %p -> PE ExceptionAddress %p\n",
+                 (void *)PC_sig(sigcontext), rec->ExceptionAddress );
+        }
+    }
+#endif
     save_context( &context, sigcontext );
     setup_raise_exception( sigcontext, rec, &context );
 }

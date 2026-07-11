@@ -260,6 +260,30 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
     {
         if (ios_pool_freelist[i].advised) continue;
         if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        /* task #34 belt: NEVER volatilize a range that overlaps a LIVE ledger
+         * entry. Freelist and ledger are disjoint by design (free removes the
+         * ledger entry), so any overlap here is an accounting bug — and
+         * MADV_FREE on live pool memory is exactly the "iOS zero-harvests
+         * executing code" death seen in ml74 (Steam pressure makes the
+         * harvest actually happen; Thumper never pushed hard enough). Skip
+         * the range, log loudly, and keep it un-advised so we re-check. */
+        {
+            int j, live_overlap = 0;
+            size_t f_off = ios_pool_freelist[i].off, f_end = f_off + ios_pool_freelist[i].size;
+            for (j = 0; j < ios_pool_ledger_count; j++)
+            {
+                size_t l_off = ios_pool_ledger[j].off, l_end = l_off + ios_pool_ledger[j].size;
+                if (l_off < f_end && l_end > f_off) { live_overlap = 1; break; }
+            }
+            if (live_overlap)
+            {
+                dprintf(2, "[jit-pool] SWEEP SKIPPED live-overlap: freed off=0x%lx+0x%lx overlaps ledger off=0x%lx+0x%lx peb=%p — accounting bug, NOT volatilizing\n",
+                        (unsigned long)f_off, (unsigned long)(f_end - f_off),
+                        (unsigned long)ios_pool_ledger[j].off, (unsigned long)ios_pool_ledger[j].size,
+                        ios_pool_ledger[j].peb);
+                continue;
+            }
+        }
         if (ios_jit_rw_base_global)
             madvise( (char *)ios_jit_rw_base_global + ios_pool_freelist[i].off,
                      ios_pool_freelist[i].size, MADV_FREE );
@@ -1580,12 +1604,18 @@ static inline BOOL is_vprot_exec_write( BYTE vprot )
     return (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY));
 }
 
+/* task #34 [jit-tripwire]: defined below; forward-declared so the fixed-map
+ * helpers above its definition can instrument JIT-pool-range clobbers. */
+static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,
+                                    int prot, void *retaddr );
+
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
+    ios_jit_range_tripwire( "anon_mmap_fixed", start, size, prot, __builtin_return_address(0) );
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
 
@@ -1595,6 +1625,33 @@ void *anon_mmap_alloc( size_t size, int prot )
     assert( !(size & host_page_mask) );
 
     return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+}
+
+/* task #34 [jit-tripwire]: ml74's fatal page (0x125114000, inside the JIT
+ * pool RX view) faulted on EXECUTE with prot=RW max_prot=RW. max_prot can
+ * only DROP via a fresh mapping, never via mprotect — so some path REPLACED
+ * a pool code page with a plain RW anon mapping (MAP_FIXED clobber, or a
+ * munmap whose hole a later kernel-pick refilled). Every wine unmap and
+ * fixed-map flows through unmap_area / remove_reserved_area /
+ * anon_mmap_fixed / anon_mmap_tryfixed: log any call intersecting the pool
+ * RX view or its RW alias, with the instrumented site's return address, so
+ * one device run names the culprit. Legit hits exist (pool tail EC_CODE
+ * carves, decommit of pool-backed anon RWX) — the log includes the range so
+ * they can be told apart from clobbers of live image-copy code. */
+static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,
+                                    int prot, void *retaddr )
+{
+    uintptr_t a = (uintptr_t)addr, e = a + size;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    static volatile int n;
+
+    if (!ps || !addr || !size) return;
+    if (!((rx && a < rx + ps && e > rx) || (rw && a < rw + ps && e > rw))) return;
+    if (__sync_fetch_and_add( &n, 1 ) > 300) return;
+    dprintf(2, "[jit-tripwire] %s addr=%p size=0x%lx prot=%d caller=%p (pool rx=%p rw=%p)\n",
+            tag, addr, (unsigned long)size, prot, retaddr, (void *)rx, (void *)rw);
 }
 
 #ifdef USE_UFFD_WRITEWATCH
@@ -1909,6 +1966,9 @@ static size_t unmap_area_above_user_limit( void *addr, size_t size )
 static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
     void *ptr;
+
+    /* no [jit-tripwire] here: tryfixed is no-clobber by definition (fails on
+     * overlap), and ml75 showed it drowns the cap in pool-setup boot noise. */
 
 #ifdef MAP_FIXED_NOREPLACE
     ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
@@ -3296,12 +3356,19 @@ static void remove_reserved_area( void *addr, size_t size )
     {
         if ((char *)view->base >= (char *)addr + size) break;
         if ((char *)view->base + view->size <= (char *)addr) continue;
-        if (view->base > addr) munmap( addr, (char *)view->base - (char *)addr );
+        if (view->base > addr)
+        {
+            ios_jit_range_tripwire( "remove_reserved_area", addr,
+                                    (char *)view->base - (char *)addr, -1,
+                                    __builtin_return_address(0) );
+            munmap( addr, (char *)view->base - (char *)addr );
+        }
         if ((char *)view->base + view->size > (char *)addr + size) return;
         view_size = ROUND_SIZE( view->base, view->size, host_page_mask );
         size = (char *)addr + size - ((char *)view->base + view_size);
         addr = (char *)view->base + view_size;
     }
+    ios_jit_range_tripwire( "remove_reserved_area", addr, size, -1, __builtin_return_address(0) );
     munmap( addr, size );
 }
 
@@ -3319,6 +3386,8 @@ static void unmap_area( void *start, size_t size )
 
     assert( !((UINT_PTR)start & host_page_mask) );
     size = ROUND_SIZE( 0, size, host_page_mask );
+
+    ios_jit_range_tripwire( "unmap_area", start, size, -1, __builtin_return_address(0) );
 
     if (!(size = unmap_area_above_user_limit( start, size ))) return;
 

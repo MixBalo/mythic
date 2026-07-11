@@ -1225,7 +1225,15 @@ struct ContentView: View {
             // 640 MB clears the current fan-out with headroom to reach the
             // ole32 delay-load (FEX riprel probe) and beyond. The real fix for
             // the PHYSICAL duplication is .text sharing (deferred project).
-            let poolSizeMB = 640
+            //
+            // 2026-07-10 pm (task #34 / CEF): 896 MB — libcef.dll's 212MB
+            // pool copy EXHAUSTED 640 (bump 412MB + no contiguous 212MB →
+            // libcef load degraded → init CHECK). Pure-x64 skip-copy was
+            // trialed and reverted (broke x18-trampoline layout, ml68);
+            // until skip-copy or .text sharing lands, buy headroom. Virtual
+            // is jetsam-exempt; the copy itself is ~212MB real RSS when
+            // written.
+            let poolSizeMB = 896
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)

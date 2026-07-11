@@ -910,6 +910,68 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
             }
         }
     }
+
+    /* task #34 single-process CEF: the 64GB VA window above the GPU carveout
+     * can hold exactly ONE CEF instance's PartitionAlloc pools + one V8
+     * sandbox (see virtual_ios.c slot allocator). Force steamwebhelper into
+     * Chromium single-process mode so browser/gpu/renderer/utility all run
+     * as threads of one pseudo-process, and refuse any --type= child it
+     * still tries to spawn (e.g. crashpad-handler) — a second instance
+     * would re-init both static PA copies and exhaust the slots. Chromium
+     * tolerates a failed crashpad spawn (continues without crash upload). */
+    {
+        static const char helper[] = "steamwebhelper.exe";
+        static const char typesw[] = "--type=";
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        int hl = sizeof(helper) - 1, k, j;
+        int is_helper = 0;
+        for (k = 0; k + hl <= ip_len && !is_helper; k++)
+        {
+            for (j = 0; j < hl; j++)
+            {
+                WCHAR c = ip[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)helper[j]) break;
+            }
+            if (j == hl) is_helper = 1;
+        }
+        if (is_helper)
+        {
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+            int tl = sizeof(typesw) - 1, has_type = 0;
+            for (k = 0; k + tl <= cl_len && !has_type; k++)
+            {
+                for (j = 0; j < tl; j++)
+                    if (cl[k + j] != (WCHAR)typesw[j]) break;
+                if (j == tl) has_type = 1;
+            }
+            if (has_type)
+            {
+                dprintf(2, "[proc-gate] REFUSING steamwebhelper --type= child (single-process mode; task #34)\n");
+                return STATUS_ACCESS_DENIED;
+            }
+            /* Append --single-process to the browser instance's command line.
+             * The new buffer intentionally leaks (once per helper launch);
+             * RtlDestroyProcessParameters only frees the params block itself. */
+            {
+                static const char sp[] = " --single-process";
+                int sl = sizeof(sp) - 1;
+                WCHAR *nbuf = malloc( (cl_len + sl + 1) * sizeof(WCHAR) );
+                if (nbuf)
+                {
+                    memcpy( nbuf, cl, cl_len * sizeof(WCHAR) );
+                    for (j = 0; j < sl; j++) nbuf[cl_len + j] = (WCHAR)sp[j];
+                    nbuf[cl_len + sl] = 0;
+                    params->CommandLine.Buffer = nbuf;
+                    params->CommandLine.Length = (cl_len + sl) * sizeof(WCHAR);
+                    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                    dprintf(2, "[proc-gate] steamwebhelper: injected --single-process (task #34)\n");
+                }
+            }
+        }
+    }
 #endif
 
     unixdir = get_unix_curdir( params );
