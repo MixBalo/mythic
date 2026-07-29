@@ -27,10 +27,12 @@
 #ifdef WINE_IOS
 #include <os/log.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <time.h>
 /* From signal_arm64_ios.c — written by __wine_syscall_dispatcher at entry */
 extern volatile uint64_t g_wine_dispatcher_x18;
 extern volatile uint64_t g_wine_dispatcher_count;
@@ -161,12 +163,69 @@ sigset_t server_block_set;  /* signals to block during server calls */
  * Wine process — a POSIX fd is process-wide, and in-process CreateThread
  * callers (e.g. DXMT's command-queue encode/finish threads) must reuse it.
  *
- * When CreateProcess child-process work is revived, each child-thread will
- * need its own fd_socket; the stashed approach used _Thread_local here, but
- * that silently broke in-process CreateThread because new threads got a -1
- * value and sendmsg failed. Per-child fd_socket will need a different
- * mechanism (e.g. keyed off a child-id set during thread setup). */
+ * S1 pseudo-processes: each child "process" has its OWN master socket, and
+ * the server detects process death by EOF on it. This global belongs to the
+ * PARENT only; children register theirs in ios_proc_sockets below, keyed by
+ * PEB (the pseudo-process identity — all the child's threads inherit it via
+ * TEB->Peb). The old code overwrote this global with the newest child's
+ * socket, so the SECOND process to exit closed an already-closed fd, its own
+ * socket stayed open, and wineserver reported it STILL_ACTIVE forever
+ * (2026-07-05 3-deep-tree bug). _Thread_local was tried before and broke
+ * in-process CreateThread (new threads saw -1). */
 static int fd_socket = -1;
+
+#ifdef WINE_IOS
+#define IOS_MAX_PROC_SOCKETS 64
+static struct ios_proc_socket
+{
+    void *peb;      /* NULL = free slot */
+    int fd;         /* this pseudo-process's master socket to wineserver */
+    BOOL exiting;   /* per-process process_exiting flag */
+} ios_proc_sockets[IOS_MAX_PROC_SOCKETS];
+static int ios_proc_socket_count = 0;
+
+extern void *ios_jit_current_peb(void);
+
+static int ios_proc_socket_index(void)
+{
+    void *cur = ios_jit_current_peb();
+    int i, n = ios_proc_socket_count;
+    if (cur)
+        for (i = 0; i < n; i++)
+            if (ios_proc_sockets[i].peb == cur) return i;
+    return -1;
+}
+
+/* Master socket for the CURRENT thread's pseudo-process (parent = global). */
+static int ios_current_fd_socket(void)
+{
+    int i = ios_proc_socket_index();
+    return (i >= 0) ? ios_proc_sockets[i].fd : fd_socket;
+}
+
+/* Per-process process_exiting flag (used by NtTerminateProcess). A global
+ * flag poisons every OTHER pseudo-process's exit path once the first one
+ * dies (they skip their self-terminate and the server never hears). */
+BOOL *ios_process_exiting_ptr(void)
+{
+    int i = ios_proc_socket_index();
+    return (i >= 0) ? &ios_proc_sockets[i].exiting : &process_exiting;
+}
+
+static void ios_register_proc_socket(void *peb_id, int fd)
+{
+    int idx = __sync_fetch_and_add(&ios_proc_socket_count, 1);
+    if (idx >= IOS_MAX_PROC_SOCKETS)
+    {
+        wine_log_write("[Wine child] proc-socket table FULL (%d)!", idx);
+        return;
+    }
+    ios_proc_sockets[idx].fd = fd;
+    ios_proc_sockets[idx].exiting = FALSE;
+    __sync_synchronize();
+    ios_proc_sockets[idx].peb = peb_id;
+}
+#endif
 static _Thread_local int initial_cwd = -1;
 static pid_t server_pid;
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -373,6 +432,19 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 }
 
 
+/* iOS-Mythic 2026-07-05: per-present frame-anatomy counters, read by
+ * winemetal_unix's Present-cadence log line (same binary). The wait
+ * accounting is gated to the GAME thread (main Wine thread, captured in
+ * server_init_process_done) so FMOD/worker threads blocking forever in
+ * waits don't swamp the signal. Question they answer: is the last
+ * ~1.5ms to locked-60 server-request WORK or wait-wake LATENCY? */
+volatile long long ios_srv_wait_us = 0;   /* game thread: wall us blocked in server_wait */
+volatile long long ios_srv_wait_req_us = 0; /* game thread: REQUESTED timeout us (finite waits) */
+volatile int ios_srv_wait_count = 0;      /* game thread: server_wait calls */
+volatile int ios_srv_wait_timeouts = 0;   /* ... of which returned STATUS_TIMEOUT */
+volatile int ios_srv_req_count = 0;       /* ALL threads: wineserver requests */
+uintptr_t ios_srv_game_teb = 0;           /* set once by server_init_process_done */
+
 /***********************************************************************
  *           server_call_unlocked
  */
@@ -381,7 +453,15 @@ unsigned int server_call_unlocked( void *req_ptr )
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
 
+    ios_srv_req_count++;
     if ((ret = send_request( req ))) return ret;
+    /* iOS-Mythic 2026-07-05: kick the in-process server loop out of its
+     * tick sleep so the request is picked up in ~50us instead of waiting
+     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
+    {
+        extern void ios_wineserver_wake(void);
+        ios_wineserver_wake();
+    }
     return wait_reply( req );
 }
 
@@ -898,7 +978,37 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
         abs_timeout -= now.QuadPart;
     }
 
-    ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+    {
+        int is_game = ios_srv_game_teb &&
+                      (uintptr_t)NtCurrentTeb() == ios_srv_game_teb;
+        struct timespec t0, t1;
+        if (is_game) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
+        if (is_game)
+        {
+            clock_gettime( CLOCK_MONOTONIC, &t1 );
+            ios_srv_wait_us += (t1.tv_sec - t0.tv_sec) * 1000000LL
+                             + (t1.tv_nsec - t0.tv_nsec) / 1000;
+            ios_srv_wait_count++;
+            if (ret == STATUS_TIMEOUT) ios_srv_wait_timeouts++;
+            /* Requested duration: only for RELATIVE timeouts (negative
+             * input) — those were converted to QPC-epoch absolutes above,
+             * so abs_timeout and QPC share an epoch. Positive inputs are
+             * NT-1601-epoch absolutes and would poison the math.
+             * overshoot/wait = (w_ms - wreq_ms)/waits per window. */
+            if (timeout && timeout->QuadPart < 0)
+            {
+                LARGE_INTEGER entry_now;
+                long long req_us;
+                NtQueryPerformanceCounter( &entry_now, NULL );
+                /* entry_now is post-wait; reconstruct from measured wall */
+                req_us = (abs_timeout - entry_now.QuadPart) / 10
+                       + (t1.tv_sec - t0.tv_sec) * 1000000LL
+                       + (t1.tv_nsec - t0.tv_nsec) / 1000;
+                if (req_us > 0) ios_srv_wait_req_us += req_us;
+            }
+        }
+    }
     if (ret == STATUS_USER_APC) return invoke_user_apc( NULL, &apc, ret );
 
     /* A test on Windows 2000 shows that Windows always yields during
@@ -1062,7 +1172,11 @@ void CDECL wine_server_send_fd( int fd )
 
     for (;;)
     {
+#ifdef WINE_IOS
+        if ((ret = sendmsg( ios_current_fd_socket(), &msghdr, 0 )) == sizeof(data)) return;
+#else
         if ((ret = sendmsg( fd_socket, &msghdr, 0 )) == sizeof(data)) return;
+#endif
         if (ret >= 0) server_protocol_error( "partial write %d\n", ret );
         if (errno == EINTR) continue;
         if (errno == EPIPE) abort_thread(0);
@@ -1096,7 +1210,12 @@ int wine_server_receive_fd( obj_handle_t *handle )
 
     for (;;)
     {
+#ifdef WINE_IOS
+        int recv_sock = ios_current_fd_socket();
+        if ((ret = recvmsg( recv_sock, &msghdr, MSG_CMSG_CLOEXEC )) > 0)
+#else
         if ((ret = recvmsg( fd_socket, &msghdr, MSG_CMSG_CLOEXEC )) > 0)
+#endif
         {
             struct cmsghdr *cmsg;
             for (cmsg = CMSG_FIRSTHDR( &msghdr ); cmsg; cmsg = CMSG_NXTHDR( &msghdr, cmsg ))
@@ -1111,12 +1230,39 @@ int wine_server_receive_fd( obj_handle_t *handle )
                 }
 #endif
             }
+#ifdef WINE_IOS
+            /* task #24 wedge probe: a client retry-looped get_handle_fd while
+             * the server sendmsg'd successfully every time — the fd right is
+             * getting lost between the two ends. Log the receive when the fd
+             * is missing (MSG_CTRUNC = kernel stripped the right, e.g. fd
+             * table exhaustion) and the first few successes for baseline. */
+            {
+                static volatile int fd_recv_logged = 0;
+                int fdl = fd_recv_logged;
+                if (fd == -1 || fdl < 8 || (msghdr.msg_flags & MSG_CTRUNC))
+                {
+                    if (fdl < 40)
+                    {
+                        __sync_add_and_fetch(&fd_recv_logged, 1);
+                        dprintf(2, "[fd-recv] sock=%d peb=%p ret=%d fd=%d handle=%x msg_flags=%x%s\n",
+                                recv_sock, ios_jit_current_peb(), ret, fd, *handle,
+                                msghdr.msg_flags,
+                                (msghdr.msg_flags & MSG_CTRUNC) ? "  <-- CTRUNC: fd right stripped" :
+                                (fd == -1) ? "  <-- NO FD in message" : "");
+                    }
+                }
+            }
+#endif
             if (fd != -1) fcntl( fd, F_SETFD, FD_CLOEXEC ); /* in case MSG_CMSG_CLOEXEC is not supported */
             return fd;
         }
         if (!ret) break;
         if (errno == EINTR) continue;
         if (errno == EPIPE) break;
+#ifdef WINE_IOS
+        dprintf(2, "[fd-recv] recvmsg FAILED sock=%d peb=%p ret=%d errno=%d\n",
+                recv_sock, ios_jit_current_peb(), ret, errno);
+#endif
         server_protocol_perror("recvmsg");
     }
     /* the server closed the connection; time to die... */
@@ -1296,12 +1442,30 @@ int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
                 access = reply->access;
                 if ((fd = wine_server_receive_fd( &fd_handle )) != -1)
                 {
+                    /* task #24: the settings-freeze loop showed a handle
+                     * whose fd never reaches the requester. If the received
+                     * handle doesn't match the requested one, we'd silently
+                     * mis-cache (assert is compiled out) — log it. */
+                    if (wine_server_ptr_handle(fd_handle) != handle)
+                        dprintf(2, "[fd-recv] HANDLE MISMATCH: asked %p got %p (fd=%d peb=%p)\n",
+                                handle, wine_server_ptr_handle(fd_handle), fd,
+                                ios_jit_current_peb());
                     assert( wine_server_ptr_handle(fd_handle) == handle );
                     *needs_close = (!reply->cacheable ||
                                     !add_fd_to_cache( handle, fd, reply->type,
                                                       reply->access, reply->options ));
                 }
-                else ret = STATUS_TOO_MANY_OPENED_FILES;
+                else
+                {
+                    static volatile int nofd_logged = 0;
+                    if (nofd_logged < 20)
+                    {
+                        __sync_add_and_fetch(&nofd_logged, 1);
+                        dprintf(2, "[fd-recv] get_unix_fd: NO FD for handle %p (peb=%p) -> TOO_MANY_OPENED_FILES\n",
+                                handle, ios_jit_current_peb());
+                    }
+                    ret = STATUS_TOO_MANY_OPENED_FILES;
+                }
             }
             else if (reply->cacheable)
             {
@@ -1725,7 +1889,29 @@ static int init_thread_pipe(void)
  */
 void process_exit_wrapper( int status )
 {
+#ifdef WINE_IOS
+    /* Close THIS pseudo-process's master socket — the EOF is how wineserver
+     * learns the process died (signals its process object, wakes waiters).
+     * Clear the registry slot so a stray second call can't double-close. */
+    int i = ios_proc_socket_index();
+    if (i >= 0)
+    {
+        extern void ios_jit_reclaim_process( void *peb );
+        void *dead_peb = ios_proc_sockets[i].peb;
+        wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
+                       status, ios_proc_sockets[i].fd);
+        close( ios_proc_sockets[i].fd );
+        ios_proc_sockets[i].peb = NULL;
+        /* Task #25: release this pseudo-process's JIT pool allocations
+         * (module copies, trampolines, FEX CodeBuffers). Children only —
+         * the session (else-branch) lives as long as the app. Reuse is
+         * grace-delayed inside the allocator for laggard exit threads. */
+        ios_jit_reclaim_process( dead_peb );
+    }
+    else close( fd_socket );
+#else
     close( fd_socket );
+#endif
     wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d)", status );
     exit( status );  /* on iOS, wine_ios_exit shim longjmps back to wine_process_thread */
 }
@@ -1918,12 +2104,16 @@ size_t server_init_process_child( int child_fd_socket )
     size_t info_size;
     DWORD pid, tid;
 
-    /* Set the thread-local fd_socket for this child "process" */
-    fd_socket = child_fd_socket;
-    if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
-        wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", fd_socket);
+    /* Register this child's master socket keyed by its PEB (teb->Peb is
+     * already the child's — set in wine_ios_child_main before this call).
+     * The global fd_socket stays the PARENT's; send_fd/receive_fd/exit
+     * resolve per-process via ios_current_fd_socket(). */
+    if (fcntl( child_fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
+        wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", child_fd_socket);
+    ios_register_proc_socket( ios_jit_current_peb(), child_fd_socket );
 
-    wine_log_write("[Wine child] server_init_process_child: fd_socket=%d", fd_socket);
+    wine_log_write("[Wine child] server_init_process_child: fd_socket=%d (peb=%p)",
+                   child_fd_socket, ios_jit_current_peb());
 
     /* Do NOT set up signal mask — already done by parent (shared process) */
     /* Do NOT call setup_config_dir — already done by parent */
@@ -1985,6 +2175,13 @@ void server_init_process_done(void)
     FILE_FS_DEVICE_INFORMATION info;
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
 
+    /* iOS-Mythic: this runs on the main (game) thread exactly once —
+     * capture its TEB for the server_wait frame-anatomy accounting. */
+    {
+        extern uintptr_t ios_srv_game_teb;
+        ios_srv_game_teb = (uintptr_t)NtCurrentTeb();
+    }
+
     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
         chdir( "/" );
     close( initial_cwd );
@@ -2027,8 +2224,9 @@ void server_init_process_done(void)
     {
         extern void *pLdrInitializeThunk;
         extern void *pRtlUserThreadStart;
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
-            NtCurrentTeb(), peb, main_image_info.TransferAddress, suspend);
+            NtCurrentTeb(), peb, ios_cur_image_info()->TransferAddress, suspend);
 
         /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {
@@ -2107,9 +2305,230 @@ void server_init_process_done(void)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                 dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ sample_thread(2); });
         }
+
+        /* iOS-Mythic 2026-07-03 sampling profiler for the 30 FPS hunt.
+         * Every prior frame-cost theory (L1 misses, drawable stalls, DXMT
+         * encode) was eliminated by measurement; this samples the game
+         * thread's PC at ~500Hz forever and prints a 256-byte-bucket
+         * histogram every 4096 samples (~10s). Buckets land in one of:
+         * JIT pool (guest blocks / dispatcher / module copies), app binary
+         * (unix side), or elsewhere — mapping the hot buckets tells us
+         * where the ~1.4s/frame actually goes. Counts halve at each print
+         * so the histogram tracks the current phase. */
+        if (!getenv("MYTHIC_QUIET"))
+        {
+            /* iOS-Mythic 2026-07-05 quiet mode: the sampler thread_suspends
+             * the game thread ~500x/s (each suspend+get_state+resume steals
+             * wall time and adds jitter) — a few %% of frame time plus heat,
+             * and heat is what caps ProMotion at 60. MYTHIC_QUIET (set in
+             * WineProcessBridge.m) skips the profiler entirely; comment the
+             * setenv out for diagnostic sessions. */
+            pthread_t prof_pthread = pthread_self();
+            mach_port_t prof_thread_initial = pthread_mach_thread_np(prof_pthread);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                /* Follow the game thread: the Mach handler records the last
+                 * thread that took a PE-VA exec fault (= made a native call)
+                 * in ios_last_exec_fault_thread. The first Wine thread we
+                 * originally pinned dies ~33s in, which froze [PROF] before
+                 * the menu phase. Re-read every iteration so the profile
+                 * tracks whichever thread is actually driving frames. */
+                extern volatile mach_port_t ios_last_exec_fault_thread;
+                enum { PROF_SLOTS = 512 };
+                static uint64_t prof_keys[PROF_SLOTS];
+                static uint32_t prof_counts[PROF_SLOTS];
+                /* v4: follow the BUSIEST thread (max cpu_usage), re-chosen
+                 * every ~2s. The last-exec-faulter heuristic kept landing on
+                 * the WAITING main thread; the render worker that actually
+                 * burns the 53ms frame barely faults since the USD fix. */
+                mach_port_t prof_self = pthread_mach_thread_np(pthread_self());
+                mach_port_t prof_held = MACH_PORT_NULL;
+                integer_t prof_cpu = 0;
+                uint64_t prof_iter = 0;
+                /* Secondary histogram: LR of samples whose PC is in the
+                 * dyld-shared-cache range. [PROF] showed ~87% of gameplay
+                 * time in ONE system-dylib bucket (a wait syscall) — the
+                 * LR names the Wine call site, symbolizable with atos
+                 * against the app binary. */
+                static uint64_t prof_lr_keys[PROF_SLOTS];
+                static uint32_t prof_lr_counts[PROF_SLOTS];
+                uint64_t total = 0;
+                mach_port_t prof_thread = prof_thread_initial;
+                /* Task #25 [susp]: whole-task suspension detector. Three
+                 * desktop "freezes" showed a ~53.7s stall where even the 2s
+                 * watchdog missed ticks — consistent with the DEBUGGER
+                 * suspending the task (StikDebug death/timeout), not a wedge.
+                 * A 2ms sleep that takes >3s = the task was stopped; log the
+                 * exact wall gap so freeze reports self-diagnose. */
+                uint64_t susp_last_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                for (;;) {
+                    usleep(2000);
+                    {
+                        uint64_t now_ns = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                        if (now_ns - susp_last_ns > 3000000000ull)
+                            wine_log_write("[susp] TASK WAS SUSPENDED/STALLED for %.1fs (2ms sleep gap)",
+                                           (now_ns - susp_last_ns) / 1e9);
+                        susp_last_ns = now_ns;
+                    }
+                    if ((prof_iter++ & 0x3FF) == 0) {
+                        thread_act_array_t tlist;
+                        mach_msg_type_number_t tcount;
+                        if (task_threads(mach_task_self(), &tlist, &tcount) == KERN_SUCCESS) {
+                            integer_t best_cpu = -1;
+                            mach_port_t best = MACH_PORT_NULL;
+                            unsigned int k;
+                            for (k = 0; k < tcount; k++) {
+                                thread_basic_info_data_t bi;
+                                mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+                                if (tlist[k] == prof_self) continue;
+                                if (thread_info(tlist[k], THREAD_BASIC_INFO,
+                                                (thread_info_t)&bi, &bic) != KERN_SUCCESS) continue;
+                                if (bi.cpu_usage > best_cpu) { best_cpu = bi.cpu_usage; best = tlist[k]; }
+                            }
+                            for (k = 0; k < tcount; k++)
+                                if (tlist[k] != best) mach_port_deallocate(mach_task_self(), tlist[k]);
+                            if (best != MACH_PORT_NULL) {
+                                if (prof_held != MACH_PORT_NULL && prof_held != best)
+                                    mach_port_deallocate(mach_task_self(), prof_held);
+                                prof_held = best;
+                                prof_thread = best;
+                                prof_cpu = best_cpu;
+                            }
+                            vm_deallocate(mach_task_self(), (vm_address_t)tlist,
+                                          tcount * sizeof(*tlist));
+                        }
+                    }
+                    if (thread_suspend(prof_thread) != KERN_SUCCESS) { usleep(200000); continue; }
+                    arm_thread_state64_t st;
+                    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                    kern_return_t kr = thread_get_state(prof_thread, ARM_THREAD_STATE64,
+                                                        (thread_state_t)&st, &cnt);
+                    thread_resume(prof_thread);
+                    if (kr != KERN_SUCCESS) continue;
+                    uint64_t pc_full = arm_thread_state64_get_pc(st);
+                    uint64_t key = pc_full >> 8;
+                    int i, free_i = -1;
+                    for (i = 0; i < PROF_SLOTS; i++) {
+                        if (prof_counts[i] && prof_keys[i] == key) { prof_counts[i]++; break; }
+                        if (!prof_counts[i] && free_i < 0) free_i = i;
+                    }
+                    if (i == PROF_SLOTS && free_i >= 0) { prof_keys[free_i] = key; prof_counts[free_i] = 1; }
+                    /* v4.1: capture LR for ALL samples — pool-resident hot
+                     * functions (memset, virtual_unwind in ntdll's copy)
+                     * need their CALLERS named to attribute the unwind
+                     * storm, not just system-range wait syscalls. */
+                    {
+                        uint64_t lr_key = arm_thread_state64_get_lr(st) >> 4;
+                        for (i = 0; i < PROF_SLOTS; i++) {
+                            if (prof_lr_counts[i] && prof_lr_keys[i] == lr_key) { prof_lr_counts[i]++; break; }
+                            if (!prof_lr_counts[i]) { prof_lr_keys[i] = lr_key; prof_lr_counts[i] = 1; break; }
+                        }
+                    }
+                    total++;
+                    /* v5: coherent fp-chain walk of the profiled thread every
+                     * ~2s. pc+lr can't attribute kernel time (lr lands inside
+                     * libsystem_kernel wrappers like mach_vm_map+0x6c); the fp
+                     * chain, walked while the thread is SUSPENDED, names the
+                     * real caller. Guest FEX frames don't keep fp chains —
+                     * bounded garbage, validity-checked. */
+                    if ((total % 1024) == 0) {
+                        arm_thread_state64_t bst;
+                        mach_msg_type_number_t bcnt = ARM_THREAD_STATE64_COUNT;
+                        if (thread_suspend(prof_thread) == KERN_SUCCESS) {
+                            uint64_t pcs[12];
+                            int nf = 0;
+                            if (thread_get_state(prof_thread, ARM_THREAD_STATE64,
+                                                 (thread_state_t)&bst, &bcnt) == KERN_SUCCESS) {
+                                uint64_t fp_w = arm_thread_state64_get_fp(bst);
+                                pcs[nf++] = arm_thread_state64_get_pc(bst);
+                                pcs[nf++] = arm_thread_state64_get_lr(bst);
+                                while (nf < 12 && fp_w > 0x1000) {
+                                    uint64_t fb[2]; mach_vm_size_t got = 0;
+                                    if (mach_vm_read_overwrite(mach_task_self(),
+                                            (mach_vm_address_t)fp_w, 16,
+                                            (mach_vm_address_t)fb, &got) != KERN_SUCCESS
+                                        || got != 16)
+                                        break;
+                                    if (fb[1] < 0x4000) break;
+                                    pcs[nf++] = fb[1];
+                                    if (fb[0] <= fp_w) break; /* fp must move up-stack */
+                                    fp_w = fb[0];
+                                }
+                            }
+                            thread_resume(prof_thread);
+                            if (nf) {
+                                char bl[640]; int bln = 0;
+                                int f;
+                                bln += snprintf(bl+bln, sizeof(bl)-bln,
+                                                "[PROF-BT] tid=0x%x:", prof_thread);
+                                for (f = 0; f < nf && bln < (int)sizeof(bl)-90; f++) {
+                                    Dl_info bi2;
+                                    if (dladdr((void*)(uintptr_t)pcs[f], &bi2) && bi2.dli_sname)
+                                        bln += snprintf(bl+bln, sizeof(bl)-bln, " %s+0x%llx",
+                                                        bi2.dli_sname,
+                                                        (unsigned long long)(pcs[f]-(uintptr_t)bi2.dli_saddr));
+                                    else
+                                        bln += snprintf(bl+bln, sizeof(bl)-bln, " 0x%llx",
+                                                        (unsigned long long)pcs[f]);
+                                }
+                                dprintf(STDERR_FILENO, "%s\n", bl);
+                            }
+                        }
+                    }
+                    if ((total % 4096) == 0) {
+                        /* top-10 by count (simple selection; 512 slots) */
+                        char line[512]; int len = 0;
+                        len += snprintf(line + len, sizeof(line) - len, "[PROF] tid=0x%x cpu=%d n=%llu top:",
+                                        prof_thread, (int)prof_cpu, (unsigned long long)total);
+                        for (int rank = 0; rank < 10 && len < (int)sizeof(line) - 40; rank++) {
+                            int best = -1; uint32_t bc = 0;
+                            for (i = 0; i < PROF_SLOTS; i++)
+                                if (prof_counts[i] > bc) { bc = prof_counts[i]; best = i; }
+                            if (best < 0 || bc == 0) break;
+                            len += snprintf(line + len, sizeof(line) - len, " 0x%llx00*%u",
+                                            (unsigned long long)prof_keys[best], bc);
+                            prof_counts[best] = 0; /* consumed; decay below repopulates */
+                        }
+                        dprintf(STDERR_FILENO, "%s\n", line);
+                        for (i = 0; i < PROF_SLOTS; i++) prof_counts[i] >>= 1;
+
+                        /* top-8 wait-callers (LR of system-range samples),
+                         * self-symbolized via dladdr (works for dyld-cache
+                         * addresses; app-dylib statics resolve to nearest
+                         * exported symbol — cross-check offline with atos). */
+                        len = 0;
+                        len += snprintf(line + len, sizeof(line) - len, "[PROF-LR] top:");
+                        for (int rank = 0; rank < 8 && len < (int)sizeof(line) - 100; rank++) {
+                            int best = -1; uint32_t bc = 0;
+                            Dl_info info;
+                            uint64_t addr;
+                            for (i = 0; i < PROF_SLOTS; i++)
+                                if (prof_lr_counts[i] > bc) { bc = prof_lr_counts[i]; best = i; }
+                            if (best < 0 || bc == 0) break;
+                            addr = prof_lr_keys[best] << 4;
+                            if (rank < 3 && dladdr((void *)(uintptr_t)addr, &info) && info.dli_sname)
+                                len += snprintf(line + len, sizeof(line) - len, " 0x%llx(%s+0x%llx)*%u",
+                                                (unsigned long long)addr, info.dli_sname,
+                                                (unsigned long long)(addr - (uintptr_t)info.dli_saddr), bc);
+                            else
+                                len += snprintf(line + len, sizeof(line) - len, " 0x%llx*%u",
+                                                (unsigned long long)addr, bc);
+                            prof_lr_counts[best] = 0;
+                        }
+                        dprintf(STDERR_FILENO, "%s\n", line);
+                        for (i = 0; i < PROF_SLOTS; i++) prof_lr_counts[i] >>= 1;
+                    }
+                }
+            });
+        }
     }
 #endif
-    signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
+    {
+        /* Owner-aware (X3): a child's first thread must start at the CHILD
+         * exe's entry — main_image_info is restored to the session's exe
+         * right after child startup-info init (see wine_ios_child_main). */
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+        signal_start_thread( ios_cur_image_info()->TransferAddress, peb, suspend, NtCurrentTeb() );
+    }
 }
 
 

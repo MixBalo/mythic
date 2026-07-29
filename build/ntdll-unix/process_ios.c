@@ -453,6 +453,17 @@ static void *ios_child_thread_entry( void *arg )
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
     free( args->argv );
     free( args );
+
+    /* Zero TSD slot 275 before the implicit pthread_exit: we write the TEB
+     * there without owning the key, and a foreign Apple key with an ObjC
+     * destructor owns that slot — destructor(TEB) crashes in objc_release
+     * (S0 bugs 3+7; same guard as pthread_exit_wrapper). */
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        *(void **)(tsd_base + 275 * 8) = NULL;
+    }
     return NULL;
 }
 #endif
@@ -869,6 +880,98 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 #ifdef WINE_IOS
     ERR("NtCreateUserProcess: image=%s cmdline=%s\n",
         debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ));
+
+    /* TEMP HACK (Steam S3 2026-07-10, task #29): refuse to spawn Steam's
+     * minidump reporter. The reporter child hits the deep guest-exception-
+     * DISPATCH wall ("exception frame is not in stack limits") and — worse —
+     * its NtTerminateProcess currently takes the whole app down (open bug).
+     * Steam explicitly tolerates a failed spawn ("Failed spawning steam
+     * error reporter process." → continues), verified run 9. Remove once
+     * (a) exception dispatch at guest faults works and (b) the pseudo-proc
+     * terminate path no longer kills the session. */
+    {
+        static const char blocked[] = "steamerrorreporter";
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        int bl = sizeof(blocked) - 1, k, j;
+        for (k = 0; k + bl <= ip_len; k++)
+        {
+            for (j = 0; j < bl; j++)
+            {
+                WCHAR c = ip[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)blocked[j]) break;
+            }
+            if (j == bl)
+            {
+                dprintf(2, "[proc-gate] REFUSING spawn of %s (steamerrorreporter TEMP gate)\n",
+                        debugstr_us( &params->ImagePathName ));
+                return STATUS_ACCESS_DENIED;
+            }
+        }
+    }
+
+    /* task #34 single-process CEF: the 64GB VA window above the GPU carveout
+     * can hold exactly ONE CEF instance's PartitionAlloc pools + one V8
+     * sandbox (see virtual_ios.c slot allocator). Force steamwebhelper into
+     * Chromium single-process mode so browser/gpu/renderer/utility all run
+     * as threads of one pseudo-process, and refuse any --type= child it
+     * still tries to spawn (e.g. crashpad-handler) — a second instance
+     * would re-init both static PA copies and exhaust the slots. Chromium
+     * tolerates a failed crashpad spawn (continues without crash upload). */
+    {
+        static const char helper[] = "steamwebhelper.exe";
+        static const char typesw[] = "--type=";
+        const WCHAR *ip = params->ImagePathName.Buffer;
+        int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
+        int hl = sizeof(helper) - 1, k, j;
+        int is_helper = 0;
+        for (k = 0; k + hl <= ip_len && !is_helper; k++)
+        {
+            for (j = 0; j < hl; j++)
+            {
+                WCHAR c = ip[k + j];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)helper[j]) break;
+            }
+            if (j == hl) is_helper = 1;
+        }
+        if (is_helper)
+        {
+            const WCHAR *cl = params->CommandLine.Buffer;
+            int cl_len = params->CommandLine.Length / sizeof(WCHAR);
+            int tl = sizeof(typesw) - 1, has_type = 0;
+            for (k = 0; k + tl <= cl_len && !has_type; k++)
+            {
+                for (j = 0; j < tl; j++)
+                    if (cl[k + j] != (WCHAR)typesw[j]) break;
+                if (j == tl) has_type = 1;
+            }
+            if (has_type)
+            {
+                dprintf(2, "[proc-gate] REFUSING steamwebhelper --type= child (single-process mode; task #34)\n");
+                return STATUS_ACCESS_DENIED;
+            }
+            /* Append --single-process to the browser instance's command line.
+             * The new buffer intentionally leaks (once per helper launch);
+             * RtlDestroyProcessParameters only frees the params block itself. */
+            {
+                static const char sp[] = " --single-process";
+                int sl = sizeof(sp) - 1;
+                WCHAR *nbuf = malloc( (cl_len + sl + 1) * sizeof(WCHAR) );
+                if (nbuf)
+                {
+                    memcpy( nbuf, cl, cl_len * sizeof(WCHAR) );
+                    for (j = 0; j < sl; j++) nbuf[cl_len + j] = (WCHAR)sp[j];
+                    nbuf[cl_len + sl] = 0;
+                    params->CommandLine.Buffer = nbuf;
+                    params->CommandLine.Length = (cl_len + sl) * sizeof(WCHAR);
+                    params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+                    dprintf(2, "[proc-gate] steamwebhelper: injected --single-process (task #34)\n");
+                }
+            }
+        }
+    }
 #endif
 
     unixdir = get_unix_curdir( params );
@@ -888,9 +991,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     if (!machine)
     {
+        /* Owner-aware (X3): the SPAWNER's identity decides hybrid-image
+         * machine promotion — an x64 child spawning from an aarch64
+         * session must not consult the session's main exe. */
+        extern int ios_is_arm64ec_cur(void);
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
         machine = pe_info.machine;
-        if (is_arm64ec() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
-            machine = main_image_info.Machine;
+        if (ios_is_arm64ec_cur() && pe_info.is_hybrid && machine == IMAGE_FILE_MACHINE_ARM64)
+            machine = ios_cur_image_info()->Machine;
     }
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;
@@ -1086,7 +1194,12 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 #ifdef WINE_IOS
     {
         static int term_log_count = 0;
-        if (term_log_count < 3) {
+        /* iOS-Mythic [term-stack] (task#29): also fire on ANY nonzero exit_code
+         * (capped) so Steam's deliberate ExitProcess(-104) bootstrapper bail is
+         * captured — the first-3 slots are consumed by early exit-0 procs
+         * (cmd/start.exe) before steam.exe ever runs. The dump below (guest RIP +
+         * emulator-stack code-address scan) names which steam.exe code path bails. */
+        if (term_log_count < 3 || (exit_code != 0 && term_log_count < 24)) {
             term_log_count++;
             extern volatile uint64_t g_wine_dispatcher_count;
             extern volatile uint64_t g_wine_unix_call_count;
@@ -1094,6 +1207,95 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
                 handle, (unsigned int)exit_code,
                 (unsigned long long)g_wine_dispatcher_count,
                 (unsigned long long)g_wine_unix_call_count);
+            /* task #24: Thumper's settings page deliberately calls
+             * ExitProcess(-1) from a fresh thread with no preceding
+             * exception — the deciding code is invisible. Dump the calling
+             * thread's guest x64 state: RIP, gregs, and return-address-
+             * looking qwords on the guest stack (attributed offline via the
+             * [jit-pool]/load-order tables). FEX state layout: rip@0x18,
+             * gregs@0x20 (CoreState.h); cpuarea+0x30 = FEX state ptr (same
+             * offset the [fault_rip] probe uses). dprintf not ERR — this
+             * must survive err-channel muting. */
+            {
+                TEB *cur_teb = NtCurrentTeb();
+                CHPE_V2_CPU_AREA_INFO *cpuarea = cur_teb ? cur_teb->ChpeV2CpuAreaInfo : NULL;
+                void *fex_state = cpuarea ? *(void **)((char *)cpuarea + 0x30) : NULL;
+                if (fex_state)
+                {
+                    const uint64_t *fx = (const uint64_t *)fex_state;
+                    uint64_t rip = fx[0x18 / 8];
+                    const uint64_t *gregs = &fx[0x20 / 8];
+                    uint64_t sbase = (uint64_t)cpuarea->EmulatorStackBase;
+                    uint64_t slimit = (uint64_t)cpuarea->EmulatorStackLimit;
+                    uint64_t rsp = 0;
+                    int gi, hits = 0;
+                    dprintf(2, "[term-stack] rip=%llx stack=[%llx..%llx]\n",
+                            (unsigned long long)rip, (unsigned long long)slimit,
+                            (unsigned long long)sbase);
+                    dprintf(2, "[term-stack] g0-7: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[0], gregs[1], gregs[2], gregs[3],
+                            gregs[4], gregs[5], gregs[6], gregs[7]);
+                    dprintf(2, "[term-stack] g8-15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                            gregs[8], gregs[9], gregs[10], gregs[11],
+                            gregs[12], gregs[13], gregs[14], gregs[15]);
+                    /* rsp: prefer a greg inside the cpuarea's recorded range,
+                     * but the live FEX stack can differ (seq-3656 run: rsp
+                     * pair 0x1613ffxxx vs recorded [0x1514a0000..0x1514e0000])
+                     * — fall back to any pointer-looking greg whose memory
+                     * reads back. Use mach reads so a bad candidate can't
+                     * fault the caller. */
+                    for (gi = 0; gi < 16; gi++)
+                        if (gregs[gi] >= slimit && gregs[gi] < sbase) { rsp = gregs[gi]; break; }
+                    {
+                        extern unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out);
+                        static uint64_t stack_buf[512];
+                        int cand;
+                        for (cand = -1; cand < 16 && hits == 0; cand++)
+                        {
+                            uint64_t try_sp = (cand < 0) ? rsp : gregs[cand];
+                            mach_vm_size_t got_sb = 0;
+                            int wi, nw;
+                            if (!try_sp || (try_sp & 7) || try_sp < 0x100000000ULL ||
+                                try_sp >= 0x800000000000ULL) continue;
+                            if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)try_sp,
+                                    sizeof(stack_buf), (mach_vm_address_t)stack_buf, &got_sb ) != KERN_SUCCESS ||
+                                got_sb < 64) continue;
+                            nw = (int)(got_sb / 8);
+                            for (wi = 0; wi < nw && hits < 24; wi++)
+                            {
+                                uint64_t v = stack_buf[wi];
+                                unsigned long long msz = 0;
+                                unsigned long long mbase = ios_jit_module_base_for_va( v, &msz );
+                                if (!mbase) continue;
+                                /* name via export directory of the map view */
+                                {
+                                    const unsigned char *mb = (const unsigned char *)(uintptr_t)mbase;
+                                    const char *mname = "?";
+                                    unsigned int e_lf, exp_rva, name_rva;
+                                    if (mb[0] == 'M' && mb[1] == 'Z' &&
+                                        (e_lf = *(const unsigned int *)(mb + 0x3c)) < 0x1000 &&
+                                        (exp_rva = *(const unsigned int *)(mb + e_lf + 0x88)) &&
+                                        exp_rva < msz &&
+                                        (name_rva = *(const unsigned int *)(mb + exp_rva + 0x0c)) &&
+                                        name_rva < msz)
+                                        mname = (const char *)(mb + name_rva);
+                                    else if (mb[0] == 'M' && mb[1] == 'Z')
+                                        mname = "(exe)";
+                                    dprintf(2, "[term-stack] sp+%03x: %llx  %.32s+0x%llx\n",
+                                            wi * 8, (unsigned long long)v, mname,
+                                            (unsigned long long)(v - mbase));
+                                }
+                                hits++;
+                            }
+                            if (hits)
+                                dprintf(2, "[term-stack] used %s=0x%llx, scanned %d qwords, %d code-like\n",
+                                        cand < 0 ? "cpuarea-rsp" : "greg", (unsigned long long)try_sp, nw, hits);
+                        }
+                        if (!hits) dprintf(2, "[term-stack] no readable stack candidate produced hits\n");
+                    }
+                }
+                else dprintf(2, "[term-stack] no FEX state on this thread (cpuarea=%p)\n", (void *)cpuarea);
+            }
         }
     }
     /* iOS-Mythic 2026-05-13: stack-cookie failures (STATUS_STACK_BUFFER_OVERRUN
@@ -1114,10 +1316,17 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         NtTerminateThread( GetCurrentThread(), exit_code );
         /* if we somehow return, fall through */
     }
-    /* iOS: if process is already exiting and this is the self-terminate call,
+    /* iOS: if THIS pseudo-process is already exiting and this is the
+     * self-terminate call (the -1 pseudo-handle from RtlExitUserProcess),
      * go directly to exit_process. The server may return self=false because
-     * it already processed the termination, causing an infinite loop. */
-    if (process_exiting && handle)
+     * it already processed the termination, causing an infinite loop.
+     * Per-process flag: a global one poisons every other pseudo-process's
+     * exit once the first dies (2026-07-05 3-deep-tree bug) — and worse,
+     * would force-exit a process that merely KILLS another (handle != -1),
+     * which Steam does to its helpers. */
+    extern BOOL *ios_process_exiting_ptr(void);
+    BOOL *exiting_flag = ios_process_exiting_ptr();
+    if (*exiting_flag && handle == (HANDLE)~(ULONG_PTR)0)
     {
         ERR("NtTerminateProcess: process_exiting=1, forcing exit_process(%d)\n", (int)exit_code);
         exit_process( exit_code );
@@ -1134,9 +1343,15 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     SERVER_END_REQ;
     if (self)
     {
+#ifdef WINE_IOS
+        if (!handle) *exiting_flag = TRUE;
+        else if (*exiting_flag) exit_process( exit_code );
+        else abort_process( exit_code );
+#else
         if (!handle) process_exiting = TRUE;
         else if (process_exiting) exit_process( exit_code );
         else abort_process( exit_code );
+#endif
     }
     return ret;
 }

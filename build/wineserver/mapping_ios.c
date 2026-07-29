@@ -331,7 +331,14 @@ int grow_file( int unix_fd, file_pos_t new_size )
     return 0;
 }
 
-/* simplified version of mkstemps() */
+/* simplified version of mkstemps(), rooted at server_dir_fd.
+ * iOS-Mythic: wineserver shares one unix cwd with every pseudo-process, and
+ * child launches chdir it anywhere (including read-only game dirs) — so temp
+ * files must never be created via cwd-relative paths. openat also avoids the
+ * upstream fchdir dance, which would race pseudo-processes doing relative
+ * file opens (e.g. Thumper's cache/*.pc). Exec-dir probing is gone with it:
+ * file-backed PROT_EXEC mmaps never work on iOS anyway (dual-mapped JIT pool
+ * handles all exec). */
 static int make_temp_file( char name[16] )
 {
     static unsigned int value;
@@ -341,72 +348,37 @@ static int make_temp_file( char name[16] )
     for (i = 0; i < 0x8000 && fd < 0; i++, value += 7777)
     {
         snprintf( name, 16, "tmpmap-%08x", value );
-        fd = open( name, O_RDWR | O_CREAT | O_EXCL, 0600 );
+        fd = openat( server_dir_fd, name, O_RDWR | O_CREAT | O_EXCL, 0600 );
     }
     return fd;
-}
-
-/* check if the current directory allows exec mappings */
-static int check_current_dir_for_exec(void)
-{
-    int fd;
-    char tmpfn[16];
-    void *ret = MAP_FAILED;
-
-    fd = make_temp_file( tmpfn );
-    if (fd == -1) return 0;
-    if (grow_file( fd, 1 ))
-    {
-        ret = mmap( NULL, get_page_size(), PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0 );
-        if (ret != MAP_FAILED) munmap( ret, get_page_size() );
-    }
-    close( fd );
-    unlink( tmpfn );
-    return (ret != MAP_FAILED);
 }
 
 /* create a temp file for anonymous mappings */
 static int create_temp_file( file_pos_t size )
 {
-    static int temp_dir_fd = -1;
     char tmpfn[16];
     int fd;
-
-#if defined(HAVE_MEMFD_CREATE) && defined(MFD_EXEC)
-    if ((fd = memfd_create( "wine-mapping", MFD_EXEC )) != -1)
-    {
-        if (grow_file( fd, size )) return fd;
-        close( fd );
-    }
-#endif
-    if (temp_dir_fd == -1)
-    {
-        temp_dir_fd = server_dir_fd;
-        if (!check_current_dir_for_exec())
-        {
-            /* the server dir is noexec, try the config dir instead */
-            fchdir( config_dir_fd );
-            if (check_current_dir_for_exec())
-                temp_dir_fd = config_dir_fd;
-            else  /* neither works, fall back to server dir */
-                fchdir( server_dir_fd );
-        }
-    }
-    else if (temp_dir_fd != server_dir_fd) fchdir( temp_dir_fd );
 
     fd = make_temp_file( tmpfn );
     if (fd != -1)
     {
+        unlinkat( server_dir_fd, tmpfn, 0 );
         if (!grow_file( fd, size ))
         {
+            ws_log("[srv-map] create_temp_file: grow_file failed errno=%d size=%llu\n",
+                   errno, (unsigned long long)size);
             close( fd );
             fd = -1;
         }
-        unlink( tmpfn );
     }
-    else file_set_error();
-
-    if (temp_dir_fd != server_dir_fd) fchdir( server_dir_fd );
+    else
+    {
+        int saved_errno = errno;
+        ws_log("[srv-map] create_temp_file: make_temp_file(server_dir) failed errno=%d\n",
+               saved_errno);
+        errno = saved_errno;
+        file_set_error();
+    }
     return fd;
 }
 
@@ -477,6 +449,10 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
     {
         if (is_process_init_done( process ))
         {
+            if (!(view->image.image_charact & IMAGE_FILE_DLL))
+                ws_log("[srv-map] add_process_view: EXE view but process %04x already init-done "
+                       "(state=%d charact=%x machine=%04x)", process->id,
+                       process->startup_state, view->image.image_charact, process->machine);
             generate_dll_event( thread, DbgLoadDllStateChange, view );
         }
         else if (!(view->image.image_charact & IMAGE_FILE_DLL))
@@ -1188,7 +1164,10 @@ struct mapping *create_fd_mapping( struct object *root, const struct unicode_str
 
 static struct mapping *get_mapping_obj( struct process *process, obj_handle_t handle, unsigned int access )
 {
-    return (struct mapping *)get_handle_obj( process, handle, access, &mapping_ops );
+    struct mapping *ret = (struct mapping *)get_handle_obj( process, handle, access, &mapping_ops );
+    if (!ret) ws_log("[srv-map] get_mapping_obj FAILED pid=%04x handle=%04x access=%08x err=%08x\n",
+                     process->id, handle, access, get_error());
+    return ret;
 }
 
 /* open a new file for the file descriptor backing the view */
@@ -1552,6 +1531,8 @@ DECL_HANDLER(create_mapping)
                                                           req->access, objattr->attributes );
         release_object( mapping );
     }
+    else ws_log("[srv-map] create_mapping FAILED err=%08x flags=%08x size=%llu pid=%04x\n",
+                get_error(), req->flags, (unsigned long long)req->size, current->process->id);
 
     if (root) release_object( root );
 }
@@ -1710,7 +1691,14 @@ DECL_HANDLER(map_image_view)
         {
             /* on 32-bit, the native 64-bit machine is allowed */
             if (is_machine_64bit( current->process->machine ) || req->machine != native_machine)
+            {
+                ws_log("[srv-map] map_view mismatch: pid=%04x req_machine=%04x proc_machine=%04x "
+                       "startup_state=%d charact=%x image_flags=%x img_machine=%04x",
+                       current->process->id, req->machine, current->process->machine,
+                       current->process->startup_state, view->image.image_charact,
+                       view->image.image_flags, view->image.machine);
                 set_error( STATUS_IMAGE_MACHINE_TYPE_MISMATCH );
+            }
         }
     }
 

@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -124,7 +125,11 @@ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
  * images; cube ~12-15). Silent overflow at 16 was costing us hours of
  * debugging — late modules' addresses fell through ios_jit_translate_addr
  * unchanged, leaking unix-mapped (non-executable) addresses to BLR. */
-#define IOS_JIT_MAX_MAPPINGS 64
+/* 512: desktop mode holds the session's full aarch64 image set PLUS every
+ * pseudo-process child's x64/EC set in one table. 64 overflowed at exactly
+ * the 65th image (Thumper under desktop, 2026-07-06): concrt140 copied but
+ * never registered → raw-VA DllMain call → unfixable exec-fault loop. */
+#define IOS_JIT_MAX_MAPPINGS 512
 struct ios_jit_mapping {
     void *pe_base;      /* Original PE image base address (unix mapping) */
     void *jit_base;     /* JIT pool RX address */
@@ -135,9 +140,267 @@ struct ios_jit_mapping {
     intptr_t reloc_delta;   /* JIT dest - PE ImageBase */
     unsigned int reloc_rva; /* RVA of .reloc section */
     unsigned int reloc_size;/* Size of .reloc data */
+    void *owner_peb;    /* NULL = parent/default copy; else the PEB of the
+                         * pseudo-process that owns this copy (S1 child
+                         * processes get their own ntdll image so module
+                         * lists / loader locks don't collide). Multiple
+                         * entries may share one pe_base; translation picks
+                         * the entry owned by the current thread's process,
+                         * falling back to the NULL-owner (parent) entry. */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
 static int ios_jit_mapping_count = 0;
+
+/* JIT pool head bump allocator. Owned by mprotect_exec's PE-image copy path
+ * (was a function-local static there); file-scope so the S1 per-child
+ * ntdll copy allocates from the same cursor instead of guessing pool usage.
+ * The pool TAIL is carved separately by NtAllocateVirtualMemoryEx for FEX
+ * EC_CODE buffers. Static: internal linkage, no wineserver-style symbol
+ * collision risk. */
+static size_t jit_pool_offset = 0;
+
+/* ---- Pool reclamation (task #25) ----------------------------------------
+ * The bump allocator never freed anything: 8 pseudo-processes consumed
+ * 368.9/384MB (2026-07-07) and the 9th BUS-loop-locked the session. Every
+ * head allocation is now recorded in a ledger tagged with the allocating
+ * pseudo-process (ios_jit_current_peb() — module loads run on the owning
+ * process's thread, same invariant the owner-aware IAT-sync relies on).
+ * process_exit_wrapper releases the dead process's ranges into a free list
+ * the allocator consults before bumping.
+ *
+ * Reuse is gated by a grace period: laggard threads of the dead process
+ * (woken by their closing server fds) still run PE exit paths from the
+ * process's pool copies for a moment after process_exit_wrapper. Freed
+ * bytes stay intact until actually rehanded out, so execution from a
+ * freed-but-unreused range stays valid during the grace window. */
+static pthread_mutex_t ios_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define IOS_POOL_LEDGER_MAX 1024
+struct ios_pool_alloc
+{
+    size_t off;         /* pool offset */
+    size_t size;        /* bytes (page-aligned) */
+    void  *peb;         /* allocating pseudo-process; NULL = session/unknown */
+};
+static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
+static int ios_pool_ledger_count;
+
+#define IOS_POOL_FREE_MAX 256
+#define IOS_POOL_REUSE_GRACE_SEC 3
+/* Darwin madvise: MADV_FREE marks pages volatile; MADV_FREE_REUSE is the
+ * documented cancel. Guard for older SDK headers. */
+#ifndef MADV_FREE_REUSE
+#define MADV_FREE_REUSE 8
+#endif
+struct ios_pool_free
+{
+    size_t off;
+    size_t size;
+    time_t freed_at;
+    int    advised;   /* physical pages returned via MADV_FREE (post-grace) */
+};
+static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
+static int ios_pool_free_count;
+
+void *ios_jit_current_peb(void);
+extern void *ios_jit_rw_base_global;  /* defined below */
+
+/* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
+ * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
+ * RX, writes via user_VA fault and the STR fault emulator looks up the RW
+ * alias here. Execution faults at user_VA are redirected to the RX alias
+ * (which is the only address that's actually executable on iOS TXM).
+ * Declared above ios_pool_alloc_range so the allocator can purge stale
+ * entries when it recycles a pool range. */
+#define IOS_JIT_MAX_ANON_ALIASES 32
+struct ios_jit_anon_alias {
+    uintptr_t user_va;
+    uintptr_t user_va_end;
+    uintptr_t jit_rw_alias;
+    uintptr_t jit_rx_alias;
+};
+static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
+static volatile int ios_jit_anon_alias_count = 0;
+
+/* Allocate a page-aligned range from the pool head: free list first
+ * (grace-expired first-fit; remainder returned to the list), bump second.
+ * Returns (size_t)-1 on exhaustion WITHOUT consuming any pool space (the
+ * old fetch_and_add-then-check burned the offset on every failed retry).
+ * `pool_limit` = usable head bytes (pool size minus tail reservation).
+ *
+ * anchor_off/max_dist (Steam S3 run 11 ROOT CAUSE): the x18 patcher emits
+ * B/BL from a module's .text to its trampoline range — ARM64 imm26 reaches
+ * only ±128MB, and with the 640MB pool + freelist fragmentation SHELL32's
+ * tramps landed 230MB below its image. The encoder silently truncated the
+ * offset (mod 256MB) → branches into untouched pool → the entire
+ * "poison pointer / zeroed tramp" crash family (runs 7-11, proven by
+ * imm26 0x90A311 == truncation of -0xDBD73BC). Pass anchor_off = the
+ * image's pool offset and max_dist to force the range within branch
+ * reach; (size_t)-1 anchor = unconstrained (old behavior). */
+static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
+                                       size_t anchor_off, size_t max_dist )
+{
+    size_t off = (size_t)-1;
+    time_t now = time( NULL );
+    int i;
+
+#define IOS_POOL_IN_REACH(o) \
+    (anchor_off == (size_t)-1 || \
+     ((o) > anchor_off ? (o) + alloc_size - anchor_off : anchor_off - (o)) <= max_dist)
+
+    pthread_mutex_lock( &ios_pool_lock );
+
+    /* Post-grace, return each freed range's physical pages to the OS.
+     * NO_FOOTPRINT exempts the pool from OUR jetsam ledger, but dirty
+     * pages still consume device RAM — 300MB of dead copies pressures
+     * the rest of the system (prime suspect for StikDebug dying →
+     * debugger-suspension freezes + "JIT detached"). Deferred past the
+     * grace window so laggard exit threads never execute a purged page. */
+    for (i = 0; i < ios_pool_free_count; i++)
+    {
+        if (ios_pool_freelist[i].advised) continue;
+        if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        /* task #34 belt: NEVER volatilize a range that overlaps a LIVE ledger
+         * entry. Freelist and ledger are disjoint by design (free removes the
+         * ledger entry), so any overlap here is an accounting bug — and
+         * MADV_FREE on live pool memory is exactly the "iOS zero-harvests
+         * executing code" death seen in ml74 (Steam pressure makes the
+         * harvest actually happen; Thumper never pushed hard enough). Skip
+         * the range, log loudly, and keep it un-advised so we re-check. */
+        {
+            int j, live_overlap = 0;
+            size_t f_off = ios_pool_freelist[i].off, f_end = f_off + ios_pool_freelist[i].size;
+            for (j = 0; j < ios_pool_ledger_count; j++)
+            {
+                size_t l_off = ios_pool_ledger[j].off, l_end = l_off + ios_pool_ledger[j].size;
+                if (l_off < f_end && l_end > f_off) { live_overlap = 1; break; }
+            }
+            if (live_overlap)
+            {
+                dprintf(2, "[jit-pool] SWEEP SKIPPED live-overlap: freed off=0x%lx+0x%lx overlaps ledger off=0x%lx+0x%lx peb=%p — accounting bug, NOT volatilizing\n",
+                        (unsigned long)f_off, (unsigned long)(f_end - f_off),
+                        (unsigned long)ios_pool_ledger[j].off, (unsigned long)ios_pool_ledger[j].size,
+                        ios_pool_ledger[j].peb);
+                continue;
+            }
+        }
+        if (ios_jit_rw_base_global)
+            madvise( (char *)ios_jit_rw_base_global + ios_pool_freelist[i].off,
+                     ios_pool_freelist[i].size, MADV_FREE );
+        ios_pool_freelist[i].advised = 1;
+    }
+
+    for (i = 0; i < ios_pool_free_count; i++)
+    {
+        if (ios_pool_freelist[i].size < alloc_size) continue;
+        if (now - ios_pool_freelist[i].freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        if (!IOS_POOL_IN_REACH(ios_pool_freelist[i].off)) continue;
+        off = ios_pool_freelist[i].off;
+        if (ios_pool_freelist[i].size > alloc_size)
+        {
+            ios_pool_freelist[i].off  += alloc_size;
+            ios_pool_freelist[i].size -= alloc_size;
+        }
+        else
+        {
+            ios_pool_freelist[i] = ios_pool_freelist[--ios_pool_free_count];
+        }
+        /* Task #22 root cause (2026-07-10 Steam): the sweep above marked this
+         * range volatile (MADV_FREE) and on Darwin that mark is NOT reliably
+         * cleared by rewriting these entry-backed pages — reused ranges kept
+         * getting harvested under the Steam download's memory pressure,
+         * zeroing LIVE FEX LookupCache/CodeBuffer data (same page reclaimed
+         * 4x at the same fault address, then the give-up → 24k-exception BUS
+         * storm = the "freeze", which drowned StikDebug = the "detach", then
+         * steam.exe died). MADV_FREE_REUSE is the documented cancel — apply
+         * it BEFORE handing the range out so the new owner's writes stick. */
+        {
+            int mr = -1;
+            if (ios_jit_rw_base_global)
+                mr = madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
+            dprintf(2, "[jit-pool] reused freed range off=0x%lx size=0x%lx (freelist %d ranges) reuse-cancel=%d%s\n",
+                    (unsigned long)off, (unsigned long)alloc_size, ios_pool_free_count,
+                    mr, mr ? " FAILED (still volatile!)" : "");
+        }
+        break;
+    }
+
+    if (off == (size_t)-1)
+    {
+        if (jit_pool_offset + alloc_size <= pool_limit
+            && IOS_POOL_IN_REACH(jit_pool_offset))
+        {
+            off = jit_pool_offset;
+            jit_pool_offset += alloc_size;
+            /* Same volatility belt as the freelist path — virgin pages
+             * shouldn't be MADV_FREE-marked, but under Steam-boot pressure
+             * we've seen freshly written pool content read back zero. */
+            if (ios_jit_rw_base_global)
+                madvise( (char *)ios_jit_rw_base_global + off, alloc_size, MADV_FREE_REUSE );
+        }
+    }
+#undef IOS_POOL_IN_REACH
+
+    if (off != (size_t)-1)
+    {
+        /* Steam S3 run 9/10: purge STALE anon-alias entries whose pool range
+         * overlaps the handed-out range. Aliases are only cleared on process
+         * EXIT — a live process (steam.exe) that guest-frees an anon RWX
+         * region leaves its entry behind, and once the pool range is
+         * recycled (user32's x18 trampolines in the errorreporter child) any
+         * guest MEM_DECOMMIT of the old user VA memsets the NEW occupant to
+         * zero via decommit_pages' alias path → blr into zeros → fault storm. */
+        {
+            uintptr_t new_rw_start = (uintptr_t)ios_jit_rw_base_global + off;
+            uintptr_t new_rw_end   = new_rw_start + alloc_size;
+            for (i = 0; i < ios_jit_anon_alias_count; i++)
+            {
+                uintptr_t a_start, a_end;
+                if (!ios_jit_anon_aliases[i].user_va) continue;
+                a_start = ios_jit_anon_aliases[i].jit_rw_alias;
+                a_end   = a_start + (ios_jit_anon_aliases[i].user_va_end
+                                     - ios_jit_anon_aliases[i].user_va);
+                if (a_start < new_rw_end && a_end > new_rw_start)
+                {
+                    dprintf(2, "[jit-pool] STALE alias purged on handout: user_va=%p rw=%p+0x%lx overlaps new range off=0x%lx+0x%lx\n",
+                            (void *)ios_jit_anon_aliases[i].user_va, (void *)a_start,
+                            (unsigned long)(a_end - a_start),
+                            (unsigned long)off, (unsigned long)alloc_size);
+                    ios_jit_anon_aliases[i].user_va_end = 0;
+                    __sync_synchronize();
+                    ios_jit_anon_aliases[i].user_va = 0;
+                }
+            }
+        }
+        if (ios_pool_ledger_count < IOS_POOL_LEDGER_MAX)
+        {
+            ios_pool_ledger[ios_pool_ledger_count].off  = off;
+            ios_pool_ledger[ios_pool_ledger_count].size = alloc_size;
+            ios_pool_ledger[ios_pool_ledger_count].peb  = ios_jit_current_peb();
+            ios_pool_ledger_count++;
+        }
+        else dprintf(2, "[jit-pool] ledger FULL — range off=0x%lx will never be reclaimed\n",
+                     (unsigned long)off);
+    }
+
+    pthread_mutex_unlock( &ios_pool_lock );
+    return off;
+}
+
+static size_t ios_pool_alloc_range( size_t alloc_size, size_t pool_limit )
+{
+    return ios_pool_alloc_range_ex( alloc_size, pool_limit, (size_t)-1, 0 );
+}
+
+/* Total bytes reserved from the pool TAIL by NtAllocateVirtualMemoryEx for
+ * FEX EC_CODE buffers. File-scope so head and tail allocators can refuse to
+ * cross each other: on 2026-07-06 (Thumper under desktop) the head cursor
+ * grew past the bottom of a live tail-carved FEX CodeBuffer and late DLL
+ * image copies memcpy'd over compiled blocks — neither side checked the
+ * other. Reads of the opposing cursor are racy-but-monotonic: both only
+ * grow, so a stale read can only make the check conservative late, never
+ * un-refuse. */
+static volatile size_t ios_jit_tail_reserved = 0;
 
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 void *ios_jit_rx_base_global = NULL;
@@ -204,6 +467,25 @@ void *ios_jit_get_trampoline(int slot)
     return NULL;
 }
 
+/* Reverse of the JIT translation: pool alias → original PE VA. For the
+ * thread-stack dumper — a wedged thread executing PE code shows JIT-pool
+ * pcs that dladdr can't name; this recovers "PE module base + offset". */
+uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base )
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uint64_t jb = (uint64_t)(uintptr_t)ios_jit_mappings[i].jit_base;
+        if (addr >= jb && addr < jb + ios_jit_mappings[i].size)
+        {
+            if (module_base) *module_base = (uint64_t)(uintptr_t)ios_jit_mappings[i].pe_base;
+            return (uint64_t)(uintptr_t)ios_jit_mappings[i].pe_base + (addr - jb);
+        }
+    }
+    if (module_base) *module_base = 0;
+    return 0;
+}
+
 /* Callback registered by xtajit64 (via unix_ios_push_jit_aliases unix-call)
  * so future ios_jit_add_mapping calls automatically push aliases to FEX
  * too. Without this, late-loaded DLLs (e.g. dlopen after process init)
@@ -215,35 +497,77 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
 {
     int i;
 
-    /* Dedupe by pe_base: every PROT_EXEC section of an image triggers
-     * mprotect_exec → which copies the WHOLE image and calls this. Without
-     * this check we'd record N entries for a single DLL (one per exec
-     * section) and the first match in ios_jit_translate_addr would still
-     * win, but the table fills up uselessly. Skip duplicates silently. */
+    /* Task #33: purge every entry whose PE range OVERLAPS the new image's.
+     * A fresh PE image at [pe_base, pe_base+size) proves any overlapping
+     * entry is STALE — two live images cannot occupy the same VA in the
+     * single shared address space. The old module was unmapped (FreeLibrary
+     * or pseudo-proc teardown) without this table hearing about it, and
+     * mmap reused its VA. A surviving stale entry shadows the new one on
+     * first-match: translate/sync_write of addresses in the overlap target
+     * the DEAD pool copy (observed: CEF child's EC-ntdll dispatcher slot
+     * synced into a dead copy while execution read the live copy's slot =
+     * 0 → blr x16=0 null-exec storm). The old exact-pe_base dedupe was the
+     * same disease — a LIVE image never reaches this call twice, because
+     * mprotect_exec's already-copied check early-outs; only a stale entry
+     * at the exact same VA could match, and returning kept translation on
+     * the dead copy. Tombstone write order matches reclaim (size=0 first —
+     * a zero-size entry matches no query — barrier, then pe_base=NULL) so
+     * the lock-free readers never see a half-dead entry. */
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
-        if (ios_jit_mappings[i].pe_base == pe_base) return;
+        uintptr_t eb = (uintptr_t)ios_jit_mappings[i].pe_base;
+        uintptr_t nb = (uintptr_t)pe_base;
+        if (!ios_jit_mappings[i].pe_base) continue;
+        if (eb < nb + size && nb < eb + ios_jit_mappings[i].size)
+        {
+            dprintf(2, "[jit-pool] STALE image mapping purged on add: pe=%p+0x%lx jit=%p owner=%p"
+                    " (overlaps new image %p+0x%lx)\n",
+                    (void *)eb, (unsigned long)ios_jit_mappings[i].size,
+                    ios_jit_mappings[i].jit_base, ios_jit_mappings[i].owner_peb,
+                    pe_base, (unsigned long)size);
+            ios_jit_mappings[i].size = 0;
+            __sync_synchronize();
+            ios_jit_mappings[i].pe_base = NULL;
+        }
     }
 
-    if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
+    /* Task #25: prefer a tombstoned slot (pe_base==NULL, left by pool
+     * reclamation) — long multi-process sessions would otherwise exhaust
+     * the table even though reclaim keeps freeing entries. Fields are
+     * written before pe_base (the readers' match key), with a barrier. */
     {
-        /* Hard-ERR (was silent return) — overflow leaks unix addresses through
-         * ios_jit_translate_addr unchanged, breaking dispatch. Bump
-         * IOS_JIT_MAX_MAPPINGS instead of suffering this silently. */
-        ERR("iOS JIT: mapping table FULL (%d slots) — DLL pe_base=%p jit_base=%p WILL FAIL TO TRANSLATE\n",
-            IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
-        return;
+        int slot = -1;
+        for (i = 0; i < ios_jit_mapping_count; i++)
+            if (!ios_jit_mappings[i].pe_base) { slot = i; break; }
+        if (slot < 0)
+        {
+            if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
+            {
+                /* dprintf, NOT ERR: this file's ERRs are on the `virtual` channel,
+                 * which the app's perf-default WINEDEBUG mutes (err-virtual) — the
+                 * 64-slot overflow of 2026-07-06 was invisible for exactly that
+                 * reason. Overflow leaks raw PE addresses through
+                 * ios_jit_translate_addr unchanged → unfixable exec-fault loop. */
+                dprintf(2, "[jit-pool] mapping table FULL (%d slots) — image pe_base=%p jit_base=%p "
+                        "WILL FAIL TO TRANSLATE (exec-fault loop incoming) — bump IOS_JIT_MAX_MAPPINGS!\n",
+                        IOS_JIT_MAX_MAPPINGS, pe_base, jit_base);
+                return;
+            }
+            slot = ios_jit_mapping_count;
+        }
+        ios_jit_mappings[slot].jit_base = jit_base;
+        ios_jit_mappings[slot].size = size;
+        ios_jit_mappings[slot].text_offset = 0;
+        ios_jit_mappings[slot].text_size = 0;
+        ios_jit_mappings[slot].pe_image_base = 0;
+        ios_jit_mappings[slot].reloc_delta = 0;
+        ios_jit_mappings[slot].reloc_rva = 0;
+        ios_jit_mappings[slot].reloc_size = 0;
+        ios_jit_mappings[slot].owner_peb = NULL;
+        __sync_synchronize();
+        ios_jit_mappings[slot].pe_base = pe_base;
+        if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
     }
-    ios_jit_mappings[ios_jit_mapping_count].pe_base = pe_base;
-    ios_jit_mappings[ios_jit_mapping_count].jit_base = jit_base;
-    ios_jit_mappings[ios_jit_mapping_count].size = size;
-    ios_jit_mappings[ios_jit_mapping_count].text_offset = 0;
-    ios_jit_mappings[ios_jit_mapping_count].text_size = 0;
-    ios_jit_mappings[ios_jit_mapping_count].pe_image_base = 0;
-    ios_jit_mappings[ios_jit_mapping_count].reloc_delta = 0;
-    ios_jit_mappings[ios_jit_mapping_count].reloc_rva = 0;
-    ios_jit_mappings[ios_jit_mapping_count].reloc_size = 0;
-    ios_jit_mapping_count++;
 
     /* If xtajit64 has already registered its alias-mapping push callback
      * (via the unix_ios_push_jit_aliases unix-call), forward this new
@@ -270,42 +594,51 @@ NTSTATUS unixcall_ios_push_jit_aliases(void *args)
     int i;
     if (!params || !params->callback) return STATUS_INVALID_PARAMETER;
     ios_jit_alias_pushback_cb = params->callback;
-    /* Drain current table to the callback. */
+    /* Drain current table to the callback. Child-owned copies are skipped:
+     * they share pe_base with the parent entry and pushing both would
+     * double-register the alias range in FEX (x86-64 children under FEX
+     * will need per-process alias routing — deferred to S3). */
     for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        if (ios_jit_mappings[i].owner_peb) continue;
         params->callback((unsigned long long)(uintptr_t)ios_jit_mappings[i].pe_base,
                          (unsigned long long)(uintptr_t)ios_jit_mappings[i].jit_base,
                          (unsigned long long)ios_jit_mappings[i].size);
+    }
     ERR("unixcall_ios_push_jit_aliases: registered callback + drained %d mappings\n",
         ios_jit_mapping_count);
     return STATUS_SUCCESS;
 }
 
-/* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
- * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
- * RX, writes via user_VA fault and the STR fault emulator looks up the RW
- * alias here. Execution faults at user_VA are redirected to the RX alias
- * (which is the only address that's actually executable on iOS TXM). */
-#define IOS_JIT_MAX_ANON_ALIASES 32
-struct ios_jit_anon_alias {
-    uintptr_t user_va;
-    uintptr_t user_va_end;
-    uintptr_t jit_rw_alias;
-    uintptr_t jit_rx_alias;
-};
-static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
-static volatile int ios_jit_anon_alias_count = 0;
-
 void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
 {
-    int idx = __sync_fetch_and_add(&ios_jit_anon_alias_count, 1);
-    if (idx >= IOS_JIT_MAX_ANON_ALIASES) {
-        ERR("iOS JIT: anon alias table full (idx=%d)\n", idx);
-        return;
+    int idx = -1, i;
+
+    /* Task #25: reuse slots cleared by pool reclamation (user_va==0) — FEX
+     * children each add aliases and the 32-slot table used to only grow.
+     * Serialized by the pool lock (adds are rare: CodeBuffer allocations).
+     * Write user_va LAST — it's the match key for the lock-free readers. */
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_anon_alias_count; i++)
+        if (!ios_jit_anon_aliases[i].user_va) { idx = i; break; }
+    if (idx < 0)
+    {
+        if (ios_jit_anon_alias_count >= IOS_JIT_MAX_ANON_ALIASES) {
+            pthread_mutex_unlock( &ios_pool_lock );
+            ERR("iOS JIT: anon alias table full (%d)\n", ios_jit_anon_alias_count);
+            dprintf(2, "[jit-pool] anon alias table FULL (%d slots) — writes to %p will NOT route!\n",
+                    IOS_JIT_MAX_ANON_ALIASES, user_va);
+            return;
+        }
+        idx = ios_jit_anon_alias_count;
     }
-    ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
     ios_jit_anon_aliases[idx].user_va_end = (uintptr_t)user_va + size;
     ios_jit_anon_aliases[idx].jit_rw_alias = (uintptr_t)jit_rw_alias;
     ios_jit_anon_aliases[idx].jit_rx_alias = 0;  /* set via _set_rx */
+    __sync_synchronize();
+    ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
+    if (idx == ios_jit_anon_alias_count) ios_jit_anon_alias_count = idx + 1;
+    pthread_mutex_unlock( &ios_pool_lock );
 }
 
 void ios_jit_anon_alias_set_rx(void *user_va, void *jit_rx_alias)
@@ -422,19 +755,274 @@ void ios_jit_set_teb(uintptr_t teb)
     }
 }
 
-/* Translate a PE address to JIT pool address. Returns original if not mapped. */
-void *ios_jit_translate_addr(void *addr)
+/* S1 pseudo-processes: identify the current thread's "process" by its
+ * TEB->Peb. The TEB is read from the same TSD slot the x18 trampolines
+ * use (async-signal-safe — the SEGV redirect runs on the faulting thread),
+ * with a pthread-key fallback for early boot before the slot offset is
+ * known. NULL = unknown → resolves to parent/default mapping entries. */
+void *ios_jit_current_peb(void)
 {
-    int i;
+    extern pthread_key_t ios_teb_tls_key;
+    extern int ios_teb_tls_slot_offset;
+    char *cur_teb = NULL;
+
+    if (ios_teb_tls_slot_offset)
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        cur_teb = *(char **)(tsd_base + ios_teb_tls_slot_offset);
+    }
+    if (!cur_teb && ios_teb_tls_key) cur_teb = pthread_getspecific(ios_teb_tls_key);
+    if (!cur_teb) return NULL;
+    return ((TEB *)cur_teb)->Peb;
+}
+
+/* Owner-aware main-image machine (X3 mixed-mode); registry in loader_ios.c. */
+USHORT ios_cur_image_info_machine(void)
+{
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    return ios_cur_image_info()->Machine;
+}
+
+/* Translate a PE address to a JIT pool address for a specific process.
+ * An entry owned by `owner_peb` wins; otherwise the NULL-owner (parent)
+ * entry applies. Child processes only own copies of ntdll — every other
+ * module resolves to the shared parent copy via the fallback. */
+void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb)
+{
+    int i, fallback = -1;
     uintptr_t a = (uintptr_t)addr;
 
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (a >= base && a < base + ios_jit_mappings[i].size)
-            return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
+        {
+            if (ios_jit_mappings[i].owner_peb == owner_peb)
+                return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
+            if (!ios_jit_mappings[i].owner_peb && fallback < 0) fallback = i;
+        }
     }
+    if (fallback >= 0)
+        return (void *)((uintptr_t)ios_jit_mappings[fallback].jit_base
+                        + (a - (uintptr_t)ios_jit_mappings[fallback].pe_base));
     return addr;  /* Not in any mapping */
+}
+
+/* Translate a PE address to JIT pool address. Returns original if not mapped.
+ * Owner-aware: resolves against the calling thread's process. */
+void *ios_jit_translate_addr(void *addr)
+{
+    return ios_jit_translate_addr_for_owner(addr, ios_jit_current_peb());
+}
+
+/* IAT-range collector for the stale-pointer heal. The 2026-07-04 boot
+ * breakage came from rewriting EVERY 8-byte slot holding the stale value
+ * — that clobbered arm64x metadata slots whose consumers need PE VAs for
+ * identity/range comparisons. IAT / delay-IAT slots hold nothing but call
+ * targets, so restricting the rewrite to them is semantically safe (it's
+ * the same transform the NtProtect-time IAT-sync applies). Headers are
+ * read from the pool RW copy; RVAs are relocation-invariant. */
+struct ios_iat_range { unsigned int rva, size; };
+
+static int ios_collect_iat_ranges( const unsigned char *img, size_t img_size,
+                                   struct ios_iat_range *out, int max_out )
+{
+    unsigned int e_lfanew, ndirs;
+    const unsigned char *opt;
+    const unsigned int *dir;
+    int n = 0;
+
+    if (img_size < 0x400 || img[0] != 'M' || img[1] != 'Z') return 0;
+    e_lfanew = *(const unsigned int *)(img + 0x3c);
+    if (e_lfanew < 0x40 || e_lfanew > img_size - 0x200) return 0;
+    if (memcmp(img + e_lfanew, "PE\0\0", 4)) return 0;
+    opt = img + e_lfanew + 24;
+    if (*(const unsigned short *)opt != 0x20b) return 0;      /* PE32+ only */
+    ndirs = *(const unsigned int *)(opt + 108);
+    dir = (const unsigned int *)(opt + 112);                  /* {rva,size} pairs */
+
+    /* Data directory 12: the IAT proper. */
+    if (ndirs > 12 && dir[12*2] && dir[12*2+1] &&
+        (size_t)dir[12*2] + dir[12*2+1] <= img_size && n < max_out)
+    {
+        out[n].rva = dir[12*2]; out[n].size = dir[12*2+1]; n++;
+    }
+    /* Directory 1: walk each import descriptor's FirstThunk array —
+     * covers images whose dir-12 entry is absent or incomplete. */
+    if (ndirs > 1 && dir[1*2] && dir[1*2] < img_size)
+    {
+        const unsigned char *desc = img + dir[1*2];
+        while (desc + 20 <= img + img_size && n < max_out)
+        {
+            unsigned int oft = *(const unsigned int *)(desc + 0);
+            unsigned int ft  = *(const unsigned int *)(desc + 16);
+            if (!ft && !oft) break;
+            if (ft && ft < img_size)
+            {
+                const uint64_t *t = (const uint64_t *)(img + ft);
+                unsigned int cnt = 0;
+                while ((const unsigned char *)(t + cnt + 1) <= img + img_size && t[cnt]) cnt++;
+                if (cnt) { out[n].rva = ft; out[n].size = cnt * 8; n++; }
+            }
+            desc += 20;
+        }
+    }
+    /* Directory 13: delay-load descriptors (ImportAddressTableRVA at +12). */
+    if (ndirs > 13 && dir[13*2] && dir[13*2] < img_size)
+    {
+        const unsigned char *dd = img + dir[13*2];
+        while (dd + 32 <= img + img_size && n < max_out)
+        {
+            unsigned int iat_rva = *(const unsigned int *)(dd + 12);
+            unsigned int int_rva = *(const unsigned int *)(dd + 16);
+            if (!iat_rva && !int_rva) break;
+            if (iat_rva && iat_rva < img_size)
+            {
+                const uint64_t *t = (const uint64_t *)(img + iat_rva);
+                unsigned int cnt = 0;
+                while ((const unsigned char *)(t + cnt + 1) <= img + img_size && t[cnt]) cnt++;
+                if (cnt) { out[n].rva = iat_rva; out[n].size = cnt * 8; n++; }
+            }
+            dd += 32;
+        }
+    }
+    return n;
+}
+
+/* Self-heal one stale PE-VA pointer: rewrite IAT/delay-IAT slots in the
+ * module-copy pool ranges that hold `stale_va` to its pool-VA equivalent.
+ * Called from the heal scanner thread (signal_arm64_ios.c) for addresses
+ * that exec-faulted 256+ times — i.e. values being BRANCHED to through
+ * import slots the NtProtect-time IAT-sync missed (the two-cube DXMT
+ * storm: child winemetal's pool IAT held the child EC ntdll's map VA for
+ * __wine_unix_call → one Mach exception per Metal call). Scans only
+ * registered module copies (never the FEX CodeBuffer tail). Writes go to
+ * the RW alias; concurrent readers that still load the old value just
+ * take one more fault-redirect, which is benign. */
+int ios_jit_patch_stale_pointer(unsigned long long stale_va)
+{
+    int i, patched = 0;
+    void *target = ios_jit_translate_addr_for_owner((void *)(uintptr_t)stale_va, NULL);
+    if (!ios_jit_rw_base_global || !ios_jit_rx_base_global) return 0;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        /* Heal each pool range with ITS OWNER's translation: a stale
+         * ntdll PE-VA inside a child-owned copy must point at the child's
+         * copy, not the parent's. */
+        void *range_target = ios_jit_translate_addr_for_owner(
+            (void *)(uintptr_t)stale_va, ios_jit_mappings[i].owner_peb);
+        uintptr_t pool_off = (uintptr_t)ios_jit_mappings[i].jit_base
+                           - (uintptr_t)ios_jit_rx_base_global;
+        unsigned char *rw_img = (unsigned char *)ios_jit_rw_base_global + pool_off;
+        struct ios_iat_range ranges[64];
+        int nr, r;
+        if (range_target == (void *)(uintptr_t)stale_va) continue;
+        nr = ios_collect_iat_ranges(rw_img, ios_jit_mappings[i].size, ranges, 64);
+        for (r = 0; r < nr; r++)
+        {
+            uint64_t *p = (uint64_t *)(rw_img + ranges[r].rva);
+            uint64_t *end = (uint64_t *)(rw_img + ranges[r].rva + (ranges[r].size & ~7u));
+            for (; p < end; p++)
+            {
+                if (*p == stale_va)
+                {
+                    *p = (uint64_t)(uintptr_t)range_target;
+                    patched++;
+                }
+            }
+        }
+    }
+    /* Escalation (task #25 follow-through on the parked #23 "rewrote 0"
+     * case): the DXMT unix-call storm pointer lives in a winecrt0-style
+     * .data GLOBAL, not an IAT — the IAT-restricted pass finds nothing and
+     * the same VA keeps costing one Mach exception per Metal call (118K+
+     * observed; handler saturation = the desktop "freezes"). When the IAT
+     * pass strikes out, scan each copy's data (whole image minus its known
+     * .text) for the exact 8-byte value. Exact-match + the 256-fault
+     * threshold that gates this function keep it far from the 2026-07-04
+     * blind-rewrite failure mode. */
+    /* Whole-.data exact-value scan+rewrite. DEFAULT-ON (2026-07-08:
+     * confirmed NOT the cause of the Thumper menu→game freeze — that is
+     * the pre-existing ~53.7s JIT-compile/debugger block, task #22, which
+     * reproduced with this gated OFF). Set MYTHIC_NO_HEAL_ESCALATE=1 to
+     * disable if a false-positive rewrite is ever suspected (it rewrites
+     * ANY 8-byte word equal to the stale VA, a small coincidental-collision
+     * risk on data-heavy x86 guests). */
+    if (!patched && !getenv("MYTHIC_NO_HEAL_ESCALATE"))
+    {
+        for (i = 0; i < ios_jit_mapping_count; i++)
+        {
+            void *range_target = ios_jit_translate_addr_for_owner(
+                (void *)(uintptr_t)stale_va, ios_jit_mappings[i].owner_peb);
+            uintptr_t pool_off = (uintptr_t)ios_jit_mappings[i].jit_base
+                               - (uintptr_t)ios_jit_rx_base_global;
+            unsigned char *rw_img = (unsigned char *)ios_jit_rw_base_global + pool_off;
+            size_t tx_start = ios_jit_mappings[i].text_offset;
+            size_t tx_end   = tx_start + ios_jit_mappings[i].text_size;
+            uint64_t *p   = (uint64_t *)rw_img;
+            uint64_t *end = (uint64_t *)(rw_img + (ios_jit_mappings[i].size & ~(size_t)7));
+            if (range_target == (void *)(uintptr_t)stale_va) continue;
+            for (; p < end; p++)
+            {
+                size_t off = (size_t)((unsigned char *)p - rw_img);
+                if (ios_jit_mappings[i].text_size && off >= tx_start && off < tx_end) continue;
+                if (*p == stale_va)
+                {
+                    *p = (uint64_t)(uintptr_t)range_target;
+                    patched++;
+                }
+            }
+        }
+        if (patched)
+            fprintf(stderr, "[stale-heal] 0x%llx ESCALATED: rewrote %d data slot(s) outside IATs\n",
+                    stale_va, patched);
+    }
+    /* fprintf, not ERR — the perf WINEDEBUG default mutes err+virtual and
+     * this MUST stay visible (silent healing hid the 2026-07-04 boot
+     * breakage). */
+    fprintf(stderr, "[stale-heal] 0x%llx -> %p, rewrote %d slot(s)\n",
+            stale_va, target, patched);
+    return patched;
+}
+
+/* task #24 [term-stack]: map a guest PE VA to its module base + size so
+ * the terminate-time stack dump can self-attribute return addresses. */
+unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out)
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if (va >= b && va < b + ios_jit_mappings[i].size)
+        {
+            if (size_out) *size_out = ios_jit_mappings[i].size;
+            return b;
+        }
+    }
+    return 0;
+}
+
+/* [xlate-exec] forensics: which mapping's pool range contains `addr`, and
+ * who owns it. Names the COPY a thread is executing (session vs child),
+ * which reverse_translate alone can't — copies share PE VAs. */
+void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out)
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t a = (uintptr_t)addr;
+        uintptr_t jit_base = (uintptr_t)ios_jit_mappings[i].jit_base;
+        if (a >= jit_base && a < jit_base + ios_jit_mappings[i].size)
+        {
+            if (pe_base_out) *pe_base_out = ios_jit_mappings[i].pe_base;
+            return ios_jit_mappings[i].owner_peb;
+        }
+    }
+    if (pe_base_out) *pe_base_out = NULL;
+    return (void *)(uintptr_t)-1;  /* not in any pool mapping */
 }
 
 /* Reverse-translate a JIT pool address back to the original PE address.
@@ -459,25 +1047,31 @@ void *ios_jit_reverse_translate_addr(const void *addr)
  * that the JIT pool code needs to read. */
 void ios_jit_sync_write(void *addr, size_t size)
 {
-    int i;
+    int i, fallback = -1;
     uintptr_t a = (uintptr_t)addr;
+    void *cur_peb = ios_jit_current_peb();
 
+    /* Owner-aware: sync into the copy the CURRENT process's PE code reads
+     * (child init syncs into the child's ntdll copy; parent boot into the
+     * parent's). Falls back to the NULL-owner entry like translate does. */
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
-        uintptr_t a = (uintptr_t)addr;
         uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
         if (a >= base && a < base + ios_jit_mappings[i].size)
         {
-            /* Compute offset within the image */
-            size_t off = a - base;
-            /* The JIT RW mapping is at ios_jit_rw_base_global + pool_offset.
-             * The pool_offset = jit_base - jit_rx_base_global */
-            uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[i].jit_base
-                                  - (uintptr_t)ios_jit_rx_base_global;
-            char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
-            memcpy(jit_rw_dest, addr, size);
-            return;
+            if (ios_jit_mappings[i].owner_peb == cur_peb) { fallback = i; break; }
+            if (!ios_jit_mappings[i].owner_peb && fallback < 0) fallback = i;
         }
+    }
+    if (fallback >= 0)
+    {
+        size_t off = a - (uintptr_t)ios_jit_mappings[fallback].pe_base;
+        /* The JIT RW mapping is at ios_jit_rw_base_global + pool_offset.
+         * The pool_offset = jit_base - jit_rx_base_global */
+        uintptr_t pool_offset = (uintptr_t)ios_jit_mappings[fallback].jit_base
+                              - (uintptr_t)ios_jit_rx_base_global;
+        char *jit_rw_dest = (char *)ios_jit_rw_base_global + pool_offset + off;
+        memcpy(jit_rw_dest, addr, size);
     }
 }
 
@@ -521,8 +1115,15 @@ static int ios_insn_x18_role(uint32_t insn)
         if (rn == 18) return X18_ROLE_RN;
     }
 
-    /* LDR/STR (register offset) — [31:21]=1x111000xx1, [11:10]=10 */
-    if ((top11 & 0x3E7) == 0x1C1 && ((insn >> 10) & 3) == 2)
+    /* LDR/STR (register offset) — [29:27]=111, V=0, [25:24]=00, [21]=1,
+     * [11:10]=10; size [31:30] and opc [23:22] are DON'T-CARES.
+     * iOS-Mythic 2026-07-04: mask was 0x3E7/0x1C1 which demanded
+     * insn[30]==0 AND insn[22]==0 — i.e. only 8/32-bit STORES matched.
+     * Every register-offset LOAD off x18 (`ldrb w8,[x18,x8]` — win32u's
+     * hottest TEB poll) went unpatched and cost one Mach fault per visit
+     * whenever x18 was 0 (~14%% of game-thread samples once
+     * UNIXCALL-DIRECT removed the constant x18 refresh). */
+    if ((top11 & 0x1F9) == 0x1C1 && ((insn >> 10) & 3) == 2)
     {
         if (rn == 18) return X18_ROLE_RN;
         if (rm == 18) return X18_ROLE_RM;
@@ -583,17 +1184,112 @@ static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)
  * tramp_rw/tramp_rx: RW and RX views of the trampoline area
  * tramp_size: available space for trampolines
  * Returns number of instructions patched. */
+/* Literal-pool data map builder — see the guard comment in
+ * ios_jit_patch_x18. Shared by the patcher and the trampoline-need
+ * counter. Caller frees. NULL on alloc failure (callers degrade to the
+ * unguarded pre-2026-07-07 behavior). */
+static unsigned char *ios_x18_build_data_map( const char *text, size_t text_size )
+{
+    unsigned char *data_map = calloc( 1, text_size / 32 + 1 );
+    if (!data_map) return NULL;
+    for (size_t i = 0; i < text_size; i += 4)
+    {
+        uint32_t insn = *(const uint32_t *)(text + i);
+        uint32_t top8 = insn >> 24;
+        size_t lit_bytes;
+        int64_t imm19;
+        size_t tgt;
+        switch (top8)
+        {
+        case 0x18: case 0x1C: case 0x98: lit_bytes = 4;  break;  /* LDR Wt/St, LDRSW */
+        case 0x58: case 0x5C: case 0xD8: lit_bytes = 8;  break;  /* LDR Xt/Dt, PRFM  */
+        case 0x9C:                       lit_bytes = 16; break;  /* LDR Qt           */
+        default: continue;
+        }
+        imm19 = (int64_t)(int32_t)(insn << 8) >> 13;  /* sign-extend bits[23:5] */
+        tgt = i + (size_t)(imm19 * 4);
+        if (imm19 * 4 + (int64_t)i < 0 || tgt >= text_size) continue;
+        for (size_t b = tgt; b < tgt + lit_bytes && b < text_size; b += 4)
+            data_map[(b / 4) >> 3] |= 1 << ((b / 4) & 7);
+    }
+    return data_map;
+}
+
+/* Task #25: exact trampoline budget. The old callers reserved 100% of
+ * .text for trampolines and used ~1% (894 patches × 28B ≈ 25KB against a
+ * 2.2MB reservation for ntdll) — with per-child copies of every DLL that
+ * waste was ~HALF the pool (4 apps hit 368/384MB). Count the actual
+ * patch sites and size the reservation to fit. */
+size_t ios_jit_x18_tramp_need( const char *text, size_t text_size )
+{
+    unsigned char *data_map = ios_x18_build_data_map( text, text_size );
+    size_t need = 0;
+    for (size_t i = 0; i < text_size; i += 4)
+    {
+        uint32_t insn = *(const uint32_t *)(text + i);
+        if (data_map && (data_map[(i / 4) >> 3] & (1 << ((i / 4) & 7)))) continue;
+        if (ios_insn_x18_role( insn ) != X18_ROLE_NONE) need += 32;
+    }
+    free( data_map );
+    /* Slack: the patcher's per-site max is 32B; pad one page so a
+     * count/patch drift (e.g. data_map alloc failing in one of the two
+     * passes) can't run the patcher out of space. */
+    return need + 0x1000;
+}
+
 int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
                        char *tramp_rw, char *tramp_rx, size_t tramp_size)
 {
     size_t tramp_off = 0;
     int count = 0;
     int skipped = 0;
+    int lit_skipped = 0;
+    unsigned char *data_map = NULL;
+
+    /* B/BL reach guard (Steam S3 run 11 root cause): imm26 spans ±128MB.
+     * The patcher used to encode out-of-range tramp offsets silently
+     * truncated mod 256MB → branches into untouched pool (the run 7-11
+     * "poison pointer" crash family). The allocator now anchors tramp
+     * ranges near the image; this guard makes an out-of-reach pair a hard
+     * REFUSAL (unpatched x18 insns degrade to recoverable runtime faults,
+     * a truncated branch is fatal). */
+    {
+        intptr_t d1 = (tramp_rx + tramp_size) - text_rx;
+        intptr_t d2 = tramp_rx - (text_rx + text_size);
+        if (d1 > 0x7C00000 || d1 < -0x7C00000 || d2 > 0x7C00000 || d2 < -0x7C00000)
+        {
+            dprintf(2, "[x18-tramp] REFUSED: tramp %p+0x%lx out of B/BL reach of text %p+0x%lx\n",
+                    tramp_rx, (unsigned long)tramp_size, text_rx, (unsigned long)text_size);
+            return 0;
+        }
+    }
+
+    /* Literal-pool guard (2026-07-07, conhost boot-death): .text embeds
+     * DATA — every syscall stub ends `ldr x16, <lit>; ldr x16,[x16]; blr
+     * x16; ret; <8-byte slot address>`. The literal's VALUE depends on the
+     * copy's pool base (DIR64-rebased), and for bases in 0x128xxxxxxx the
+     * low word decoded as LDP with rt2=18 → the patcher stamped a branch
+     * over the literal → the stub loaded a garbage dispatcher → BLR to
+     * junk on the child's FIRST syscall. Pure address lottery; also
+     * latent for session copies (image VAs 0x7fb9.../0x7ff9... make
+     * 0xB9/0xF9-topped literals = LDR-class false matches).
+     * Fix: pre-scan for LDR (literal) instructions and mark their target
+     * words as data; never patch a data word. False LDR-literal decodes
+     * (data that happens to look like one) only mark extra words as data
+     * — an unpatched real instruction degrades to a recoverable runtime
+     * fault, while a patched literal is fatal. Asymmetry favors skipping. */
+    data_map = ios_x18_build_data_map( text_rw, text_size );
 
     for (size_t i = 0; i < text_size; i += 4)
     {
         uint32_t insn = *(uint32_t *)(text_rw + i);
-        int role = ios_insn_x18_role(insn);
+        int role;
+        if (data_map && (data_map[(i / 4) >> 3] & (1 << ((i / 4) & 7))))
+        {
+            if (ios_insn_x18_role(insn) != X18_ROLE_NONE) lit_skipped++;
+            continue;
+        }
+        role = ios_insn_x18_role(insn);
         if (role == X18_ROLE_NONE) continue;
 
         /* Determine scratch register — use x17 normally.
@@ -700,6 +1396,12 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
     if (count > 0 || skipped > 0)
         ERR("x18 patcher: patched %d instructions (%d skipped), trampolines=%lu bytes\n",
             count, skipped, (unsigned long)tramp_off);
+    /* dprintf, not ERR (err-virtual muted): literal words the x18 matcher
+     * WOULD have clobbered — nonzero = a dodged conhost-class boot death. */
+    if (lit_skipped)
+        dprintf(2, "[x18-lit] %d literal-pool word(s) matched x18 patterns — skipped (data, not code)\n",
+                lit_skipped);
+    free( data_map );
 
     /* Verify: log first patched instruction's encoding */
     if (count > 0)
@@ -835,6 +1537,13 @@ static void *host_addr_space_limit;  /* top of the host virtual address space */
 
 static struct file_view *arm64ec_view;
 
+/* X3c: EC bitmap base for wiring EcCodeBitMap into cross-arch child PEBs
+ * (alloc_arm64ec_map only sets it on the PEB current at first allocation). */
+void *ios_arm64ec_bitmap_base(void)
+{
+    return arm64ec_view ? arm64ec_view->base : NULL;
+}
+
 ULONG_PTR user_space_wow_limit = 0;
 struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
 
@@ -895,12 +1604,18 @@ static inline BOOL is_vprot_exec_write( BYTE vprot )
     return (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY));
 }
 
+/* task #34 [jit-tripwire]: defined below; forward-declared so the fixed-map
+ * helpers above its definition can instrument JIT-pool-range clobbers. */
+static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,
+                                    int prot, void *retaddr );
+
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
+    ios_jit_range_tripwire( "anon_mmap_fixed", start, size, prot, __builtin_return_address(0) );
     return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
 }
 
@@ -910,6 +1625,33 @@ void *anon_mmap_alloc( size_t size, int prot )
     assert( !(size & host_page_mask) );
 
     return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+}
+
+/* task #34 [jit-tripwire]: ml74's fatal page (0x125114000, inside the JIT
+ * pool RX view) faulted on EXECUTE with prot=RW max_prot=RW. max_prot can
+ * only DROP via a fresh mapping, never via mprotect — so some path REPLACED
+ * a pool code page with a plain RW anon mapping (MAP_FIXED clobber, or a
+ * munmap whose hole a later kernel-pick refilled). Every wine unmap and
+ * fixed-map flows through unmap_area / remove_reserved_area /
+ * anon_mmap_fixed / anon_mmap_tryfixed: log any call intersecting the pool
+ * RX view or its RW alias, with the instrumented site's return address, so
+ * one device run names the culprit. Legit hits exist (pool tail EC_CODE
+ * carves, decommit of pool-backed anon RWX) — the log includes the range so
+ * they can be told apart from clobbers of live image-copy code. */
+static void ios_jit_range_tripwire( const char *tag, const void *addr, size_t size,
+                                    int prot, void *retaddr )
+{
+    uintptr_t a = (uintptr_t)addr, e = a + size;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t ps = ios_jit_pool_size_global;
+    static volatile int n;
+
+    if (!ps || !addr || !size) return;
+    if (!((rx && a < rx + ps && e > rx) || (rw && a < rw + ps && e > rw))) return;
+    if (__sync_fetch_and_add( &n, 1 ) > 300) return;
+    dprintf(2, "[jit-tripwire] %s addr=%p size=0x%lx prot=%d caller=%p (pool rx=%p rw=%p)\n",
+            tag, addr, (unsigned long)size, prot, retaddr, (void *)rx, (void *)rw);
 }
 
 #ifdef USE_UFFD_WRITEWATCH
@@ -1225,6 +1967,9 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 {
     void *ptr;
 
+    /* no [jit-tripwire] here: tryfixed is no-clobber by definition (fails on
+     * overlap), and ml75 showed it drowns the cap in pool-setup boot noise. */
+
 #ifdef MAP_FIXED_NOREPLACE
     ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
 #elif defined(MAP_TRYFIXED)
@@ -1490,6 +2235,36 @@ static NTSTATUS ios_stub_unix_call(void *args) {
     return STATUS_NOT_SUPPORTED;
 }
 
+static NTSTATUS ios_stub_unix_call_ok(void *args) {
+    return STATUS_SUCCESS;
+}
+
+/* iOS-Mythic 2026-07-10: the unixlib "funcs" value handed back to the PE
+ * side is a TABLE that __wine_unix_call_dispatcher indexes as
+ * funcs[code](args) — storing a bare function there makes UNIX_CALL read
+ * the stub's own instruction bytes as a pointer and blr to garbage (the
+ * Steam vgui2/opengl32 crash). The no-unix-side fallback must therefore
+ * be a table of stubs. 4096 slots covers the largest builtin enum
+ * (opengl32 funcs_count = 3107). */
+#define IOS_STUB_TABLE_SIZE 4096
+static unixlib_entry_t ios_stub_unix_call_table[IOS_STUB_TABLE_SIZE];
+/* opengl32 variant: process_attach / thread_attach / process_detach
+ * (codes 0-2 in dlls/opengl32/unixlib.h) return SUCCESS so DllMain lets
+ * the DLL load; every real wgl/gl call fails with NOT_SUPPORTED (no host
+ * GL on iOS — DXMT is D3D-only, callers must treat GL as absent). */
+static unixlib_entry_t ios_gl_stub_unix_call_table[IOS_STUB_TABLE_SIZE];
+
+static pthread_once_t ios_stub_tables_once = PTHREAD_ONCE_INIT;
+static void ios_init_stub_tables(void)
+{
+    unsigned int i;
+    for (i = 0; i < IOS_STUB_TABLE_SIZE; i++)
+        ios_stub_unix_call_table[i] = ios_gl_stub_unix_call_table[i] = ios_stub_unix_call;
+    ios_gl_stub_unix_call_table[0] = ios_stub_unix_call_ok;  /* process_attach */
+    ios_gl_stub_unix_call_table[1] = ios_stub_unix_call_ok;  /* thread_attach */
+    ios_gl_stub_unix_call_table[2] = ios_stub_unix_call_ok;  /* process_detach */
+}
+
 /* DXMT's unix call table, statically linked into Mythic.app via
  * libdxmt_combined.a (originally __wine_unix_call_funcs, renamed in
  * winemetal_unix.c to avoid collision with our own ntdll table). */
@@ -1500,6 +2275,17 @@ extern const void *dxmt_winemetal_unix_call_funcs[];
  * a real-time IAudioClock — enough for FMOD's rhythm-game timing engine
  * to advance past audio-gated splash/intro sequences. See audio_null_ios.c */
 extern const void *audio_null_ios_unix_call_funcs[];
+
+/* iOS-Mythic 2026-07-05 (Steam S0): network + crypto unix tables,
+ * compiled from wine/dlls/<dll>/ sources into libntdll_unix.a with
+ * -D__wine_unix_call_funcs=<dll>_unix_call_funcs (build/ntdll-unix/
+ * build.sh compile_unixlib). The GnuTLS-backed ones (bcrypt, secur32,
+ * crypt32) resolve libgnutls statically via build/crypto-unix/
+ * gnutls_symtab_ios.c instead of dlopen. */
+extern const void *ws2_32_unix_call_funcs[];
+extern const void *bcrypt_unix_call_funcs[];
+extern const void *secur32_unix_call_funcs[];
+extern const void *crypt32_unix_call_funcs[];
 
 /* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
  * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
@@ -1564,25 +2350,53 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             ERR("iOS: module %p (%s) -> audio_null_ios_unix_call_funcs (%p)\n",
                 module, match, audio_null_ios_unix_call_funcs);
             status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "ws2_32")) {
+            *funcs = (const void *)ws2_32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> ws2_32_unix_call_funcs (%p)\n",
+                module, match, (void *)ws2_32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "bcrypt")) {
+            *funcs = (const void *)bcrypt_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> bcrypt_unix_call_funcs (%p)\n",
+                module, match, (void *)bcrypt_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "secur32")) {
+            *funcs = (const void *)secur32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> secur32_unix_call_funcs (%p)\n",
+                module, match, (void *)secur32_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "crypt32")) {
+            *funcs = (const void *)crypt32_unix_call_funcs;
+            dprintf(2, "[unixlib] module %p (%s) -> crypt32_unix_call_funcs (%p)\n",
+                module, match, (void *)crypt32_unix_call_funcs);
+            status = STATUS_SUCCESS;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
              * Activating this causes user32 process_attach to crash until
              * wineserver shared-memory bringup is complete; gated on the
              * MYTHIC_WIN32U env var so we can flip it on for debugging. */
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
             if (getenv("MYTHIC_WIN32U")) {
                 NTSTATUS s = win32u_unix_lib_init();
-                *funcs = (const void *)ios_stub_unix_call;
+                *funcs = (const void *)ios_stub_unix_call_table;
                 WARN_(module)("iOS: module %p (%s) -> win32u_unix_lib_init() = 0x%x (ACTIVE)\n",
                               module, match, s);
             } else {
-                *funcs = (const void *)ios_stub_unix_call;
+                *funcs = (const void *)ios_stub_unix_call_table;
                 WARN_(module)("iOS: module %p (%s) -> win32u unix lib linked but dormant\n",
                               module, match);
             }
             status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "opengl32")) {
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
+            *funcs = (const void *)ios_gl_stub_unix_call_table;
+            WARN_(module)("iOS: module %p (%s) -> GL-absent stub table (attach ok, wgl/gl NOT_SUPPORTED)\n",
+                          module, match);
+            status = STATUS_SUCCESS;
         } else {
-            *funcs = (const void *)ios_stub_unix_call;
-            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub\n",
+            pthread_once( &ios_stub_tables_once, ios_init_stub_tables );
+            *funcs = (const void *)ios_stub_unix_call_table;
+            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub table\n",
                           module, up ? up : "(null)", modname ? modname : "(null)");
             status = STATUS_SUCCESS;
         }
@@ -2028,6 +2842,123 @@ static void set_arm64ec_range( const void *addr, size_t size )
     else map[pos] |= maskbits( idx ) & ~maskbits( end );
 }
 
+/* Exported: mark an arbitrary range (e.g. hand-written stubs in the pool's
+ * reserved page) as ARM64EC code, committing the covering bitmap pages
+ * first. Without the bit set, arm64x_check_call routes branches to the
+ * range into the x86 emulator, which compiles the ARM64 bytes as x86
+ * (observed: the unix-call x18-restore stub executed as guest RIP).
+ * Returns 1 if marked, 0 if the EC bitmap doesn't exist yet (caller
+ * must treat the range as NOT callable via checked indirect calls). */
+int ios_jit_mark_ec_range( const void *addr, size_t size )
+{
+    if (!arm64ec_view) return 0;
+    {
+        size_t bm_start = ((size_t)addr >> 12) / 8;
+        size_t bm_end   = (((size_t)addr + size) >> 12) / 8;
+        size_t bm_size  = ROUND_SIZE( bm_start, bm_end + 1 - bm_start, page_mask );
+        void *bm_page   = ROUND_ADDR( (char *)arm64ec_view->base + bm_start, page_mask );
+        set_vprot( arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+    }
+    set_arm64ec_range( addr, size );
+    return 1;
+}
+
+/* upstream's clear_arm64ec_range (defined below) is the inverse of
+ * set_arm64ec_range; reclamation clears freed ranges so a reused range
+ * that later hosts a pure-x64 copy doesn't keep stale EC bits (which
+ * would make arm64x_check_call BL into x86-64 bytes as if ARM64). */
+static void clear_arm64ec_range( const void *addr, size_t size );
+
+/* Task #25: release everything a dead pseudo-process allocated from the
+ * pool head. Called from process_exit_wrapper on the dying process's own
+ * thread — its ranges become reusable after IOS_POOL_REUSE_GRACE_SEC (see
+ * the ledger comment for why laggard exit threads make immediate reuse
+ * unsafe). Mapping entries covering freed ranges are tombstoned
+ * (size=0 → matches nothing; pe_base=NULL → slot reusable); anon RWX
+ * aliases (FEX CodeBuffers) in freed ranges are cleared; EC bitmap bits
+ * are cleared so a reused range starts with a clean call-routing slate. */
+void ios_jit_reclaim_process( void *peb )
+{
+    size_t total = 0;
+    int ranges = 0, maps_killed = 0, aliases_killed = 0;
+    int i, j;
+    char *rx_base = (char *)ios_jit_rx_base_global;
+
+    if (!peb || !rx_base) return;
+
+    pthread_mutex_lock( &ios_pool_lock );
+
+    for (i = 0; i < ios_pool_ledger_count; )
+    {
+        size_t off, size;
+        if (ios_pool_ledger[i].peb != peb) { i++; continue; }
+        off  = ios_pool_ledger[i].off;
+        size = ios_pool_ledger[i].size;
+
+        /* Tombstone mapping entries whose pool copy lives in this range.
+         * Write order matters for the lock-free readers (translate /
+         * fault handler): size=0 first — a zero-size entry matches no
+         * query — then pe_base=NULL (the free-slot marker). */
+        for (j = 0; j < ios_jit_mapping_count; j++)
+        {
+            char *jb = (char *)ios_jit_mappings[j].jit_base;
+            if (!ios_jit_mappings[j].pe_base) continue;
+            if (jb >= rx_base + off && jb < rx_base + off + size)
+            {
+                ios_jit_mappings[j].size = 0;
+                __sync_synchronize();
+                ios_jit_mappings[j].pe_base = NULL;
+                maps_killed++;
+            }
+        }
+
+        /* Clear anon RWX aliases (FEX CodeBuffers) backed by this range. */
+        for (j = 0; j < ios_jit_anon_alias_count; j++)
+        {
+            uintptr_t rx = ios_jit_anon_aliases[j].jit_rx_alias;
+            if (!ios_jit_anon_aliases[j].user_va) continue;
+            if (rx >= (uintptr_t)(rx_base + off) && rx < (uintptr_t)(rx_base + off + size))
+            {
+                ios_jit_anon_aliases[j].user_va_end = 0;
+                __sync_synchronize();
+                ios_jit_anon_aliases[j].user_va = 0;
+                aliases_killed++;
+            }
+        }
+
+        if (arm64ec_view) clear_arm64ec_range( rx_base + off, size );
+
+        if (ios_pool_free_count < IOS_POOL_FREE_MAX)
+        {
+            ios_pool_freelist[ios_pool_free_count].off = off;
+            ios_pool_freelist[ios_pool_free_count].size = size;
+            ios_pool_freelist[ios_pool_free_count].freed_at = time( NULL );
+            /* Physical pages returned post-grace by the allocator's
+             * MADV_FREE sweep (not here — laggard exit threads may still
+             * execute this range during the grace window, and a purged
+             * page reads zero). */
+            ios_pool_freelist[ios_pool_free_count].advised = 0;
+            ios_pool_free_count++;
+            total += size;
+            ranges++;
+        }
+        else dprintf(2, "[jit-pool] freelist FULL — leaking range off=0x%lx size=0x%lx\n",
+                     (unsigned long)off, (unsigned long)size);
+
+        /* Remove ledger entry (swap-with-last). */
+        ios_pool_ledger[i] = ios_pool_ledger[--ios_pool_ledger_count];
+    }
+
+    pthread_mutex_unlock( &ios_pool_lock );
+
+    if (ranges || maps_killed)
+        dprintf(2, "[jit-pool] RECLAIM peb=%p: %d ranges 0x%lx bytes freed (grace %ds), "
+                "%d mappings tombstoned, %d anon aliases cleared; bump=0x%lx freelist=%d\n",
+                peb, ranges, (unsigned long)total, IOS_POOL_REUSE_GRACE_SEC,
+                maps_killed, aliases_killed,
+                (unsigned long)jit_pool_offset, ios_pool_free_count);
+}
+
 
 /***********************************************************************
  *           clear_arm64ec_range
@@ -2425,12 +3356,19 @@ static void remove_reserved_area( void *addr, size_t size )
     {
         if ((char *)view->base >= (char *)addr + size) break;
         if ((char *)view->base + view->size <= (char *)addr) continue;
-        if (view->base > addr) munmap( addr, (char *)view->base - (char *)addr );
+        if (view->base > addr)
+        {
+            ios_jit_range_tripwire( "remove_reserved_area", addr,
+                                    (char *)view->base - (char *)addr, -1,
+                                    __builtin_return_address(0) );
+            munmap( addr, (char *)view->base - (char *)addr );
+        }
         if ((char *)view->base + view->size > (char *)addr + size) return;
         view_size = ROUND_SIZE( view->base, view->size, host_page_mask );
         size = (char *)addr + size - ((char *)view->base + view_size);
         addr = (char *)view->base + view_size;
     }
+    ios_jit_range_tripwire( "remove_reserved_area", addr, size, -1, __builtin_return_address(0) );
     munmap( addr, size );
 }
 
@@ -2448,6 +3386,8 @@ static void unmap_area( void *start, size_t size )
 
     assert( !((UINT_PTR)start & host_page_mask) );
     size = ROUND_SIZE( 0, size, host_page_mask );
+
+    ios_jit_range_tripwire( "unmap_area", start, size, -1, __builtin_return_address(0) );
 
     if (!(size = unmap_area_above_user_limit( start, size ))) return;
 
@@ -2720,7 +3660,8 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         static void *jit_rx_base = NULL;
         static void *jit_rw_base = NULL;
         static size_t jit_pool_size = 0;
-        static size_t jit_pool_offset = 0;
+        /* jit_pool_offset promoted to file scope (S1: shared with the
+         * per-child ntdll copy allocator). */
         static int jit_pool_init_done = 0;
 
         if (!jit_pool_init_done)
@@ -2860,6 +3801,15 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     /* If mach_vm_region returned a region above scan,
                      * scan is unmapped — skip ahead to that region's start. */
                     if ((char *)qa > scan) break;
+                    /* Mapped but not readable (PROT_NONE reservation, or
+                     * exec-only JIT page): dereferencing faults even though
+                     * vm_region reports a region. A PE image is contiguously
+                     * readable, so a non-readable page means we've walked
+                     * below the image — stop the scan. (Seen 2026-07-03:
+                     * X64ReturnInstr's anon-RWX VA sat above a PROT_NONE
+                     * Wine reservation; the scan deref'd it, the resulting
+                     * UNHANDLED faults derailed the whole redirect.) */
+                    if (!(qinfo.protection & VM_PROT_READ)) break;
                 }
                 if (*(unsigned short *)scan == 0x5A4D)  /* MZ */
                 {
@@ -2887,13 +3837,17 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                  * FEX executes via user_VA → R+X works. */
                 size_t page_size = 0x4000;
                 size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
-                size_t offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
-                if (offset + alloc_size > jit_pool_size)
+                size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
+                if (offset == (size_t)-1)
                 {
                     ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
                         base, (unsigned long)size);
+                    dprintf(2, "[jit-pool] EXHAUSTED (anon RWX): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING allocation\n",
+                            (unsigned long)alloc_size, (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
+                            (unsigned long)ios_jit_tail_reserved, ios_pool_free_count);
                     mprotect( base, size, PROT_READ );
-                    return 0;
+                    errno = ENOMEM;
+                    return -1;
                 }
 
                 vm_address_t target = (vm_address_t)base;
@@ -2958,19 +3912,32 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     base, (unsigned long)alloc_size, (unsigned long)offset,
                     (char *)jit_rx_base + offset, (char *)jit_rw_base + offset,
                     cur_prot, max_prot);
+                dprintf(2, "[jit-pool] anon RWX %p size=0x%lx → used=0x%lx/0x%lx\n",
+                        base, (unsigned long)alloc_size,
+                        (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
                 return 0;
             }
 
             /* Align to 16KB page boundary */
             size_t page_size = 0x4000;
             size_t alloc_size = (image_size + page_size - 1) & ~(page_size - 1);
-            size_t offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
+            size_t offset = ios_pool_alloc_range(alloc_size, jit_pool_size - ios_jit_tail_reserved);
 
-            if (offset + alloc_size > jit_pool_size)
+            if (offset == (size_t)-1)
             {
                 ERR("iOS JIT: pool exhausted\n");
+                /* Task #25: FAIL the protect instead of silently leaving the
+                 * image R-only — the old path returned success and the first
+                 * call into the module BUS-fault-looped, locking the whole
+                 * session. -1/ENOMEM propagates up as a failed module load /
+                 * failed process start, which the shell reports and survives. */
+                dprintf(2, "[jit-pool] EXHAUSTED (image %p+0x%lx): want=0x%lx bump=0x%lx/0x%lx tail_resv=0x%lx freelist=%d — FAILING the load (was: silent BUS loop)\n",
+                        image_base, (unsigned long)image_size, (unsigned long)alloc_size,
+                        (unsigned long)jit_pool_offset, (unsigned long)jit_pool_size,
+                        (unsigned long)ios_jit_tail_reserved, ios_pool_free_count);
                 mprotect( base, size, PROT_READ );
-                return 0;
+                errno = ENOMEM;
+                return -1;
             }
 
             /* Copy ENTIRE PE image to JIT pool (code + data + headers).
@@ -2985,6 +3952,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+            dprintf(2, "[jit-pool] image %p+0x%lx → pool %p used=0x%lx/0x%lx\n",
+                    image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
+                    (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
 
             /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap —
              * but ONLY for ARM64EC hybrid PEs. ARM64EC binaries have
@@ -3323,12 +4293,18 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     }
                     if (text_sz > 0)
                     {
-                        /* Allocate trampoline space: ~24 bytes per x18 ref, estimate ~1% of .text */
-                        size_t tramp_budget = text_sz;  /* generous: same size as .text */
+                        /* Task #25: exact budget (was 100% of .text, ~99% wasted). */
+                        extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
+                        size_t tramp_budget = ios_jit_x18_tramp_need((char *)jit_rw_base + offset + text_off, text_sz);
                         size_t tramp_alloc = (tramp_budget + page_size - 1) & ~(page_size - 1);
-                        size_t tramp_pool_off = __sync_fetch_and_add(&jit_pool_offset, tramp_alloc);
+                        /* Anchored within B/BL imm26 reach of the image (root
+                         * cause of the Steam run 7-11 crash family: tramps
+                         * 230MB from .text → silently truncated branches). */
+                        size_t tramp_pool_off = ios_pool_alloc_range_ex(tramp_alloc,
+                                jit_pool_size - ios_jit_tail_reserved,
+                                offset, 0x5000000 /* 80MB; text ≤32MB keeps worst case <128MB */);
 
-                        if (tramp_pool_off + tramp_alloc <= jit_pool_size)
+                        if (tramp_pool_off != (size_t)-1)
                         {
                             char *tramp_rw = (char *)jit_rw_base + tramp_pool_off;
                             char *tramp_rx = (char *)jit_rx_base + tramp_pool_off;
@@ -3363,6 +4339,304 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
     return mprotect( base, size, unix_prot );
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ * S1 pseudo-processes: per-child ntdll copy.
+ *
+ * Child "processes" are thread groups in the same Mach task. All modules
+ * except ntdll duplicate naturally (the child's loader maps them at fresh
+ * VAs → mprotect_exec makes fresh pool copies). ntdll is special: it is
+ * pre-mapped once by the unix side at a shared VA, and its .data holds
+ * per-process loader state (module list, loader lock, hash table). A child
+ * sharing the parent's ntdll .data corrupts both module lists — so each
+ * child gets its own pool copy of the whole ntdll image, registered as an
+ * owner_peb-tagged mapping entry. Translation picks the copy owned by the
+ * current thread's process (see ios_jit_translate_addr_for_owner).
+ *
+ * The copy source is the LIVE unix-side view: file-state .data (PE-side
+ * runtime writes go to the pool copies, never here) plus the handful of
+ * unix-written runtime slots we WANT to inherit (syscall/unix-call
+ * dispatchers, unixlib handle, xlate hooks — all unix .text addresses that
+ * the reloc range-check leaves untouched). Slots holding PARENT-POOL
+ * aliases (e.g. the Round-7 EC unix-call thunk) are rebased to the child
+ * copy by the pool-pointer sweep below.
+ */
+
+/* Mark ARM64EC CodeMap ranges for a child copy (mirror of the parent path
+ * in mprotect_exec, kept separate so the proven parent code is untouched).
+ * No-op for non-hybrid images (no .hexpthk section). */
+static void ios_jit_mark_ec_ranges_for_copy(char *rw_image, char *jit_base, size_t image_size)
+{
+    unsigned int pe_off = *(unsigned int *)(rw_image + 0x3C);
+    unsigned short num_sec = *(unsigned short *)(rw_image + pe_off + 6);
+    unsigned short opt_sz = *(unsigned short *)(rw_image + pe_off + 0x14);
+    char *sec = rw_image + pe_off + 0x18 + opt_sz;
+    int is_hybrid = 0, s;
+
+    for (s = 0; s < num_sec; s++, sec += 40)
+        if (!memcmp(sec, ".hexpthk", 8)) { is_hybrid = 1; break; }
+    if (!is_hybrid || !arm64ec_view) return;
+
+    {
+        size_t bm_start = ((size_t)jit_base >> 12) / 8;
+        size_t bm_end   = (((size_t)jit_base + image_size) >> 12) / 8;
+        size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+        void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+        set_vprot(arm64ec_view, bm_page, bm_size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+    }
+    {
+        char *opt_hdr = rw_image + pe_off + 0x18;
+        unsigned int load_cfg_rva = *(unsigned int *)(opt_hdr + 0x70 + 10*8);
+        unsigned int load_cfg_size = *(unsigned int *)(opt_hdr + 0x70 + 10*8 + 4);
+        uint64_t pe_image_base = *(uint64_t *)(opt_hdr + 0x18);
+        int found_codemap = 0;
+
+        if (load_cfg_rva && load_cfg_size > 0xD0)
+        {
+            uint64_t chpe_meta_va = *(uint64_t *)(rw_image + load_cfg_rva + 0xC8);
+            uint64_t meta_rva = (uint64_t)-1;
+            /* This runs AFTER the child DIR64 pass, which rebases the
+             * CHPEMetadataPointer slot from the header ImageBase to the
+             * child's pool copy (jit_base). Accept either form — a failed
+             * lookup falls back to flat-marking the whole image as EC,
+             * which makes arm64x_check_call treat the raw x64 syscall
+             * stubs as ARM and BR into them (X1 child ILL storm). */
+            if (chpe_meta_va >= pe_image_base && chpe_meta_va < pe_image_base + image_size)
+                meta_rva = chpe_meta_va - pe_image_base;
+            else if (chpe_meta_va >= (uint64_t)(uintptr_t)jit_base &&
+                     chpe_meta_va <  (uint64_t)(uintptr_t)jit_base + image_size)
+                meta_rva = chpe_meta_va - (uint64_t)(uintptr_t)jit_base;
+            if (meta_rva != (uint64_t)-1)
+            {
+                char *meta = rw_image + meta_rva;
+                unsigned int code_map_rva = *(unsigned int *)(meta + 0x4);
+                unsigned int code_map_count = *(unsigned int *)(meta + 0x8);
+                if (code_map_rva && code_map_count)
+                {
+                    char *code_map = rw_image + code_map_rva;
+                    unsigned int k, ec_marked = 0;
+                    for (k = 0; k < code_map_count; k++)
+                    {
+                        unsigned int start = *(unsigned int *)(code_map + k*8);
+                        unsigned int len   = *(unsigned int *)(code_map + k*8 + 4);
+                        if ((start & 0x3) == 1)  /* ARM64EC range */
+                        {
+                            set_arm64ec_range(jit_base + (start & ~0x3u), len);
+                            ec_marked++;
+                        }
+                    }
+                    found_codemap = 1 + (int)ec_marked;
+                }
+            }
+        }
+        if (!found_codemap) set_arm64ec_range(jit_base, image_size);
+        dprintf(2, "[child-ntdll] EC ranges marked for copy at %p (codemap=%d ec_ranges=%d)\n",
+                jit_base, !!found_codemap, found_codemap ? found_codemap - 1 : 0);
+    }
+}
+
+/* Copy the module containing `module_addr` into a fresh pool slot owned by
+ * `child_peb`. Returns 0 on success. Idempotent per (module, child). */
+int ios_jit_copy_module_for_child(void *module_addr, void *child_peb)
+{
+    const size_t pg = 0x4000;
+    struct ios_jit_mapping *m = NULL;
+    size_t alloc_size, offset;
+    char *rw_dest, *rx_dest, *src;
+    uint64_t pe_image_base;
+    intptr_t child_delta;
+    unsigned int pe_off;
+    int i;
+
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
+        if ((uintptr_t)module_addr >= base && (uintptr_t)module_addr < base + ios_jit_mappings[i].size)
+        {
+            if (ios_jit_mappings[i].owner_peb == child_peb) return 0;  /* already copied */
+            if (!ios_jit_mappings[i].owner_peb) m = &ios_jit_mappings[i];
+        }
+    }
+    if (!m || !ios_jit_rw_base_global)
+    {
+        dprintf(2, "[child-ntdll] no parent mapping found for %p\n", module_addr);
+        return -1;
+    }
+    if (ios_jit_mapping_count >= IOS_JIT_MAX_MAPPINGS)
+    {
+        /* Full count is fine as long as reclamation left a tombstone the
+         * append below can reuse. */
+        int free_slot = 0;
+        for (i = 0; i < ios_jit_mapping_count; i++)
+            if (!ios_jit_mappings[i].pe_base) { free_slot = 1; break; }
+        if (!free_slot)
+        {
+            dprintf(2, "[child-ntdll] mapping table FULL — cannot register child copy\n");
+            return -1;
+        }
+    }
+
+    alloc_size = (m->size + pg - 1) & ~(pg - 1);
+    offset = ios_pool_alloc_range(alloc_size, ios_jit_pool_size_global - ios_jit_tail_reserved);
+    if (offset == (size_t)-1)
+    {
+        dprintf(2, "[child-ntdll] JIT pool exhausted (need 0x%lx, bump=0x%lx of 0x%lx, tail_resv=0x%lx, freelist=%d)\n",
+                (unsigned long)alloc_size, (unsigned long)jit_pool_offset,
+                (unsigned long)ios_jit_pool_size_global,
+                (unsigned long)ios_jit_tail_reserved, ios_pool_free_count);
+        return -1;
+    }
+
+    rw_dest = (char *)ios_jit_rw_base_global + offset;
+    rx_dest = (char *)ios_jit_rx_base_global + offset;
+    src = (char *)m->pe_base;
+
+    memcpy(rw_dest, src, m->size);
+
+    pe_off = *(unsigned int *)(rw_dest + 0x3C);
+    pe_image_base = m->pe_image_base ? m->pe_image_base
+                                     : *(uint64_t *)(rw_dest + pe_off + 0x30);
+    child_delta = (intptr_t)rx_dest - (intptr_t)pe_image_base;
+
+    /* Writable sections → RW on the RX view (mirrors parent path; a failed
+     * mprotect falls back to the STR fault emulator, just slower). */
+    {
+        unsigned short num_sec = *(unsigned short *)(rw_dest + pe_off + 6);
+        unsigned short opt_sz = *(unsigned short *)(rw_dest + pe_off + 0x14);
+        char *sec = rw_dest + pe_off + 0x18 + opt_sz;
+        int s;
+        for (s = 0; s < num_sec; s++, sec += 40)
+        {
+            unsigned int chars = *(unsigned int *)(sec + 36);
+            unsigned int rva = *(unsigned int *)(sec + 12);
+            unsigned int vsz = *(unsigned int *)(sec + 8);
+            if ((chars & 0x80000000) && vsz)  /* IMAGE_SCN_MEM_WRITE */
+            {
+                size_t p_off = rva & ~(pg - 1);
+                size_t p_sz = ((rva + vsz + pg - 1) & ~(pg - 1)) - p_off;
+                if (mprotect(rx_dest + p_off, p_sz, PROT_READ | PROT_WRITE) != 0)
+                    dprintf(2, "[child-ntdll] mprotect RW failed for section RVA 0x%x (errno=%d)\n",
+                            rva, errno);
+            }
+        }
+    }
+
+    /* DIR64 relocations with the child's delta. The unix view is
+     * unrelocated (values at PE ImageBase); the range check preserves
+     * runtime-written unix addresses (dispatchers, hooks). */
+    if (m->reloc_rva && m->reloc_size)
+    {
+        char *reloc = rw_dest + m->reloc_rva;
+        char *reloc_end = reloc + m->reloc_size;
+        int fixups = 0;
+        while (reloc < reloc_end)
+        {
+            unsigned int block_rva = *(unsigned int *)reloc;
+            unsigned int block_size = *(unsigned int *)(reloc + 4);
+            unsigned short *entries = (unsigned short *)(reloc + 8);
+            int j, num;
+            if (!block_size || block_size < 8) break;
+            num = (block_size - 8) / 2;
+            for (j = 0; j < num; j++)
+            {
+                if ((entries[j] >> 12) == 10)  /* IMAGE_REL_BASED_DIR64 */
+                {
+                    uint64_t *fixup = (uint64_t *)(rw_dest + block_rva + (entries[j] & 0xFFF));
+                    if (*fixup >= pe_image_base && *fixup < pe_image_base + m->size)
+                    {
+                        *fixup += child_delta;
+                        fixups++;
+                    }
+                }
+            }
+            reloc += block_size;
+        }
+        dprintf(2, "[child-ntdll] applied %d DIR64 fixups (delta=0x%lx)\n",
+                fixups, (long)child_delta);
+    }
+
+    /* Pool-pointer sweep: unix-side code wrote a few slots with PARENT-POOL
+     * aliases (e.g. the EC unix-call thunk, Round 7). Those are wrong for
+     * the child — rebase any 8-aligned value inside the parent's pool copy
+     * of THIS module to the child copy. The unix view only ever receives
+     * unix-side writes, so matches are genuine. */
+    {
+        uintptr_t pj = (uintptr_t)m->jit_base;
+        uint64_t *p = (uint64_t *)rw_dest;
+        uint64_t *end = (uint64_t *)(rw_dest + (m->size & ~(size_t)7));
+        int swept = 0;
+        for (; p < end; p++)
+        {
+            if (*p >= pj && *p < pj + m->size)
+            {
+                uint64_t nv = (uintptr_t)rx_dest + (*p - pj);
+                dprintf(2, "[child-ntdll]   pool-ptr rebase @+0x%lx: 0x%llx -> 0x%llx\n",
+                        (unsigned long)((char *)p - rw_dest),
+                        (unsigned long long)*p, (unsigned long long)nv);
+                *p = nv;
+                swept++;
+            }
+        }
+        dprintf(2, "[child-ntdll] pool-pointer sweep: %d slot(s) rebased\n", swept);
+    }
+
+    /* x18-patch the child's .text with its own trampolines (fresh from the
+     * unix view — the parent's patches live only in the parent's copy). */
+    if (m->text_size)
+    {
+        extern size_t ios_jit_x18_tramp_need( const char *text, size_t text_size );
+        size_t tramp_need = ios_jit_x18_tramp_need(rw_dest + m->text_offset, m->text_size);
+        size_t tramp_alloc = (tramp_need + pg - 1) & ~(pg - 1);
+        size_t tramp_off = ios_pool_alloc_range_ex(tramp_alloc,
+                ios_jit_pool_size_global - ios_jit_tail_reserved,
+                (size_t)(rx_dest - (char *)ios_jit_rx_base_global),
+                0x5000000 /* B/BL imm26 reach — see ios_pool_alloc_range_ex */);
+        if (tramp_off != (size_t)-1)
+        {
+            int patched = ios_jit_patch_x18(
+                rw_dest + m->text_offset, rx_dest + m->text_offset, m->text_size,
+                (char *)ios_jit_rw_base_global + tramp_off,
+                (char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
+            sys_icache_invalidate((char *)ios_jit_rx_base_global + tramp_off, tramp_alloc);
+            dprintf(2, "[child-ntdll] x18-patched %d instructions\n", patched);
+        }
+        else dprintf(2, "[child-ntdll] no pool space for x18 trampolines!\n");
+    }
+
+    ios_jit_mark_ec_ranges_for_copy(rw_dest, rx_dest, m->size);
+
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    sys_icache_invalidate(rx_dest, m->size);
+
+    /* Register: APPEND an owned entry — the parent's entry stays intact.
+     * Task #25: reuse a tombstoned slot when one exists; pe_base written
+     * last (readers' match key) behind a barrier. */
+    {
+        int slot = -1, si;
+        for (si = 0; si < ios_jit_mapping_count; si++)
+            if (!ios_jit_mappings[si].pe_base) { slot = si; break; }
+        if (slot < 0) slot = ios_jit_mapping_count;
+        ios_jit_mappings[slot].jit_base = rx_dest;
+        ios_jit_mappings[slot].size = m->size;
+        ios_jit_mappings[slot].text_offset = m->text_offset;
+        ios_jit_mappings[slot].text_size = m->text_size;
+        ios_jit_mappings[slot].pe_image_base = pe_image_base;
+        ios_jit_mappings[slot].reloc_delta = child_delta;
+        ios_jit_mappings[slot].reloc_rva = m->reloc_rva;
+        ios_jit_mappings[slot].reloc_size = m->reloc_size;
+        ios_jit_mappings[slot].owner_peb = child_peb;
+        __sync_synchronize();
+        ios_jit_mappings[slot].pe_base = m->pe_base;
+        if (slot == ios_jit_mapping_count) ios_jit_mapping_count++;
+    }
+
+    dprintf(2, "[child-ntdll] copied %p+0x%lx -> %p (pool+0x%lx) owner_peb=%p\n",
+            m->pe_base, (unsigned long)m->size, rx_dest, (unsigned long)offset, child_peb);
+    return 0;
+}
+#endif  /* WINE_IOS */
 
 
 /***********************************************************************
@@ -3438,7 +4712,12 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         if ((view->protect & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
-    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
+    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
+    {
+        dprintf(2, "[vmem-denied] set_vprot failed: base=%p size=%p protect=0x%x\n",
+                base, (void *)size, (unsigned)protect);
+        return STATUS_ACCESS_DENIED;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -3842,7 +5121,12 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
             break;
         case EACCES:
         case EPERM:  /* access error, fall back to read() */
-            if (vprot & VPROT_WRITE) return STATUS_ACCESS_DENIED;
+            if (vprot & VPROT_WRITE)
+            {
+                dprintf(2, "[vmem-denied] shared-writable mmap EACCES/EPERM: addr=%p size=%p\n",
+                        map_addr, (void *)map_size);
+                return STATUS_ACCESS_DENIED;
+            }
             break;
         default:
             ERR( "mmap error %s, range %p-%p, unix_prot %#x\n",
@@ -3923,7 +5207,43 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     }
     else host_end = ROUND_ADDR( base + size, host_page_mask );
 
-    if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+    /* iOS-Mythic (task #22 real root cause, 2026-07-10): FEX's Windows
+     * VirtualDontNeed() = MEM_DECOMMIT (often WITHOUT recommit — LookupCache
+     * uses it as a cheap bzero on every cache clear) and then touches the
+     * pages again assuming Linux MADV_DONTNEED semantics (still mapped,
+     * reads return zero). The upstream PROT_NONE mmap-over therefore turned
+     * every Steam module-load cache-clear into a recurring BUS-fault burst
+     * on the SAME pages (retry#1..63 in one run), and on anon-RWX ranges it
+     * silently DESTROYED the pool vm_remap alias (decoupled user VA from the
+     * pool RW/RX views). Give decommit Linux-like semantics instead:
+     *  - alias-backed range: memset the RW alias (zero contract), keep the
+     *    mapping and the alias intact;
+     *  - plain range: mmap-over RW (fresh zero pages, still accessible) and
+     *    zero the partial host pages at the edges by hand. */
+    {
+        extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
+        uintptr_t rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
+        if (rw_alias)
+        {
+            memset( (void *)rw_alias, 0, size );
+        }
+        else if (host_start < host_end)
+        {
+            anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+            /* Zero the guest sub-ranges on partial host pages the mmap-over
+             * couldn't cover — FEX relies on decommit-as-bzero, and stale
+             * LookupCache entries surviving at the edges would run wrong
+             * blocks. Edge pages belong to the same committed RW guest heap. */
+            if ((char *)base < host_start) memset( base, 0, host_start - (char *)base );
+            if (host_end < (char *)base + size) memset( host_end, 0, (char *)base + size - host_end );
+        }
+        else
+        {
+            /* Range lies within a single host page — no full page to remap;
+             * zero it in place to honour the decommit-as-bzero contract. */
+            memset( base, 0, size );
+        }
+    }
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
@@ -4661,7 +5981,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     {
         if (image_info->machine == IMAGE_FILE_MACHINE_ARM64 &&
             (machine == IMAGE_FILE_MACHINE_AMD64 ||
-             (!machine && main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64)))
+             (!machine && ios_cur_image_info_machine() == IMAGE_FILE_MACHINE_AMD64)))
         {
             update_arm64x_mapping( view, nt, dir, sec );
             /* reload changed machine from NT header */
@@ -5043,7 +6363,12 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 
     res = get_mapping_info( handle, access, &sec_flags, &full_size, &shared_file,
                             &image_info, &nt_name, &exp_name );
-    if (res) return res;
+    if (res)
+    {
+        dprintf(2, "[map-sec] get_mapping_info handle=%p access=0x%x -> 0x%x\n",
+                handle, (unsigned)access, res);
+        return res;
+    }
 
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
@@ -5092,7 +6417,11 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
 
-    if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+    if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL )))
+    {
+        dprintf(2, "[map-sec] server_get_unix_fd handle=%p -> 0x%x\n", handle, res);
+        return res;
+    }
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
@@ -5134,6 +6463,8 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (needs_close) close( unix_handle );
+    if (res) dprintf(2, "[map-sec] virtual_map_section handle=%p prot=0x%x size=%p -> 0x%x\n",
+                     handle, (unsigned)protect, (void *)size, res);
     return res;
 }
 
@@ -5555,6 +6886,18 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
     }
 #endif
     teb->Peb = peb;
+#ifdef WINE_IOS
+    /* S1 pseudo-processes: a new thread belongs to its CREATOR's process.
+     * The global `peb` is switched (permanently) to the child's PEB during
+     * a child spawn, so parent threads created afterwards must not inherit
+     * it. ios_jit_current_peb() resolves the creating thread's PEB and is
+     * NULL-safe during early boot (falls back to the global). */
+    {
+        extern void *ios_jit_current_peb(void);
+        void *creator_peb = ios_jit_current_peb();
+        if (creator_peb) teb->Peb = creator_peb;
+    }
+#endif
     teb->Tib.Self = &teb->Tib;
     teb->Tib.StackBase = (void *)~0ul;
     teb->ActivationContextStackPointer = &teb->ActivationContextStack;
@@ -5914,8 +7257,14 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     sigset_t sigset;
     SIZE_T size;
 
-    if (!reserve_size) reserve_size = main_image_info.MaximumStackSize;
-    if (!commit_size) commit_size = main_image_info.CommittedStackSize;
+    {
+        /* Owner-aware (X3): default stack sizes come from the calling
+         * pseudo-process's main exe, not the session's. */
+        extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+        const SECTION_IMAGE_INFORMATION *ios_ii = ios_cur_image_info();
+        if (!reserve_size) reserve_size = ios_ii->MaximumStackSize;
+        if (!commit_size) commit_size = ios_ii->CommittedStackSize;
+    }
 
     size = max( reserve_size, commit_size );
     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
@@ -6161,6 +7510,43 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     mutex_unlock( &virtual_mutex );
     rec->ExceptionCode = ret;
     return ret;
+}
+
+/* Steam S3 (task #29): when virtual_handle_fault can't service a fault,
+ * dump the target's memory picture — is it in a Wine file_view (Wine should
+ * manage it → our commit/vprot has a gap), or is it a FEX/foreign mapping
+ * Wine doesn't know about? Plus vprot of the page and its neighbors (a
+ * page-crossing write into an uncommitted next-page shows as this/next
+ * differing). Decides whether the fix is Wine-side commit-on-fault or a
+ * FEX guest-memory issue. */
+void ios_dump_fault_region( void *addr )
+{
+    char *page = ROUND_ADDR( addr, host_page_mask );
+    BYTE vp_prev, vp, vp_next;
+    struct file_view *view;
+    extern void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
+    extern size_t ios_jit_pool_size_global;
+    uintptr_t a = (uintptr_t)addr, rx = (uintptr_t)ios_jit_rx_base_global,
+              rw = (uintptr_t)ios_jit_rw_base_global, sz = ios_jit_pool_size_global;
+    const char *region = "unknown/foreign";
+
+    mutex_lock( &virtual_mutex );
+    vp_prev = get_host_page_vprot( page - host_page_size );
+    vp      = get_host_page_vprot( page );
+    vp_next = get_host_page_vprot( page + host_page_size );
+    view = find_view( addr, 1 );
+    if (rx && a >= rx && a < rx + sz) region = "JIT-POOL-RX (exec, RO)";
+    else if (rw && a >= rw && a < rw + sz) region = "JIT-POOL-RW (alias)";
+    dprintf( 2, "[fault-rgn] addr=%p page=%p vprot prev/this/next=%02x/%02x/%02x region=%s\n",
+             addr, page, vp_prev, vp, vp_next, region );
+    if (view)
+        dprintf( 2, "[fault-rgn]   IN WINE VIEW base=%p size=0x%lx protect=0x%x off=0x%lx end=%p\n",
+                 view->base, (unsigned long)view->size, view->protect,
+                 (unsigned long)((char *)addr - (char *)view->base),
+                 (char *)view->base + view->size );
+    else
+        dprintf( 2, "[fault-rgn]   NO wine view — Wine doesn't own this addr (FEX/foreign mmap)\n" );
+    mutex_unlock( &virtual_mutex );
 }
 
 
@@ -6697,7 +8083,16 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
+        else
+        {
+            /* iOS-Mythic (task #22): never MADV_DONTNEED an anon-RWX pool
+             * alias — discarding the shared entry pages silently zeroes the
+             * pool RX view too (live FEX code/data). MEM_RESET is advisory,
+             * so skipping it is legal. */
+            extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
+            if (!ios_jit_anon_alias_lookup( (uintptr_t)base ))
+                madvise( base, size, MADV_DONTNEED );
+        }
     }
     else  /* commit the pages */
     {
@@ -6803,7 +8198,89 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     else
         limit = 0;
 
+#ifdef WINE_IOS
+    {
+        NTSTATUS st;
+        /* task#29 CEF: PartitionAlloc (chrome_elf DllMain) reserves multi-GB
+         * pools (16GB pool + 16GB align slack = one 32GB kernel-pick). iOS
+         * caps user VA at 0x8000000000 (39-bit; the extended-VA entitlement
+         * is not available to free personal teams), and wine's furniture
+         * (PE images, TEBs, stacks, EC bitmap) clusters at the TOP of that
+         * space, so jumbo kernel-picks die of top-of-space fragmentation
+         * (probe ml59: 0x800000000 reserve -> c0000017 twice -> chrome_elf
+         * OOM immediate-crash) — while ~200GB sits empty in the middle.
+         * Steer jumbo (>=1GB) kernel-pick reserves into the middle zone
+         * [0x4000000000, 0x7800000000); fall back to the default search if
+         * the zone ever fills. */
+        if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) && !limit)
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          0x4000000000ULL, 0x77ffffffffULL, 0, 0 );
+            if (st)
+            {
+                dprintf(2, "[jumbo] middle-zone place failed (0x%x) for size=0x%lx — falling back to default search\n",
+                        (unsigned)st, (unsigned long)*size_ptr);
+                st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+            }
+        }
+        else
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+            /* task#29 CEF plan C: a HINTED jumbo reserve that fails placement
+             * is retried as kernel-pick. Windows semantics say fail on
+             * conflict, but PartitionAlloc-style callers use the returned
+             * pointer (the hint is just ASLR seasoning) and its hints are
+             * 47-bit randoms that can never fit under the iOS 512GB VA
+             * ceiling. Serving from wherever we have room lets PA take its
+             * aligned pool from the top hole instead of dying in the 32GB
+             * fallback. Jumbo-only, loudly logged. */
+            if (st && *ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE))
+            {
+                void *hint = *ret;
+                void *pick = NULL;
+                SIZE_T sz = *size_ptr;
+                NTSTATUS st2 = STATUS_NO_MEMORY;
+                /* Preserve the hint's offset within its natural alignment:
+                 * PartitionAlloc hints (16GB boundary - 64KB) encode a
+                 * guard-before-pool layout and it REJECTS a redirect that is
+                 * merely 16GB-aligned (observed ml62: 0x7800000000 handed
+                 * back three times, freed each time, then the fatal 32GB
+                 * fallback). Walk the aligned slots in the usable top arena
+                 * and try hint_offset-preserving fixed placements first. */
+                ULONG_PTR align_unit = 0x400000000ULL;              /* 16GB */
+                ULONG_PTR off = (ULONG_PTR)hint & (align_unit - 1);
+                ULONG_PTR slot;
+                for (slot = 0x7C00000000ULL; slot >= 0x6800000000ULL && st2; slot -= align_unit)
+                {
+                    void *cand = (void *)(slot + off - (off ? align_unit : 0));
+                    SIZE_T csz = *size_ptr;
+                    if ((ULONG_PTR)cand < 0x6000000000ULL) break;
+                    pick = cand;
+                    st2 = allocate_virtual_memory( &pick, &csz, type, protect, 0, 0, 0, 0 );
+                    if (!st2) sz = csz;
+                }
+                if (st2)
+                {
+                    pick = NULL;
+                    sz = *size_ptr;
+                    st2 = allocate_virtual_memory( &pick, &sz, type, protect, 0, 0, 0, 0 );
+                }
+                dprintf(2, "[jumbo] hinted reserve %p size=0x%lx failed (0x%x) — offset-preserving retry -> %p (0x%x)\n",
+                        hint, (unsigned long)*size_ptr, (unsigned)st, pick, (unsigned)st2);
+                if (!st2)
+                {
+                    *ret = pick;
+                    *size_ptr = sz;
+                    st = STATUS_SUCCESS;
+                }
+            }
+        }
+
+        return st;
+    }
+#else
     return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+#endif
 }
 
 
@@ -6943,16 +8420,21 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         ios_jit_rx_base_global && ios_jit_rw_base_global &&
         ios_jit_pool_size_global)
     {
-        static volatile size_t ios_jit_alloc_ex_offset = 0;
         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
         /* Reserve from the END of the JIT pool to avoid colliding with
-         * mprotect_exec's PE-image copies which take from the start. */
-        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_alloc_ex_offset, alloc_size);
+         * mprotect_exec's PE-image copies which take from the start.
+         * ios_jit_tail_reserved is the shared file-scope counter so the
+         * head allocators can refuse to grow into tail-carved buffers. */
+        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_tail_reserved, alloc_size);
         size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;
-        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2)
+        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2 ||
+            pool_tail_off < jit_pool_offset)
         {
             ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
                 (size_t)*size_ptr);
+            dprintf(2, "[jit-pool] TAIL REFUSED (FEX EC_CODE): want=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx — falling to normal alloc (likely fatal for FEX)\n",
+                    (unsigned long)alloc_size, (unsigned long)(reserve_offset + alloc_size),
+                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
             /* Fall through to normal allocation */
         }
         else
@@ -6992,6 +8474,10 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * arm64x_check_call, so EC marking is unneeded. */
             ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p NOP-prefilled\n",
                 alloc_size, jit_rx, jit_rw);
+            dprintf(2, "[jit-pool] tail EC_CODE rx=%p size=0x%lx tail_resv=0x%lx head_used=0x%lx/0x%lx\n",
+                    jit_rx, (unsigned long)alloc_size,
+                    (unsigned long)(reserve_offset + alloc_size),
+                    (unsigned long)jit_pool_offset, (unsigned long)ios_jit_pool_size_global);
             return STATUS_SUCCESS;
         }
     }
@@ -7024,8 +8510,31 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         return result.virtual_alloc_ex.status;
     }
 
+#ifdef WINE_IOS
+    {
+        NTSTATUS st;
+        /* task#29 CEF jumbo-reserve middle-zone steering — see
+         * NtAllocateVirtualMemory for the rationale. Only when the caller
+         * imposed no constraints of its own. */
+        if (!*ret && *size_ptr >= 0x40000000 && (type & MEM_RESERVE) &&
+            !align && !limit_low && !limit_high)
+        {
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          0x4000000000ULL, 0x77ffffffffULL, 0, attributes );
+            if (st)
+                st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                              limit_low, limit_high, align, attributes );
+        }
+        else
+            st = allocate_virtual_memory( ret, size_ptr, type, protect,
+                                          limit_low, limit_high, align, attributes );
+
+        return st;
+    }
+#else
     return allocate_virtual_memory( ret, size_ptr, type, protect,
                                     limit_low, limit_high, align, attributes );
+#endif
 }
 
 
@@ -7393,6 +8902,18 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                      * which has unix_base-relative pointers. These must become
                      * jit_base-relative to match the DIR64-fixuped JIT copy. */
                     {
+                        /* OWNER-AWARE (2026-07-07): ntdll's image VA range
+                         * matches the session copy AND every same-arch child
+                         * copy — the old first-match scan always picked the
+                         * session's entry, so child modules' ntdll imports
+                         * pointed at the SESSION pool copy. services.exe's
+                         * rpcrt4 IAT got session-copy Tp* → threadpool
+                         * workers born executing the wrong ntdll → exit
+                         * crash in LdrShutdownThread holding the session
+                         * loader lock → rpcss never answered explorer's
+                         * CoRegisterClassObject. The sync runs on the owning
+                         * process's thread, so current-peb is the owner. */
+                        void *sync_owner = ios_jit_current_peb();
                         uint64_t *p = (uint64_t *)jit_rw_dest;
                         uint64_t *end_p = (uint64_t *)(jit_rw_dest + (size & ~7));
                         int fixup_count = 0;
@@ -7401,24 +8922,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                             uint64_t val = *p;
                             if (val)
                             {
-                                int j;
-                                for (j = 0; j < ios_jit_mapping_count; j++)
+                                void *nv = ios_jit_translate_addr_for_owner(
+                                        (void *)(uintptr_t)val, sync_owner);
+                                if (nv != (void *)(uintptr_t)val)
                                 {
-                                    uintptr_t mbase = (uintptr_t)ios_jit_mappings[j].pe_base;
-                                    if (val >= mbase && val < mbase + ios_jit_mappings[j].size)
-                                    {
-                                        uintptr_t off_in_img = val - mbase;
-                                        *p = (uintptr_t)ios_jit_mappings[j].jit_base + off_in_img;
-                                        fixup_count++;
-                                        break;
-                                    }
+                                    *p = (uint64_t)(uintptr_t)nv;
+                                    fixup_count++;
                                 }
                             }
                             p++;
                         }
+                        /* dprintf, not ERR — the perf WINEDEBUG default mutes
+                         * err+virtual and this is the owner-routing evidence. */
                         if (fixup_count)
-                            ERR("iOS JIT: synced IAT region %p+0x%lx → JIT, translated %d pointers\n",
-                                base, (unsigned long)size, fixup_count);
+                            dprintf(2, "[iat-sync] region %p+0x%lx: translated %d pointers (owner=%p)\n",
+                                    base, (unsigned long)size, fixup_count, sync_owner);
                     }
                     break;
                 }
@@ -8119,7 +9637,11 @@ NTSTATUS WINAPI NtLockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size, 
     *addr = ROUND_ADDR( *addr, page_mask );
 
     if (mlock( ROUND_ADDR( *addr, host_page_mask ), ROUND_SIZE( *addr, *size, host_page_mask ) ))
+    {
+        dprintf(2, "[vmem-denied] mlock failed: addr=%p size=%p errno=%d\n",
+                *addr, (void *)*size, errno);
         status = STATUS_ACCESS_DENIED;
+    }
     return status;
 }
 

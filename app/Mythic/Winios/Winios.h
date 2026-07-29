@@ -37,6 +37,29 @@ void winios_post_touch_down(int x, int y);
 void winios_post_touch_move(int x, int y);
 void winios_post_touch_up(int x, int y);
 
+/* Key press bridge (VK codes: RETURN=0x0D SPACE=0x20 ESCAPE=0x1B).
+ * down=1 press, down=0 release. */
+void winios_post_key(int vk, int down);
+
+/* S2 desktop compositor placement. Called by the Swift presentation
+ * placeholder (MetalBackedView) with its bounds in UIWindow coords —
+ * the wine virtual desktop renders aspect-fit inside this frame, like
+ * the games' Metal layer, instead of covering the whole phone screen.
+ * Safe to call before or after the compositor exists; main-thread
+ * dispatch inside. */
+void winios_set_compositor_frame(double x, double y, double w, double h);
+
+/* S2 trackpad pointer. (x, y) are ABSOLUTE wine-desktop pixels (the
+ * Swift trackpad engine owns the cursor position); flags are raw
+ * MOUSEEVENTF_* combos; data carries the wheel delta for
+ * MOUSEEVENTF_WHEEL. Events queue to the same ring the touch bridge
+ * uses. A MOVE event also repositions the compositor's cursor layer. */
+void winios_pointer(int x, int y, unsigned int flags, unsigned int data);
+
+/* Reposition the rendered cursor arrow (desktop px). Usually implied
+ * by winios_pointer(MOVE); exposed for initial placement. */
+void winios_cursor_move(int x, int y);
+
 #ifdef __cplusplus
 }
 #endif

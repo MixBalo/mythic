@@ -46,12 +46,63 @@ compile_one() {
     fi
 }
 
+# iOS-Mythic 2026-07-05 (Steam S0): compile a DLL's unix side into
+# libntdll_unix.a. Args: src, obj-name, funcs-prefix, extra flags...
+# The __wine_unix_call_funcs tables are renamed per-lib (they'd collide
+# in one archive) and registered by name in virtual_ios.c's
+# load_builtin_unixlib. GnuTLS-backed libs add ios_gnutls_shim.h to
+# route dlopen/dlsym at the static symtab (gnutls_symtab_ios.c).
+CRYPTO_DIR="$REPO_ROOT/build/crypto-unix"
+GNUTLS_PREFIX="$REPO_ROOT/toolchains/gnutls-ios"
+compile_unixlib() {
+    local src=$1 name=$2 prefix=$3
+    shift 3
+    echo -n "  $name... "
+    if xcrun -sdk iphoneos clang \
+        -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 \
+        -O2 -fPIC -fvisibility=hidden -fno-stack-protector -fno-strict-aliasing \
+        -Wno-implicit-function-declaration -Wno-int-conversion \
+        -include "$WINE_BUILD/include/config.h" \
+        -include "$BUILD_DIR/shims/wine_ios_exit.h" \
+        -I"$BUILD_DIR/shims" \
+        -I"$WINE_BUILD/include" -I"$WINE_SRC/include" \
+        -D__WINESRC__ -D_NTSYSTEM_ -D_ACRTIMP= -DWINBASEAPI= \
+        -DWINE_UNIX_LIB -DWINE_IOS=1 \
+        -D__wine_unix_call_funcs=${prefix}_unix_call_funcs \
+        -D__wine_unix_call_wow64_funcs=${prefix}_unix_call_wow64_funcs \
+        "$@" \
+        -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
+        echo "OK"
+        SUCCEEDED=$((SUCCEEDED + 1))
+    else
+        echo "FAILED"
+        FAILED=$((FAILED + 1))
+        FAILED_FILES="$FAILED_FILES $name"
+    fi
+}
+
 echo "=== Building ntdll unix (iOS) ==="
 
 # iOS-Mythic 2026-05-13: silent audio driver — provides a null
 # IAudioClock that advances at real time so FMOD's audio-gated rhythm
 # logic in Thumper et al. advances past intro music.
 compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+
+# iOS-Mythic 2026-07-05 (Steam S0): network + crypto unix sides.
+echo "=== Building crypto/network unixlibs ==="
+"$CRYPTO_DIR/gen_gnutls_symtab.sh" > /dev/null
+compile_one "$CRYPTO_DIR/gnutls_symtab_ios.c" "gnutls_symtab_ios"
+compile_unixlib "$WINE_SRC/dlls/ws2_32/unixlib.c" "ws2_32_unixlib" "ws2_32" \
+    -I"$WINE_SRC/dlls/ws2_32"
+compile_unixlib "$WINE_SRC/dlls/bcrypt/gnutls.c" "bcrypt_unixlib" "bcrypt" \
+    -I"$WINE_SRC/dlls/bcrypt" -I"$GNUTLS_PREFIX/include" \
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
+compile_unixlib "$WINE_SRC/dlls/secur32/schannel_gnutls.c" "secur32_unixlib" "secur32" \
+    -I"$WINE_SRC/dlls/secur32" -I"$GNUTLS_PREFIX/include" \
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
+compile_unixlib "$CRYPTO_DIR/crypt32_unixlib_ios.c" "crypt32_unixlib" "crypt32" \
+    -I"$WINE_SRC/dlls/crypt32" -I"$GNUTLS_PREFIX/include" \
+    -include "$CRYPTO_DIR/ios_gnutls_shim.h"
 
 for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
     name=$(basename "$src" .c)
@@ -98,6 +149,8 @@ echo ""
 echo "=== Building libntdll_unix.a ==="
 ar rcs "$OBJ_DIR/libntdll_unix.a" \
     "$OBJ_DIR/audio_null_ios.o" \
+    "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
+    "$OBJ_DIR/bcrypt_unixlib.o" "$OBJ_DIR/secur32_unixlib.o" "$OBJ_DIR/crypt32_unixlib.o" \
     "$OBJ_DIR/cdrom.o" "$OBJ_DIR/debug.o" "$OBJ_DIR/env.o" "$OBJ_DIR/file.o" \
     "$OBJ_DIR/loader.o" "$OBJ_DIR/loadorder.o" "$OBJ_DIR/process.o" "$OBJ_DIR/registry.o" \
     "$OBJ_DIR/security.o" "$OBJ_DIR/serial.o" "$OBJ_DIR/server.o" \

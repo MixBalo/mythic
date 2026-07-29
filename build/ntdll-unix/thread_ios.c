@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1061,19 +1062,22 @@ static void contexts_to_server( struct context_data server_contexts[2], CONTEXT 
     unsigned int count = 0;
     void *native_context = get_native_context( context );
     void *wow_context = get_wow_context( context );
+    /* Owner-aware (X3): context machine follows the calling pseudo-process. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    USHORT image_machine = ios_cur_image_info()->Machine;
 
     if (native_context)
     {
         context_to_server( &server_contexts[count++], native_machine, native_context, native_machine );
-        if (wow_context) context_to_server( &server_contexts[count++], main_image_info.Machine,
-                                            wow_context, main_image_info.Machine );
-        else if (native_machine != main_image_info.Machine)
-            context_to_server( &server_contexts[count++], main_image_info.Machine,
+        if (wow_context) context_to_server( &server_contexts[count++], image_machine,
+                                            wow_context, image_machine );
+        else if (native_machine != image_machine)
+            context_to_server( &server_contexts[count++], image_machine,
                                native_context, native_machine );
     }
     else
         context_to_server( &server_contexts[count++], native_machine,
-                           wow_context, main_image_info.Machine );
+                           wow_context, image_machine );
 
     if (count < 2) memset( &server_contexts[1], 0, sizeof(server_contexts[1]) );
 }
@@ -1086,16 +1090,19 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
 {
     void *native_context = get_native_context( context );
     void *wow_context = get_wow_context( context );
+    /* Owner-aware (X3): context machine follows the calling pseudo-process. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    USHORT image_machine = ios_cur_image_info()->Machine;
 
     if (native_context)
     {
         context_from_server( native_context, &server_contexts[0], native_machine );
         if (wow_context)
-            context_from_server( wow_context, &server_contexts[1], main_image_info.Machine );
+            context_from_server( wow_context, &server_contexts[1], image_machine );
         else
             context_from_server( native_context, &server_contexts[1], native_machine );
     }
-    else context_from_server( wow_context, &server_contexts[0], main_image_info.Machine );
+    else context_from_server( wow_context, &server_contexts[0], image_machine );
 }
 
 
@@ -1109,6 +1116,23 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
     close( ntdll_get_thread_data()->wait_fd[1] );
     close( ntdll_get_thread_data()->reply_fd );
     close( ntdll_get_thread_data()->request_fd );
+    /* iOS-Mythic (Steam S0): we write the TEB directly into TSD slot 275
+     * (start_thread above) because FEX hardcodes offset 0x898 — but we
+     * don't OWN dynamic key 275. If an Apple framework allocated that key
+     * with an ObjC destructor, pthread's TSD cleanup calls
+     * destructor(TEB) at thread exit → objc_release on a non-object →
+     * crash (seen: every winhttp resolver-thread exit died in
+     * objc_release+0x10 under pthread_exit). NULL values are skipped by
+     * the cleanup loop, so clear the slot before exiting. */
+    {
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        dprintf(2, "[tsd275] tid=%04x CLEAR at pthread_exit (was %p)\n",
+                (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                *(void **)(tsd_base + 275 * 8));
+        *(void **)(tsd_base + 275 * 8) = NULL;
+    }
     pthread_exit( UIntToPtr(status) );
 }
 
@@ -1122,6 +1146,15 @@ static void start_thread( TEB *teb )
 {
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
     BOOL suspend;
+
+    /* iOS-Mythic 2026-07-04 perf: promote guest threads to USER_INTERACTIVE
+     * QoS. Default-QoS pthreads on iOS are E-core-eligible and get heavy
+     * kernel timer coalescing (tens of ms of wakeup leeway on
+     * select/nanosleep). [PROF] showed the game thread parked ~87% of each
+     * 59ms frame in one system wait — if that's a frame-limiter sleep being
+     * coalesced, this alone can collapse the wait to its requested length.
+     * USER_INTERACTIVE = P-core scheduling + minimal timer leeway. */
+    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
 
     thread_data->syscall_table = KeServiceDescriptorTable;
     thread_data->syscall_trace = TRACE_ON(syscall);
@@ -1143,6 +1176,12 @@ static void start_thread( TEB *teb )
         __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
         tsd_base &= ~7ULL;
         *(void **)(tsd_base + 275 * 8) = teb;
+        /* task #24: Thumper's settings threads fault with TSD[275]==NULL in
+         * the x18-free thunks despite this write. Trace the slot lifecycle:
+         * this set, the exit-time clears, and the value at SEGV time. */
+        dprintf(2, "[tsd275] tid=%04x SET teb=%p tsd_base=%p readback=%p\n",
+                (unsigned int)(ULONG_PTR)teb->ClientId.UniqueThread, (void *)teb,
+                (void *)tsd_base, *(void **)(tsd_base + 275 * 8));
     }
     server_init_thread( thread_data->start, &suspend );
     signal_start_thread( thread_data->start, thread_data->param, suspend, teb );
@@ -1260,7 +1299,13 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     }
 
 #ifdef __aarch64__
-    if (is_arm64ec())
+    /* Owner-aware (X3): key the CHPE cpu_area on the process the TEB
+     * belongs to, not the session's main exe — x64 children in an aarch64
+     * desktop need it, aarch64 threads must not get it. */
+    extern const SECTION_IMAGE_INFORMATION *ios_image_info_for_peb( void *peb_id );
+    const SECTION_IMAGE_INFORMATION *ios_ii = ios_image_info_for_peb( teb->Peb );
+    if (current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+        ios_ii->Machine == IMAGE_FILE_MACHINE_AMD64)
     {
         CHPE_V2_CPU_AREA_INFO *cpu_area;
         const SIZE_T chpev2_stack_size = 0x40000;
@@ -1280,8 +1325,8 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     }
     else
     {
-        ERR("iOS arm64ec: NOT setting cpu_area (is_arm64ec=%d main_machine=0x%x)\n",
-            is_arm64ec(), main_image_info.Machine);
+        ERR("iOS arm64ec: NOT setting cpu_area (owner machine=0x%x session is_arm64ec=%d)\n",
+            ios_ii->Machine, is_arm64ec());
     }
 #endif
 
@@ -1375,6 +1420,55 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     if (flags & ~supported_flags)
         FIXME( "Unsupported flags %#x.\n", flags );
+
+    /* [thr-create] pseudo-process forensics: services threadpool workers
+     * were born with a SESSION-copy threadpool_worker_proc as their start
+     * routine (2026-07-07 [exit-stk]) — log every creation with the start
+     * address's copy attribution to catch the creator red-handed. */
+    {
+        extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+        extern void *ios_jit_current_peb(void);
+        extern unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out);
+        void *cp = NULL;
+        void *co = ios_jit_pool_copy_owner((void *)start, &cp);
+        dprintf(2, "[thr-create] creator_teb=%p creator_peb=%p start=%p (copy pe=%p owner=%p) param=%p\n",
+                (void *)NtCurrentTeb(), ios_jit_current_peb(), (void *)start, cp, co, param);
+        /* [create-stk]: the creator's PE call chain, with per-frame copy
+         * attribution — names the frame where a services thread crossed
+         * into session-copy Tp code before spawning the doomed worker. */
+        {
+            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+            static volatile int cs_count;
+            if (__sync_add_and_fetch(&cs_count, 1) <= 20)
+            {
+                char *frame = (char *)get_syscall_frame();
+                uint64_t pe_sp = frame ? *(uint64_t *)(frame + 0xf8) : 0;
+                uint64_t pe_lr = frame ? *(uint64_t *)(frame + 0xf0) : 0;
+                uint64_t pe_pc = frame ? *(uint64_t *)(frame + 0x100) : 0;
+                int w, hits = 0;
+                dprintf(2, "[create-stk] frame pc=%p lr=%p sp=%p\n",
+                        (void *)(uintptr_t)pe_pc, (void *)(uintptr_t)pe_lr, (void *)(uintptr_t)pe_sp);
+                for (w = 0; w < 384 && hits < 12 && pe_sp; w++)
+                {
+                    uint64_t val = 0, mod, va;
+                    mach_vm_size_t got = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(),
+                            (mach_vm_address_t)(pe_sp + 8ull * w), 8,
+                            (mach_vm_address_t)&val, &got) != KERN_SUCCESS || got != 8)
+                        break;
+                    if ((va = ios_jit_reverse_translate(val, &mod)) && va != val)
+                    {
+                        void *fcp = NULL;
+                        void *fco = ios_jit_pool_copy_owner((void *)(uintptr_t)val, &fcp);
+                        dprintf(2, "[create-stk] sp+0x%x: 0x%llx pe=%p+0x%llx copy_owner=%p\n",
+                                w * 8, (unsigned long long)val, (void *)(uintptr_t)mod,
+                                (unsigned long long)(va - mod), fco);
+                        hits++;
+                    }
+                }
+            }
+        }
+    }
 
     if (zero_bits > 21 && zero_bits < 32) return STATUS_INVALID_PARAMETER_3;
 #ifndef _WIN64

@@ -79,16 +79,72 @@ static struct session_thread_data *get_session_thread_data(void)
     return thread_info->session_data;
 }
 
+extern int dprintf(int fd, const char *fmt, ...);
+#include <time.h>
+
+/* Task #21 diagnosis: the desktop "freeze after closing a program" is a
+ * GUI thread stuck reading a shared session object, holding user_lock while
+ * every other GUI thread starves. Two candidate mechanisms — a permanently
+ * ODD seq (abandoned server write) caught here, or an OUTER livelock (seq
+ * keeps changing so release never confirms) caught in release_seqlock. Both
+ * are wall-clock instrumented; the spin-count probe missed the odd case
+ * because Apple's `yield` timing made 200M iters take far longer than the
+ * user waited. */
 void shared_object_acquire_seqlock( const shared_object_t *object, UINT64 *seq )
 {
-    while ((*seq = ReadNoFence64( &object->seq )) & 1) YieldProcessor();
+    UINT64 spins = 0;
+    unsigned long long t0 = 0;
+    int logged = 0;
+    while ((*seq = ReadNoFence64( &object->seq )) & 1)
+    {
+        YieldProcessor();
+        if ((++spins & 0xFFFFF) == 0)  /* sample the clock ~every 1M iters */
+        {
+            unsigned long long now = clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+            if (!t0) t0 = now;
+            else if (now - t0 > 1500000000ull)  /* stuck odd >1.5s */
+            {
+                if (!logged++)
+                    dprintf( 2, "[seq-odd] object %p seq=0x%llx id=0x%llx STUCK ODD >1.5s\n",
+                             (const void *)object, (unsigned long long)*seq,
+                             (unsigned long long)object->id );
+                { LARGE_INTEGER d = { .QuadPart = -10000 }; NtDelayExecution( FALSE, &d ); }
+            }
+        }
+    }
     __SHARED_READ_FENCE;
 }
 
 BOOL shared_object_release_seqlock( const shared_object_t *object, UINT64 seq )
 {
+    BOOL ok;
     __SHARED_READ_FENCE;
-    return ReadNoFence64( &object->seq ) == seq;
+    ok = ReadNoFence64( &object->seq ) == seq;
+    if (!ok)
+    {
+        /* Livelock detector: count CONSECUTIVE failures against the SAME
+         * object on this thread; a genuine writer resolves in microseconds,
+         * so a long streak = the reader never converges. */
+        static __thread const shared_object_t *last_obj;
+        static __thread unsigned last_fails;
+        static __thread unsigned long long streak_t0;
+        if (object == last_obj)
+        {
+            unsigned long long now = clock_gettime_nsec_np( CLOCK_MONOTONIC_RAW );
+            if (!streak_t0) streak_t0 = now;
+            if (++last_fails >= 100000 && now - streak_t0 > 1500000000ull)
+            {
+                dprintf( 2, "[seq-livelock] object %p want_seq=0x%llx cur_seq=0x%llx id=0x%llx fails=%u\n",
+                         (const void *)object, (unsigned long long)seq,
+                         (unsigned long long)ReadNoFence64( &object->seq ),
+                         (unsigned long long)object->id, last_fails );
+                last_fails = 0; streak_t0 = now;
+                { LARGE_INTEGER d = { .QuadPart = -10000 }; NtDelayExecution( FALSE, &d ); }
+            }
+        }
+        else { last_obj = object; last_fails = 0; streak_t0 = 0; }
+    }
+    return ok;
 }
 
 static object_id_t shared_object_get_id( const shared_object_t *object )
@@ -225,6 +281,12 @@ NTSTATUS get_shared_desktop( struct object_lock *lock, const desktop_shm_t **des
     if (!lock->id || !shared_object_release_seqlock( object, lock->seq ))
     {
         shared_object_acquire_seqlock( object, &lock->seq );
+        /* iOS (task #21): freed object (id==0, dead pseudo-process) would
+         * leave lock->id==0 forever → caller's while(==PENDING) spins under
+         * user_lock → whole-desktop freeze. Drop the stale cache and fail
+         * so the loop exits (upstream protects get_shared_input the same
+         * way via lock->id=-1; desktop/queue lack it). */
+        if (!object->id) { data->shared_desktop = NULL; return STATUS_INVALID_HANDLE; }
         *desktop_shm = &object->shm.desktop;
         lock->id = object->id;
         return STATUS_PENDING;
@@ -258,6 +320,8 @@ NTSTATUS get_shared_queue( struct object_lock *lock, const queue_shm_t **queue_s
     if (!lock->id || !shared_object_release_seqlock( object, lock->seq ))
     {
         shared_object_acquire_seqlock( object, &lock->seq );
+        /* iOS (task #21): freed-object guard — see get_shared_desktop. */
+        if (!object->id) { data->shared_queue = NULL; return STATUS_INVALID_HANDLE; }
         *queue_shm = &object->shm.queue;
         lock->id = object->id;
         return STATUS_PENDING;

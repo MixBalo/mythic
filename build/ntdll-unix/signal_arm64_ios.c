@@ -37,10 +37,12 @@
 #include <errno.h>
 #include <unistd.h>
 #ifdef WINE_IOS
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <pthread/pthread.h>
+#include <pthread/qos.h>
 #include <fcntl.h>
 #endif
 #ifdef HAVE_SYS_PARAM_H
@@ -68,7 +70,18 @@
 #include "unix_private.h"
 #include "wine/debug.h"
 
+/* defined at the bottom of this file with the [thread-stacks] dumper */
+static const char *ios_pe_module_name( uint64_t base );
+
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
+
+/* X3 mixed-mode: user-mode entry points follow the current pseudo-process's
+ * ntdll image (cross-arch children run a private ARM64EC ntdll). Falls back
+ * to the session p* globals when the process has no private image. */
+#include "ios_mixed.h"
+#define IOS_PFUNC(name) __extension__ ({ \
+    const struct ios_ntdll_funcs *_iosf = ios_cur_ntdll_funcs(); \
+    _iosf ? _iosf->name : (void *)p##name; })
 
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
@@ -242,6 +255,118 @@ volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
 volatile int ios_exc_msg_count = 0;
+/* Last thread that took an exec fault at a PE VA (i.e. made a native call
+ * through the redirect path) — the game thread in practice. The [PROF]
+ * sampler in server_ios.c follows this so it profiles the presenting
+ * thread instead of whatever thread first hit signal_start_thread (which
+ * died ~33s in and left [PROF] sampling a corpse). */
+volatile mach_port_t ios_last_exec_fault_thread = MACH_PORT_NULL;
+
+/* Real unix-side KUSER_SHARED_DATA address, for unix code (e.g. win32u's
+ * get_tick_count) that would otherwise read the canonical 0x7ffe0000 and
+ * eat a Mach fault per load. */
+unsigned long long ios_get_real_usd(void)
+{
+    return (unsigned long long)ios_exc_usd;
+}
+
+/* ---- Self-healing stale-pointer patcher ----------------------------------
+ * Mechanism-#2 exec faults: pool-resident module copies hold function
+ * pointers that still carry PE VAs (lazily-written ARM64EC aux-IAT slots,
+ * runtime GetProcAddress results — writes that happen pool-side AFTER the
+ * NtProtect sync/translate pass ran). Each call through such a pointer
+ * faults (~8K/s in gameplay, each suspending the calling thread for a full
+ * handler round trip). The Mach handler enqueues every distinct faulted
+ * PE VA here; a low-priority scanner thread rewrites EVERY 8-byte slot in
+ * the module-copy pool ranges holding that value to its pool equivalent.
+ * Each stale pointer faults once, then never again. FEX CodeBuffer ranges
+ * are NOT scanned (guest-RIP constants live there). */
+/* 64 → 256 (2026-07-07): with a desktop + several pseudo-processes the
+ * boot one-shot VAs alone overflowed 64 slots, and the two-cube DXMT
+ * fault storm's VA (child winemetal IAT → child EC ntdll map VA,
+ * 315K faults) arrived late and was silently dropped — never tracked,
+ * never healed. */
+#define IOS_STALE_VA_MAX 256
+/* Only heal a VA once it has exec-faulted this many times. Boot-time
+ * one-shot redirects (thread entry points, DLL entry calls) fault a
+ * handful of times and must NOT be healed — pool slots legitimately hold
+ * some of those PE VAs (CONTEXT records, pending thread params), and
+ * rewriting them broke boot (2026-07-04 freeze, pre-splash NULL-deref
+ * livelock). The pathological stale pointers fault thousands of times per
+ * second; a threshold cleanly separates the two populations. */
+#define IOS_STALE_VA_HEAL_THRESHOLD 256
+static uint64_t ios_stale_va_seen[IOS_STALE_VA_MAX];
+static uint32_t ios_stale_va_hits[IOS_STALE_VA_MAX];
+static volatile int ios_stale_va_seen_count = 0;
+static uint64_t ios_stale_va_queue[IOS_STALE_VA_MAX];
+static volatile int ios_stale_va_head = 0;   /* written by scanner */
+static volatile int ios_stale_va_tail = 0;   /* written by exc handler */
+
+static void ios_stale_va_enqueue( uint64_t va )
+{
+    int i, n = ios_stale_va_seen_count;
+    for (i = 0; i < n; i++)
+    {
+        if (ios_stale_va_seen[i] == va)
+        {
+            if (++ios_stale_va_hits[i] == IOS_STALE_VA_HEAL_THRESHOLD)
+            {
+                ios_stale_va_queue[ios_stale_va_tail % IOS_STALE_VA_MAX] = va;
+                ios_stale_va_tail++;
+                fprintf( stderr, "[stale-heal] 0x%llx crossed %d faults — queued for heal\n",
+                         (unsigned long long)va, IOS_STALE_VA_HEAL_THRESHOLD );
+            }
+            return;
+        }
+    }
+    if (n >= IOS_STALE_VA_MAX)
+    {
+        /* Table full: evict the coldest entry (boot one-shots sit at a
+         * handful of hits) so pathological late-comers — a new child's
+         * DXMT IAT — still get tracked. Only the single mach-handler
+         * thread calls this, so the read-modify-write is safe. */
+        int min_i = 0;
+        uint32_t min_h = ios_stale_va_hits[0];
+        for (i = 1; i < n; i++)
+            if (ios_stale_va_hits[i] < min_h) { min_h = ios_stale_va_hits[i]; min_i = i; }
+        if (min_h >= IOS_STALE_VA_HEAL_THRESHOLD) return;  /* everything hot — drop */
+        ios_stale_va_seen[min_i] = va;
+        ios_stale_va_hits[min_i] = 1;
+        return;
+    }
+    ios_stale_va_seen[n] = va;
+    ios_stale_va_hits[n] = 1;
+    ios_stale_va_seen_count = n + 1;
+}
+
+static void *ios_stale_va_scanner( void *arg )
+{
+    extern int ios_jit_patch_stale_pointer( unsigned long long stale_va );
+    /* Healing default-ON since 2026-07-07: the patcher now rewrites ONLY
+     * IAT/delay-IAT slots (parsed from each pool copy's PE headers), so
+     * the 2026-07-04 breakage class — arm64x metadata slots whose
+     * consumers need PE VAs for identity/range comparisons — can't be
+     * touched. Import slots hold nothing but call targets; rewriting
+     * them is the same transform the NtProtect-time IAT-sync applies.
+     * MYTHIC_NO_HEAL=1 reverts to dry-run reporting. */
+    int do_heal = getenv( "MYTHIC_NO_HEAL" ) == NULL;
+    pthread_setname_np( "wine-stale-heal" );
+    for (;;)
+    {
+        usleep( 100000 );
+        while (ios_stale_va_head != ios_stale_va_tail)
+        {
+            uint64_t va = ios_stale_va_queue[ios_stale_va_head % IOS_STALE_VA_MAX];
+            ios_stale_va_head++;
+            if (do_heal)
+                ios_jit_patch_stale_pointer( va );
+            else
+                fprintf( stderr, "[stale-heal] (dry-run) hot stale VA 0x%llx — heal skipped (MYTHIC_NO_HEAL set)\n",
+                         (unsigned long long)va );
+        }
+    }
+    return NULL;
+}
 
 /* Per-thread trampoline for signal handlers (runs on faulting thread) */
 static __thread void *ios_my_trampoline = NULL;
@@ -327,6 +452,15 @@ static void *ios_mach_exception_thread( void *arg )
     /* Name this thread for debugging */
     pthread_setname_np("wine-x18-exc");
 
+    /* 2026-07-04 perf: this thread is effectively an interrupt handler —
+     * every STR emulation, exec-fault redirect, and USD read (~2,600 per
+     * present-group in gameplay) suspends the faulting thread until THIS
+     * thread services the message. At default QoS it is E-core-eligible
+     * and can be preempted by every USER_INTERACTIVE game thread — each
+     * fault then pays scheduling latency on top of handling cost. Run it
+     * as hot as its clients. */
+    pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
+
     ios_exc_thread_alive = 1;
 
     for (;;)
@@ -346,6 +480,31 @@ static void *ios_mach_exception_thread( void *arg )
 
         thread_t thread = req->thread.name;
         int handled = 0;
+
+        /* 2026-07-03 storm probe: ~40K Mach exceptions PER PRESENT measured
+         * in the menu phase (~all of the 1.4s frame time at ~33us each).
+         * Sample every 4096th message: exception type + faulting PC + insn
+         * so the trap source is nameable from one run. */
+        if ((ios_exc_msg_count & 0xFFF) == 0)
+        {
+            arm_thread_state64_t pstate;
+            mach_msg_type_number_t pcount = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state( thread, ARM_THREAD_STATE64,
+                                  (thread_state_t)&pstate, &pcount ) == KERN_SUCCESS)
+            {
+                uint64_t ppc = arm_thread_state64_get_pc( pstate );
+                uint32_t pinsn = 0;
+                vm_size_t psz = sizeof(pinsn);
+                vm_read_overwrite( mach_task_self(), ppc, sizeof(pinsn),
+                                   (vm_address_t)&pinsn, &psz );
+                dprintf(STDERR_FILENO,
+                        "[EXC_SAMPLE] #%d exc=%d code0=0x%llx pc=0x%llx insn=0x%08x lr=0x%llx\n",
+                        ios_exc_msg_count, req->exception,
+                        (unsigned long long)(req->code_count > 1 ? req->code[1] : req->code[0]),
+                        (unsigned long long)ppc, pinsn,
+                        (unsigned long long)pstate.__lr);
+            }
+        }
 
         /* Look up per-thread TEB and trampoline for the faulting thread */
         uintptr_t thread_teb = 0;
@@ -385,7 +544,7 @@ static void *ios_mach_exception_thread( void *arg )
                 extern void *ios_jit_rx_base_global;
                 extern size_t ios_jit_pool_size_global;
                 extern int ios_jit_addr_is_text(uintptr_t addr);
-                extern void *ios_jit_translate_addr(void *addr);
+                extern void *ios_jit_translate_addr_for_owner(void *addr, void *owner_peb);
 
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
@@ -408,8 +567,49 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     else
                     {
-                        /* Exec fault OUTSIDE JIT pool RX — try translations. */
-                        void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        /* Exec fault OUTSIDE JIT pool RX — try translations.
+                         * IMPORTANT: this handler runs on its own thread, so
+                         * translation must use the FAULTING thread's process
+                         * (its registered TEB->Peb), not ours — a child
+                         * thread's ntdll fault must redirect to the child's
+                         * copy (S1 pseudo-processes). */
+                        void *jit_pc;
+                        void *fault_owner_peb = thread_teb ? ((TEB *)thread_teb)->Peb : NULL;
+                        ios_last_exec_fault_thread = thread;
+                        jit_pc = ios_jit_translate_addr_for_owner((void *)(uintptr_t)fault_pc,
+                                                                  fault_owner_peb);
+                        /* Module-mapping hit = a stale PE-VA pointer somewhere
+                         * in the pool — queue it for the heal scanner so this
+                         * address only ever faults once. */
+                        if (jit_pc != (void *)(uintptr_t)fault_pc)
+                            ios_stale_va_enqueue((uint64_t)fault_pc);
+                        /* [xlate-exec] pseudo-process forensics: every
+                         * image-VA exec fault is an ownership decision —
+                         * log which copy the thread was routed to. A child
+                         * thread landing in a session-owned copy (owner=0
+                         * while its teb->peb is a child peb) is the
+                         * cross-copy migration that kills thread exit. */
+                        {
+                            extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                            /* Child threads only — the session's own boot
+                             * takes thousands of these and drowned the
+                             * budget (2026-07-07 run: all 128 entries spent
+                             * before services.exe even spawned). */
+                            if (fault_owner_peb && peb && fault_owner_peb != (void *)peb)
+                            {
+                                static volatile int xe_count = 0;
+                                int xe = __sync_add_and_fetch(&xe_count, 1);
+                                if (xe <= 256 || (xe % 1024) == 0)
+                                {
+                                    void *copy_pe = NULL;
+                                    void *copy_owner = ios_jit_pool_copy_owner(jit_pc, &copy_pe);
+                                    dprintf(STDERR_FILENO,
+                                        "[xlate-exec] #%d teb=%p owner=%p pc=%p -> %p (copy pe=%p copy_owner=%p)\n",
+                                        xe, (void *)thread_teb, fault_owner_peb,
+                                        (void *)(uintptr_t)fault_pc, jit_pc, copy_pe, copy_owner);
+                                }
+                            }
+                        }
                         if (jit_pc == (void *)(uintptr_t)fault_pc)
                         {
                             /* iOS-Mythic: if PC is in JIT pool RW alias range,
@@ -442,17 +642,24 @@ static void *ios_mach_exception_thread( void *arg )
                         }
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                         {
+                            /* Plain pc redirect — even with x18==0. The old
+                             * x18-restore trampoline clobbered x17, which is
+                             * LIVE in FEX-emitted code (callret scratch) and
+                             * in ARM64EC thunks. If the redirect target's
+                             * code needs the TEB, its [x18,#imm] access
+                             * faults and case 3 emulates it clobber-free. */
                             if (thread_teb && state.__x[18] == 0)
                             {
-                                /* Also fix x18 via trampoline */
-                                state.__x[17] = (uint64_t)(uintptr_t)jit_pc;
-                                __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
+                                static volatile int redir2_count = 0;
+                                int t2 = __sync_add_and_fetch(&redir2_count, 1);
+                                if (t2 <= 10 || (t2 % 4096) == 0)
+                                    dprintf(STDERR_FILENO,
+                                        "[x18-redir2] #%d pc=%p -> jit=%p (x18 set via state)\n",
+                                        t2, (void*)(uintptr_t)fault_pc, jit_pc);
+                                /* Same set_state x18 experiment as case 3. */
+                                state.__x[18] = thread_teb;
                             }
-                            else
-                            {
-                                /* x18 OK, just redirect PC */
-                                __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
-                            }
+                            __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
                             ios_exc_x18_fixes++;
                             handled = 1;
                         }
@@ -460,22 +667,213 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
-            /* 3. Fix x18=0 for DATA ACCESS faults.
-             * iOS zeros x18 on context switch / thread_set_state.
-             * Route through per-thread TEB trampoline to restore x18. */
-            if (!handled && state.__x[18] == 0 && thread_teb && thread_trampoline)
+            /* 3. Emulate [x18, #imm] accesses when x18 == 0.
+             * iOS zeros x18 on context switch. EC/FEX code reads the TEB
+             * through x18; with x18==0 the effective address IS the TEB
+             * offset, so we can complete the access in-handler against the
+             * real TEB (teb + fault_addr) and advance pc. Rn==18 in the
+             * faulting instruction is the exact discriminator — a fault
+             * with any other base register is NOT x18-caused and falls
+             * through to real fault handling.
+             *
+             * This REPLACES the old x18-restore trampoline for data faults.
+             * The trampoline clobbered x17 (its jump register) — fatal when
+             * the interrupted code held a live value there. Two confirmed
+             * kills (2026-07-04, after UNIXCALL-DIRECT widened the x18==0
+             * windows): (a) FEX emitter loop `str w16,[x15,x17]` re-executed
+             * with x17=pc → garbage address → eternal UNHANDLED; (b) ntdll
+             * EC TEB-read sites trampolined with live x17 (pool pointers,
+             * FP constants observed) → silent state corruption → heap
+             * damage → libsystem_malloc died inside Metal texture creation.
+             * Emulation clobbers NOTHING. x18 stays 0 afterwards; each
+             * subsequent TEB access costs one fault until the next context
+             * switch restores nothing — acceptable, bounded, correct. */
+            if (!handled && state.__x[18] == 0 && thread_teb)
             {
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
 
-                if (!is_exec_fault)
+                if (!is_exec_fault && fault_addr < 0x10000 &&
+                    fault_pc >= 0x100000000ULL)
                 {
-                    /* Data access fault — x18=0 caused a bad load/store.
-                     * Fix x18 via trampoline regardless of where PC is. */
-                    state.__x[17] = fault_pc;
-                    __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
-                    ios_exc_x18_fixes++;
-                    handled = 1;
+                    uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
+                    int rn = (insn >> 5) & 0x1f;
+
+                    if (rn == 18)
+                    {
+                        uintptr_t ea = thread_teb + fault_addr;
+                        int rt = insn & 0x1f;
+                        int emulated = 0;
+
+                        switch (insn & 0xffc00000)
+                        {
+                        /* unsigned-offset immediate loads, base x18 */
+                        case 0xf9400000: /* LDR Xt */
+                            if (rt != 31) state.__x[rt] = *(uint64_t *)ea;
+                            emulated = 1; break;
+                        case 0xb9400000: /* LDR Wt (zero-extend) */
+                            if (rt != 31) state.__x[rt] = *(uint32_t *)ea;
+                            emulated = 1; break;
+                        case 0x39400000: /* LDRB Wt */
+                            if (rt != 31) state.__x[rt] = *(uint8_t *)ea;
+                            emulated = 1; break;
+                        case 0x79400000: /* LDRH Wt */
+                            if (rt != 31) state.__x[rt] = *(uint16_t *)ea;
+                            emulated = 1; break;
+                        /* unsigned-offset immediate stores, base x18 */
+                        case 0xf9000000: /* STR Xt */
+                            *(uint64_t *)ea = (rt == 31) ? 0 : state.__x[rt];
+                            emulated = 1; break;
+                        case 0xb9000000: /* STR Wt */
+                            *(uint32_t *)ea = (rt == 31) ? 0 : (uint32_t)state.__x[rt];
+                            emulated = 1; break;
+                        case 0x39000000: /* STRB Wt */
+                            *(uint8_t *)ea = (rt == 31) ? 0 : (uint8_t)state.__x[rt];
+                            emulated = 1; break;
+                        case 0x79000000: /* STRH Wt */
+                            *(uint16_t *)ea = (rt == 31) ? 0 : (uint16_t)state.__x[rt];
+                            emulated = 1; break;
+                        default: break;
+                        }
+
+                        /* LDP/STP Xt,Xt2,[x18,#imm] signed-offset (no writeback) */
+                        if (!emulated && (insn & 0xffc00000) == 0xa9400000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            if (rt != 31)  state.__x[rt]  = *(uint64_t *)ea;
+                            if (rt2 != 31) state.__x[rt2] = *(uint64_t *)(ea + 8);
+                            emulated = 1;
+                        }
+                        else if (!emulated && (insn & 0xffc00000) == 0xa9000000)
+                        {
+                            int rt2 = (insn >> 10) & 0x1f;
+                            *(uint64_t *)ea       = (rt == 31)  ? 0 : state.__x[rt];
+                            *(uint64_t *)(ea + 8) = (rt2 == 31) ? 0 : state.__x[rt2];
+                            emulated = 1;
+                        }
+
+                        /* GPR register-offset (`ldrb w8,[x18,x8]` killed boot
+                         * 2026-07-04 19:39) and unscaled-immediate (LDUR/STUR)
+                         * families, any size, loads+stores+signed loads. The
+                         * hardware already computed the offset into fault_addr,
+                         * so only size/opc/Rt semantics matter here. */
+                        if (!emulated &&
+                            ((insn & 0x3f200c00) == 0x38200800 ||   /* register offset */
+                             (insn & 0x3f200c00) == 0x38000000))    /* unscaled imm9 */
+                        {
+                            int size = (insn >> 30) & 3;   /* 0=B 1=H 2=W 3=X */
+                            int opc  = (insn >> 22) & 3;   /* 0=ST 1=LD 2/3=LDS */
+                            uint64_t val = 0;
+                            emulated = 1;
+                            if (opc == 0)               /* store */
+                            {
+                                val = (rt == 31) ? 0 : state.__x[rt];
+                                switch (size)
+                                {
+                                case 0: *(uint8_t  *)ea = (uint8_t)val;  break;
+                                case 1: *(uint16_t *)ea = (uint16_t)val; break;
+                                case 2: *(uint32_t *)ea = (uint32_t)val; break;
+                                case 3: *(uint64_t *)ea = val;           break;
+                                }
+                            }
+                            else if (opc == 1)          /* zero-extending load */
+                            {
+                                switch (size)
+                                {
+                                case 0: val = *(uint8_t  *)ea; break;
+                                case 1: val = *(uint16_t *)ea; break;
+                                case 2: val = *(uint32_t *)ea; break;
+                                case 3: val = *(uint64_t *)ea; break;
+                                }
+                                if (rt != 31) state.__x[rt] = val;
+                            }
+                            else if (size == 3 && opc == 2)
+                            {
+                                /* PRFM (register/unscaled) — prefetch, no-op */
+                            }
+                            else                        /* sign-extending load */
+                            {
+                                int64_t sval = 0;
+                                switch (size)
+                                {
+                                case 0: sval = *(int8_t  *)ea; break;
+                                case 1: sval = *(int16_t *)ea; break;
+                                case 2: sval = *(int32_t *)ea; break; /* LDRSW */
+                                }
+                                if (opc == 3) /* 32-bit target: Wt, zero upper */
+                                    sval = (int64_t)(uint32_t)(int32_t)sval;
+                                if (rt != 31) state.__x[rt] = (uint64_t)sval;
+                            }
+                        }
+
+                        /* SIMD/FP register-offset + unsigned-offset loads/
+                         * stores, base x18 (V=1, bit 26). `LDR Q0,[x18,x8]`
+                         * (insn 3ce86a40) crashed the crypt32 cert-verify
+                         * SIMD memcpy 2026-07-05. ea = thread_teb+fault_addr
+                         * (hw already added the offset). Access width from
+                         * {size, opc<1>}: size0+opc<1> = 128-bit Q, else
+                         * 1<<size bytes (B/H/S/D). opc<0> (bit22): 1=load,
+                         * 0=store. Loads write neon_state.__v[rt] (zeroing
+                         * the upper lanes) and push it back immediately;
+                         * stores read from it. */
+                        if (!emulated && have_neon &&
+                            ((insn & 0x3f200c00) == 0x3c200800 ||   /* SIMD register offset */
+                             (insn & 0x3f000000) == 0x3d000000))    /* SIMD unsigned-offset imm */
+                        {
+                            int size = (insn >> 30) & 3;
+                            int opc  = (insn >> 22) & 3;
+                            int bytes = (size == 0 && (opc & 2)) ? 16 : (1 << size);
+                            if (opc & 1)   /* load */
+                            {
+                                memset(&neon_state.__v[rt], 0, 16);
+                                memcpy(&neon_state.__v[rt], (void *)ea, bytes);
+                                thread_set_state(thread, ARM_NEON_STATE64,
+                                                 (thread_state_t)&neon_state, neon_count);
+                            }
+                            else           /* store */
+                            {
+                                memcpy((void *)ea, &neon_state.__v[rt], bytes);
+                            }
+                            emulated = 1;
+                        }
+
+                        if (emulated)
+                        {
+                            static volatile int emul3_count = 0;
+                            int e3 = __sync_add_and_fetch(&emul3_count, 1);
+                            if (e3 <= 20 || (e3 % 4096) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[x18-emul3] #%d pc=%p insn=%08x teb+0x%llx rt=%d\n",
+                                    e3, (void*)(uintptr_t)fault_pc, insn,
+                                    (unsigned long long)fault_addr, rt);
+                            /* EXPERIMENT: also set x18 in the written-back
+                             * state. Project lore says thread_set_state
+                             * doesn't preserve x18 — from early testing that
+                             * may have been confounded. If it DOES stick,
+                             * the silent-copy hole (NtCurrentTeb = mov
+                             * x0,x18 propagating 0 without faulting) closes
+                             * and emul3 should fire ~once per context
+                             * switch instead of once per TEB access. Free
+                             * either way — verify via emul3 rate + next-
+                             * fault x18 values in the log. */
+                            state.__x[18] = thread_teb;
+                            __darwin_arm_thread_state64_set_pc_fptr(
+                                state, (void *)(uintptr_t)(fault_pc + 4));
+                            ios_exc_x18_fixes++;
+                            handled = 1;
+                        }
+                        else
+                        {
+                            /* x18-based but unrecognized encoding (writeback,
+                             * register-offset, SIMD...). Log it — needs a new
+                             * case above, NOT the old x17-clobbering
+                             * trampoline. Falls through to real handling. */
+                            dprintf(STDERR_FILENO,
+                                "[x18-emul3] UNRECOGNIZED insn=%08x pc=%p teb+0x%llx\n",
+                                insn, (void*)(uintptr_t)fault_pc,
+                                (unsigned long long)fault_addr);
+                        }
+                    }
                 }
             }
 
@@ -971,6 +1369,130 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* iOS-Mythic RECLAIM RECOVERY (FEX-2607 Thumper): a page that Wine/FEX
+             * consider committed can be reclaimed by iOS under memory pressure —
+             * 2607's per-thread 96MB LookupCaches push the app over the jetsam
+             * limit, so committed L1/L2/code pages get dropped and the re-access
+             * faults with no other handler -> terminate. Force the page back with
+             * mprotect(RW); it returns zero-filled, which is functionally correct
+             * for FEX's caches (a zero L1/L2 slot reads as "empty" -> FEX
+             * recompiles). Gated to the FEX host-arena band (~0x7Cxx..0x80xx) so
+             * it can't mask guest/dyld/null-deref faults, with a 16-slot per-page
+             * repeat guard so an ineffective mprotect can't spin forever. */
+            {
+                uint64_t fa = (uint64_t)fault_addr;
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+
+                /* task #34 (ml74): EXECUTE fault on a code page — the RW grant
+                 * below can never fix it (observed: retry#1..51 on
+                 * 0x7ecaf00000, RW mprotect "succeeds", same fault forever;
+                 * and the fatal walk in the pool RX view at 0x125115ce0 whose
+                 * page had become prot=RW max_prot=RW). Handle code ranges
+                 * FIRST: try to restore R|X — works when the pool/copy
+                 * mapping is intact and only lost its protection. If mprotect
+                 * RX fails, max_prot lost X = the mapping was REPLACED (see
+                 * [jit-tripwire] in virtual_ios.c) — nothing in-handler can
+                 * fix that; log the vm_region ground truth and fall through
+                 * so the fault surfaces instead of spinning. */
+                if (!handled && fa == (uint64_t)fault_pc)
+                {
+                    extern void *ios_jit_rx_base_global;
+                    extern size_t ios_jit_pool_size_global;
+                    uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                    int in_pool_rx = rx && fa >= rx && fa < rx + ios_jit_pool_size_global;
+                    int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
+
+                    if (in_pool_rx || in_band)
+                    {
+                        enum { XR_PAGE = 0x4000 };
+                        uint64_t pg = fa & ~(uint64_t)(XR_PAGE - 1);
+                        static volatile uint64_t xr_pg[16] = {0};
+                        static volatile uint32_t xr_n[16]  = {0};
+                        int s = (int)((pg >> 14) & 15);
+                        int giveup = 0;
+                        if (xr_pg[s] == pg) { if (++xr_n[s] > 8) giveup = 1; }
+                        else { xr_pg[s] = pg; xr_n[s] = 1; }
+#ifndef MADV_FREE_REUSE
+#define MADV_FREE_REUSE 8
+#endif
+                        if (!giveup)
+                        {
+                            /* Restore R|X. Works when the pool RX view / arm64ec
+                             * pool-copy mapping is intact and only lost protection
+                             * under reclaim. MADV_FREE_REUSE cancels any residual
+                             * volatility so the page isn't immediately re-harvested. */
+                            int mpr = mprotect( (void *)(uintptr_t)pg, XR_PAGE, PROT_READ | PROT_EXEC );
+                            int errno_save = errno;
+                            int reuse = madvise( (void *)(uintptr_t)pg, XR_PAGE, MADV_FREE_REUSE );
+                            static volatile int xrc = 0;
+                            int xrcn = __sync_fetch_and_add(&xrc, 1);
+                            if (xrcn < 40 || (xrcn % 50) == 0)
+                                dprintf(STDERR_FILENO,
+                                    "[exec-recover] pg=0x%llx fault=0x%llx mprotect_rx=%d(errno=%d) reuse-cancel=%d retry#%u %s\n",
+                                    (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
+                                    reuse, xr_n[s], in_pool_rx ? "pool-rx" : "band");
+                            if (mpr == 0) handled = 1;
+                            /* else: mprotect RX failed => max_prot lost EXECUTE =>
+                             * the code page was REPLACED by a plain RW mapping
+                             * ([jit-tripwire] names the culprit). Nothing here can
+                             * re-add X; leave handled=0 and fall through to the
+                             * unhandled path, which dumps vm_region ground truth
+                             * and surfaces the fault instead of spinning forever. */
+                        }
+                    }
+                }
+
+                /* DATA fault reclaim recovery in the FEX host-arena band
+                 * (FEX-2607 Thumper path): a page Wine/FEX consider committed
+                 * gets reclaimed under memory pressure — 2607's per-thread 96MB
+                 * LookupCaches push over the jetsam limit, so L1/L2/cache pages
+                 * are dropped and the re-access faults with no other handler.
+                 * Force the page back with mprotect(RW); zero-filled is correct
+                 * for FEX's caches (a zero L1/L2 slot reads "empty" -> recompile).
+                 * Gated to the host-arena band AND to non-execute faults so it
+                 * can't shadow the R|X path above or mask guest/null-deref faults.
+                 * Task #22: cap was >4 — Steam's download pressure re-harvested
+                 * the same still-volatile page 5+ times; MADV_FREE_REUSE makes
+                 * recovery permanent, the higher cap is a belt for residual
+                 * volatility. */
+                if (!handled && fa != (uint64_t)fault_pc &&
+                    fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
+                {
+                    static volatile uint64_t rr_pg[16] = {0};
+                    static volatile uint32_t rr_n[16]  = {0};
+                    /* iOS uses 16KB host pages. NOTE: `host_page_size` in this
+                     * file resolves to the Mach *function*, not a size — using
+                     * it as a value gave a garbage mask (mprotect EINVAL). */
+                    enum { RR_PAGE = 0x4000 };
+                    uint64_t pg = fa & ~(uint64_t)(RR_PAGE - 1);
+                    int s = (int)((pg >> 14) & 15);
+                    int giveup = 0;
+                    if (rr_pg[s] == pg) { if (++rr_n[s] > 64) giveup = 1; }
+                    else { rr_pg[s] = pg; rr_n[s] = 1; }
+                    if (!giveup)
+                    {
+                        int mpr = mprotect( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE );
+                        int errno_save = errno;
+                        int used_mmap = 0;
+                        if (mpr != 0)   /* page may be UNMAPPED, not just PROT_NONE — remap fresh */
+                        {
+                            void *r = mmap( (void *)(uintptr_t)pg, RR_PAGE, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 );
+                            used_mmap = (r == (void *)(uintptr_t)pg);
+                        }
+                        int reuse = madvise( (void *)(uintptr_t)pg, RR_PAGE, MADV_FREE_REUSE );
+                        static volatile int rc = 0;
+                        int rcn = __sync_fetch_and_add(&rc, 1);
+                        if (rcn < 40 || (rcn % 50) == 0)
+                            dprintf(STDERR_FILENO,
+                                "[reclaim-recover] pg=0x%llx fault=0x%llx mprotect=%d(errno=%d) mmap=%d reuse-cancel=%d retry#%u\n",
+                                (unsigned long long)pg, (unsigned long long)fa, mpr, errno_save,
+                                used_mmap, reuse, rr_n[s]);
+                        if (mpr == 0 || used_mmap) handled = 1;
+                    }
+                }
+            }
+
             if (handled)
                 thread_set_state( thread, ARM_THREAD_STATE64,
                                   (thread_state_t)&state, count );
@@ -1032,6 +1554,40 @@ static void *ios_mach_exception_thread( void *arg )
                             (unsigned long long)fault_pc_check,
                             first_seen ? " [first]" : "");
                     }
+                    /* TEMP [rip-leak] task#34 ml64-class: guest RIP inside a
+                     * JIT-POOL mapping means a pool-translated pointer leaked
+                     * into guest control flow (guest must only ever see PE
+                     * VAs; ml64 ran away executing dbghelp's pool ARM64 .text
+                     * as x86). Name the module+RVA and dump the guest return
+                     * stack so the SOURCE of the poisoned pointer is
+                     * identifiable. Capped. STRIP BEFORE COMMIT. */
+                    if (first_seen && state_rip_q)
+                    {
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        uint64_t mod_base = 0;
+                        uint64_t pe = ios_jit_reverse_translate( state_rip_q, &mod_base );
+                        static int leak_n;
+                        if (pe && leak_n < 12)
+                        {
+                            uint64_t rsp = state.__x[23];  /* ARM64EC SRA: RSP=x23 */
+                            uint64_t stk[8] = { 0 };
+                            vm_size_t outsz = sizeof(stk);
+                            leak_n++;
+                            vm_read_overwrite( mach_task_self(), rsp, sizeof(stk),
+                                               (vm_address_t)stk, &outsz );
+                            dprintf(STDERR_FILENO,
+                                "[rip-leak] guest RIP 0x%llx IS POOL addr = PE 0x%llx (module base 0x%llx rva 0x%llx)\n"
+                                "[rip-leak] guest RSP=0x%llx stack: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                                (unsigned long long)state_rip_q, (unsigned long long)pe,
+                                (unsigned long long)mod_base,
+                                (unsigned long long)(pe - mod_base),
+                                (unsigned long long)rsp,
+                                (unsigned long long)stk[0], (unsigned long long)stk[1],
+                                (unsigned long long)stk[2], (unsigned long long)stk[3],
+                                (unsigned long long)stk[4], (unsigned long long)stk[5],
+                                (unsigned long long)stk[6], (unsigned long long)stk[7]);
+                        }
+                    }
                 }
                 if (cnt <= 5 || (cnt % 100) == 0 || terminal_pc)
                 {
@@ -1043,6 +1599,26 @@ static void *ios_mach_exception_thread( void *arg )
                         (void*)(uintptr_t)__darwin_arm_thread_state64_get_sp(state),
                         (void*)(uintptr_t)state.__x[16],
                         (void*)(uintptr_t)state.__x[17]);
+                    /* [ec-fault-regs] the faulting insn f8686928 = ldr x8,[x9,x8]:
+                     * addr = x9(base) + x8(index). Dump x8..x11 so we can name the
+                     * table (EC bitmap? syscall-frame? LookupCache?) and why it's bad. */
+                    if (cnt <= 3)
+                    {
+                        void *peb_ecbm = NULL; void *peb_p = NULL;
+                        if (thread_teb) {
+                            peb_p = ((TEB *)thread_teb)->Peb;
+                            /* PEB->EcCodeBitMap read DIRECTLY (same struct is_ec_code
+                             * uses). If this != 0 but x9==0, is_ec_code read a wrong
+                             * offset / wrong peb; if this == 0, the field is really null
+                             * for this thread's peb (timing / peb not wired). */
+                            if (peb_p) peb_ecbm = ((PEB *)peb_p)->EcCodeBitMap;
+                        }
+                        dprintf(STDERR_FILENO, "[ec-fault-regs] x8=%p x9=%p x10=%p x11=%p x0=%p x2=%p | teb=%p peb=%p peb->EcCodeBitMap=%p\n",
+                            (void*)(uintptr_t)state.__x[8], (void*)(uintptr_t)state.__x[9],
+                            (void*)(uintptr_t)state.__x[10], (void*)(uintptr_t)state.__x[11],
+                            (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
+                            (void *)thread_teb, peb_p, peb_ecbm);
+                    }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
                     {
@@ -1050,11 +1626,418 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
                             (void*)lr_p, *lr_p);
                     }
+                    /* Which pool COPY is pc in, and who owns it? Names the
+                     * session-vs-child copy — the PE attribution below can't
+                     * (all copies share PE VAs). owner=-1 = not pool. */
+                    {
+                        extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                        void *copy_pe = NULL;
+                        void *copy_owner = ios_jit_pool_copy_owner((void *)(uintptr_t)fault_pc, &copy_pe);
+                        void *cur_teb_peb = thread_teb ? ((TEB *)thread_teb)->Peb : NULL;
+                        dprintf(STDERR_FILENO,
+                            "[mach_exc] pc pool-copy pe=%p owner=%p; thread teb=%p peb=%p\n",
+                            copy_pe, copy_owner, (void *)thread_teb, cur_teb_peb);
+                        /* [nls-probe] The first fault is upcase_unicode_to_utf8 (ntdll RVA
+                         * 0x38aa8) reading the NLS upcase-table pointer at ntdll .data RVA
+                         * 0xc04e0 via `adrp x16,0xc0000; ldr x7,[x16,#0x4e0]` — and getting
+                         * NULL. Compare the value the POOL copy read (x16+0x4e0) against the
+                         * PE mapping's own .data (copy_pe+0xc04e0). If PE!=0 && pool==0 the
+                         * pool copy's .data is stale (fix = sync/share ntdll .data); if both
+                         * 0 the PE global was never populated (fix is upstream NLS init). */
+                        if (cnt <= 2 && copy_pe && (uintptr_t)copy_pe >= 0x100000000ULL)
+                        {
+                            uint64_t x16v = (uint64_t)state.__x[16];
+                            uint64_t pool_v = (x16v >= 0x100000000ULL)
+                                ? *(volatile uint64_t *)(uintptr_t)(x16v + 0x4e0) : 0xdead1;
+                            uint64_t pe_v = *(volatile uint64_t *)((uintptr_t)copy_pe + 0xc04e0);
+                            dprintf(STDERR_FILENO,
+                                "[nls-probe] upcase ptr: pool[x16+0x4e0]=0x%llx  PE[pe+0xc04e0]=0x%llx  (x16=0x%llx pe=%p rva_pc=0x%llx)\n",
+                                (unsigned long long)pool_v, (unsigned long long)pe_v,
+                                (unsigned long long)x16v, copy_pe,
+                                (unsigned long long)((uintptr_t)fault_pc - ((uintptr_t)fault_pc & ~0xfffffULL)));
+                        }
+                    }
                     if ((uintptr_t)fault_pc >= 0x100000000ULL)
                     {
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
                         dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                    }
+                    /* iOS-Mythic: symbolize pc/lr via dladdr — works for
+                     * dyld-cache addresses in-process. Names the native
+                     * subsystem when a fault lands in system frameworks
+                     * (e.g. the 2026-07-04 post-UNIXCALL-DIRECT crash at
+                     * 0x18521c0d0 was unattributable offline: DeviceSupport
+                     * symbol tree only has lazily-extracted dylibs). */
+                    {
+                        Dl_info di_pc, di_lr;
+                        const char *pc_img = "?", *pc_sym = "?"; uint64_t pc_off = 0;
+                        const char *lr_img = "?", *lr_sym = "?"; uint64_t lr_off = 0;
+                        if (dladdr((void*)(uintptr_t)fault_pc, &di_pc))
+                        {
+                            if (di_pc.dli_fname) pc_img = di_pc.dli_fname;
+                            if (di_pc.dli_sname) { pc_sym = di_pc.dli_sname;
+                                pc_off = fault_pc - (uint64_t)(uintptr_t)di_pc.dli_saddr; }
+                        }
+                        if (dladdr((void*)(uintptr_t)state.__lr, &di_lr))
+                        {
+                            if (di_lr.dli_fname) lr_img = di_lr.dli_fname;
+                            if (di_lr.dli_sname) { lr_sym = di_lr.dli_sname;
+                                lr_off = state.__lr - (uint64_t)(uintptr_t)di_lr.dli_saddr; }
+                        }
+                        dprintf(STDERR_FILENO,
+                            "[mach_exc] sym pc=%s`%s+0x%llx lr=%s`%s+0x%llx\n",
+                            pc_img, pc_sym, (unsigned long long)pc_off,
+                            lr_img, lr_sym, (unsigned long long)lr_off);
+                        /* JIT-pool addresses: name the PE module + offset
+                         * (same machinery as [thread-stacks]) so faults in
+                         * copied PE code self-symbolize. */
+                        {
+                            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                            uint64_t mod, va;
+                            if ((va = ios_jit_reverse_translate( fault_pc, &mod )))
+                                dprintf(STDERR_FILENO, "[mach_exc] pc PE: %s+0x%llx (va=0x%llx)\n",
+                                        ios_pe_module_name(mod), (unsigned long long)(va - mod),
+                                        (unsigned long long)va);
+                            /* [bucketscan-probe] Thumper dies in FEXCore GuestToHostMap::BlockList
+                             * (ankerl unordered_dense) do_find (libarm64ecfex ~RVA 0x1d140-0x1d280,
+                             * caller LookupCache::FindBlock) scanning its bucket array OFF THE END:
+                             * loop `add x17,x11,w12,uxtw#3; ldr w1,[x17]` => x11=buckets base,
+                             * w12=index, x17=x11+w12*8 walks unmapped guest mem. Dump base/index/
+                             * scan-distance/key (NO deref — stay signal-safe) to tell UNINITIALIZED
+                             * (x11 garbage/tiny, no valid array) from TORN-READ (x11 a valid heap
+                             * ptr but distance huge => bounds/mask stale from a concurrent swap). */
+                            {
+                                uint64_t bs_mod, bs_va;
+                                if ((bs_va = ios_jit_reverse_translate( fault_pc, &bs_mod )))
+                                {
+                                    uint64_t bs_rva = bs_va - bs_mod;
+                                    /* [findblock-probe] LookupCache::FindBlock(x0=this=LookupCache*, x1=Thread,
+                                     * x2=Address). Its L1 lookup faults at ~0x18c90: ldp x8,x9,[x0,#0x30] (x0[0x30]=
+                                     * L1 base, x0[0x38]=L1 mask), x25=x8+(x9&x2)<<4, ldr [x25]. Capture x0 (the LIVE
+                                     * LookupCache ptr — dead by do_find) + L1 fields to tell a BOGUS x0 (garbage/
+                                     * guest ptr from the dispatcher/StateFrame) from a valid-but-corrupted cache. */
+                                    if (bs_rva >= 0x18c70 && bs_rva < 0x18e20)
+                                    {
+                                        static volatile int fb_seen = 0;
+                                        if (__sync_fetch_and_add(&fb_seen, 1) < 6)
+                                        {
+                                            uint64_t x0v = (uint64_t)state.__x[0];
+                                            uint64_t l1base = 0xdead, l1mask = 0xdead;
+                                            int host = (x0v >= 0x100000000ULL && x0v < 0x800000000000ULL);
+                                            if (host) {
+                                                l1base = *(volatile uint64_t *)(uintptr_t)(x0v + 0x30);
+                                                l1mask = *(volatile uint64_t *)(uintptr_t)(x0v + 0x38);
+                                            }
+                                            dprintf(STDERR_FILENO,
+                                                "[findblock-probe] rva=0x%llx x0(LookupCache)=0x%llx host=%d x1(Thread)=0x%llx x2(rip)=0x%llx L1base[0x30]=0x%llx L1mask[0x38]=0x%llx\n",
+                                                (unsigned long long)bs_rva, (unsigned long long)x0v, host,
+                                                (unsigned long long)state.__x[1], (unsigned long long)state.__x[2],
+                                                (unsigned long long)l1base, (unsigned long long)l1mask);
+                                        }
+                                    }
+                                    if (bs_rva >= 0x1d100 && bs_rva < 0x1d300)
+                                    {
+                                        static volatile int bs_seen = 0;
+                                        if (__sync_fetch_and_add(&bs_seen, 1) < 6)
+                                        {
+                                            uint64_t x8v  = (uint64_t)state.__x[8];
+                                            uint64_t x11v = (uint64_t)state.__x[11];
+                                            uint64_t x12v = (uint64_t)state.__x[12];
+                                            uint64_t x15v = (uint64_t)state.__x[15];
+                                            uint64_t x17v = (uint64_t)state.__x[17];
+                                            dprintf(STDERR_FILENO,
+                                                "[bucketscan-probe] do_find rva=0x%llx x11(base)=0x%llx x17(cur)=0x%llx scan_dist=0x%llx(%llu buckets) x8=0x%llx x12(idx)=0x%llx x15(key)=0x%llx\n",
+                                                (unsigned long long)bs_rva, (unsigned long long)x11v,
+                                                (unsigned long long)x17v, (unsigned long long)(x17v - x11v),
+                                                (unsigned long long)((x17v - x11v) / 8), (unsigned long long)x8v,
+                                                (unsigned long long)x12v, (unsigned long long)x15v);
+                                            /* Dump the actual bucket CONTENTS at x11 (m_buckets). This range is
+                                             * mapped (the scan reads it up to x17). Each ankerl bucket = 8 bytes
+                                             * {u32 dist_and_fingerprint, u32 value_idx}. All-zero => empty (do_find
+                                             * would have stopped); small ascending d_a_f => a real map; random
+                                             * huge values => uninitialized/torn/UAF backing store. Also dump
+                                             * callee-saved regs so we can recover `this` (do_find: this[0x18]==
+                                             * m_buckets, this[0x3e]=m_shifts) offline. */
+                                            {
+                                                uint64_t bk[6] = {0,0,0,0,0,0};
+                                                if (x11v >= 0x100000000ULL && x11v < 0x800000000000ULL)
+                                                    for (int bi = 0; bi < 6; bi++)
+                                                        bk[bi] = *(volatile uint64_t *)(uintptr_t)(x11v + (uint64_t)bi * 8);
+                                                dprintf(STDERR_FILENO,
+                                                    "[bucketscan-probe] buckets@x11: %016llx %016llx %016llx %016llx %016llx %016llx | x0=%llx x9=%llx x10=%llx x19=%llx x20=%llx x21=%llx x22=%llx\n",
+                                                    (unsigned long long)bk[0], (unsigned long long)bk[1],
+                                                    (unsigned long long)bk[2], (unsigned long long)bk[3],
+                                                    (unsigned long long)bk[4], (unsigned long long)bk[5],
+                                                    (unsigned long long)state.__x[0], (unsigned long long)state.__x[9],
+                                                    (unsigned long long)state.__x[10], (unsigned long long)state.__x[19],
+                                                    (unsigned long long)state.__x[20], (unsigned long long)state.__x[21],
+                                                    (unsigned long long)state.__x[22]);
+                                                /* Recover the map `this`: do_find has this[0x18]==m_buckets(x11v).
+                                                 * Whichever candidate reg, at +0x18, holds x11v is `this`. Then dump
+                                                 * its ankerl fields to tell a real-but-corrupted map (sane values
+                                                 * ptrs, only m_buckets bad) from a wrong/guest `this`. Guarded reads. */
+                                                {
+                                                    uint64_t cands[4] = { (uint64_t)state.__x[10], (uint64_t)state.__x[19],
+                                                                          (uint64_t)state.__x[21], (uint64_t)state.__x[0] };
+                                                    int found = 0;
+                                                    for (int ci = 0; ci < 4 && !found; ci++) {
+                                                        uint64_t th = cands[ci];
+                                                        if (th < 0x100000000ULL || th >= 0x800000000000ULL) continue;
+                                                        uint64_t mb = *(volatile uint64_t *)(uintptr_t)(th + 0x18);
+                                                        if (mb != x11v) continue;
+                                                        found = 1;
+                                                        uint64_t vb  = *(volatile uint64_t *)(uintptr_t)(th + 0x0);
+                                                        uint64_t ve  = *(volatile uint64_t *)(uintptr_t)(th + 0x8);
+                                                        uint64_t f20 = *(volatile uint64_t *)(uintptr_t)(th + 0x20);
+                                                        uint64_t f28 = *(volatile uint64_t *)(uintptr_t)(th + 0x28);
+                                                        uint8_t  sh  = *(volatile uint8_t  *)(uintptr_t)(th + 0x3e);
+                                                        dprintf(STDERR_FILENO,
+                                                            "[bucketscan-probe] THIS=0x%llx(reg%d) values.begin=0x%llx end=0x%llx [0x20]=0x%llx [0x28]=0x%llx m_shifts=0x%x\n",
+                                                            (unsigned long long)th, ci, (unsigned long long)vb,
+                                                            (unsigned long long)ve, (unsigned long long)f20,
+                                                            (unsigned long long)f28, sh);
+                                                    }
+                                                    if (!found)
+                                                        dprintf(STDERR_FILENO,
+                                                            "[bucketscan-probe] THIS not found in x0/x10/x19/x21 (map ptr not in loop regs)\n");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if ((va = ios_jit_reverse_translate( state.__lr, &mod )))
+                                dprintf(STDERR_FILENO, "[mach_exc] lr PE: %s+0x%llx (va=0x%llx)\n",
+                                        ios_pe_module_name(mod), (unsigned long long)(va - mod),
+                                        (unsigned long long)va);
+                            /* [nullfp-probe] When the fault is #arm64x_check_call with x11=0,
+                             * the EC indirect-call TARGET is null. The caller pattern is
+                             *   lr-0x1c: adrp xN, PAGE ;  lr-0xc: ldr x11,[xN,#OFF] ;  lr-4: blr x8
+                             * Decode adrp+ldr to recover the target-global address, then read it
+                             * from BOTH the pool COPY and the PE mapping. pool==0 && PE!=0 => the
+                             * pool copy's .data was never relocated/synced (same class as the NLS
+                             * casemap bug); both==0 => the static-init that populates it never ran. */
+                            if (cnt <= 3 && va && (uintptr_t)state.__x[11] == 0 &&
+                                (uintptr_t)state.__lr >= 0x100000000ULL)
+                            {
+                                uint64_t lr_rva = va - mod;
+                                uint64_t pool_base = (uint64_t)state.__lr - lr_rva;
+                                uint32_t *cp = (uint32_t *)(uintptr_t)state.__lr;
+                                uint32_t adrp_i = cp[-7];   /* lr-0x1c */
+                                uint32_t ldr_i  = cp[-3];   /* lr-0xc  */
+                                int is_adrp = ((adrp_i >> 24) & 0x9f) == 0x90;
+                                int is_ldr  = ((ldr_i  >> 22) & 0x3ff) == 0x3e5; /* LDR imm,64 unsigned */
+                                if (is_adrp && is_ldr)
+                                {
+                                    int64_t immlo = (adrp_i >> 29) & 0x3;
+                                    int64_t immhi = (adrp_i >> 5) & 0x7ffff;
+                                    int64_t imm = (immhi << 2) | immlo;
+                                    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
+                                    uint64_t adrp_pc = (uint64_t)state.__lr - 0x1c;
+                                    uint64_t page = (adrp_pc & ~0xfffULL) + ((uint64_t)imm << 12);
+                                    uint64_t off  = (uint64_t)((ldr_i >> 10) & 0xfff) << 3;
+                                    uint64_t g_pool = page + off;
+                                    uint64_t g_rva  = g_pool - pool_base;
+                                    uint64_t gv_pool = *(volatile uint64_t *)(uintptr_t)g_pool;
+                                    uint64_t gv_pe   = *(volatile uint64_t *)(uintptr_t)(mod + g_rva);
+                                    dprintf(STDERR_FILENO,
+                                        "[nullfp-probe] tgt-global rva=0x%llx pool[0x%llx]=0x%llx PE[0x%llx]=0x%llx mod=%s lr_rva=0x%llx\n",
+                                        (unsigned long long)g_rva,
+                                        (unsigned long long)g_pool, (unsigned long long)gv_pool,
+                                        (unsigned long long)(mod + g_rva), (unsigned long long)gv_pe,
+                                        ios_pe_module_name(mod), (unsigned long long)lr_rva);
+                                }
+                                else
+                                    dprintf(STDERR_FILENO,
+                                        "[nullfp-probe] caller not adrp+ldr: adrp_i=0x%08x ldr_i=0x%08x lr_rva=0x%llx mod=%s\n",
+                                        adrp_i, ldr_i, (unsigned long long)(va - mod), ios_pe_module_name(mod));
+                            }
+                        }
+                        /* fp-chain backtrace of the faulting thread — names
+                         * the exact native call path (which Metal call fed
+                         * free() a garbage pointer). Native code has honest
+                         * x29 chains; stop on invalid fp. */
+                        if (cnt <= 3)
+                        {
+                            uint64_t fp_walk = state.__fp;
+                            int fr;
+                            for (fr = 0; fr < 10 && fp_walk; fr++)
+                            {
+                                uint64_t frame_buf[2];
+                                mach_vm_size_t got_fw = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)fp_walk, 16,
+                                        (mach_vm_address_t)frame_buf, &got_fw)
+                                        != KERN_SUCCESS || got_fw != 16)
+                                    break;
+                                {
+                                    uint64_t ret_pc = frame_buf[1];
+                                    Dl_info di_f;
+                                    const char *f_img = "?", *f_sym = "?";
+                                    uint64_t f_off = ret_pc;
+                                    if (ret_pc > 0x4000 &&
+                                        dladdr((void*)(uintptr_t)ret_pc, &di_f))
+                                    {
+                                        if (di_f.dli_fname) f_img = di_f.dli_fname;
+                                        if (di_f.dli_sname) { f_sym = di_f.dli_sname;
+                                            f_off = ret_pc - (uint64_t)(uintptr_t)di_f.dli_saddr; }
+                                    }
+                                    dprintf(STDERR_FILENO,
+                                        "[mach_exc] bt[%d] 0x%llx %s`%s+0x%llx\n",
+                                        fr, (unsigned long long)ret_pc,
+                                        f_img, f_sym, (unsigned long long)f_off);
+                                    if (ret_pc <= 0x4000) break;
+                                }
+                                fp_walk = frame_buf[0];
+                            }
+                        }
+                        /* Stack scan ([term-stack] pattern): the exit-path
+                         * crashers have no walkable fp chain, so reconstruct
+                         * call history from return addresses left on the
+                         * stack. Copy attribution per hit — the frame where
+                         * copy_owner flips from a child peb to 0 (session)
+                         * is where the thread crossed ntdll copies. */
+                        if (cnt <= 3)
+                        {
+                            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                            extern void *ios_jit_pool_copy_owner(const void *addr, void **pe_base_out);
+                            uint64_t sp_scan = __darwin_arm_thread_state64_get_sp(state);
+                            int w2, hits = 0;
+                            for (w2 = 0; w2 < 512 && hits < 24; w2++)
+                            {
+                                uint64_t slot_val;
+                                mach_vm_size_t got_sv = 0;
+                                if (mach_vm_read_overwrite(mach_task_self(),
+                                        (mach_vm_address_t)(sp_scan + 8ull * w2), 8,
+                                        (mach_vm_address_t)&slot_val, &got_sv)
+                                        != KERN_SUCCESS || got_sv != 8)
+                                    break;
+                                {
+                                    uint64_t mod3, va3;
+                                    if ((va3 = ios_jit_reverse_translate( slot_val, &mod3 )) && va3 != slot_val)
+                                    {
+                                        void *cp3 = NULL;
+                                        void *co3 = ios_jit_pool_copy_owner((void *)(uintptr_t)slot_val, &cp3);
+                                        dprintf(STDERR_FILENO,
+                                            "[exit-stk] sp+0x%x: 0x%llx = %s+0x%llx copy_owner=%p\n",
+                                            w2 * 8, (unsigned long long)slot_val,
+                                            ios_pe_module_name(mod3),
+                                            (unsigned long long)(va3 - mod3), co3);
+                                        hits++;
+                                    }
+                                }
+                            }
+                        }
+                        /* One-shot: dump the faulting native function's
+                         * prologue so we can see what per-thread/global
+                         * state it reads (libsystem_malloc keeps dying on
+                         * corrupt zone state — need its actual fastpath). */
+                        static volatile int proto_dumped = 0;
+                        if (di_pc.dli_saddr && fault_pc >= 0x180000000ULL &&
+                            __sync_bool_compare_and_swap(&proto_dumped, 0, 1))
+                        {
+                            uint32_t *fp = (uint32_t*)di_pc.dli_saddr;
+                            int w;
+                            for (w = 0; w < 40; w += 8)
+                                dprintf(STDERR_FILENO,
+                                    "[mach_exc] fn+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                    w * 4, fp[w], fp[w+1], fp[w+2], fp[w+3],
+                                    fp[w+4], fp[w+5], fp[w+6], fp[w+7]);
+                        }
+                    }
+                    /* Thing B one-shot: a zero-page pc crawl means a thread
+                     * took `blr x16` with x16==1 from an EC exit thunk
+                     * ($iexit_thunk$ at EC ntdll+0x73040: adrp x8,+0x51
+                     * pages; ldr x16,[x8,#0x480]; blr x16). Dump (a) the
+                     * ARM64X dispatch slots of every private EC ntdll copy,
+                     * (b) the qword the adrp ACTUALLY dereferenced computed
+                     * from the execution-address lr (catches link-vs-exec
+                     * address skew in pool copies), (c) x9 — exit-thunk
+                     * convention: x9 = the x64 target being called — and
+                     * (d) an fp-chain backtrace with PE attribution so the
+                     * call path INTO the thunk names itself. */
+                    static volatile int thunk_probe_shots = 0;
+                    if (fault_pc < 0x1000 && thunk_probe_shots < 3)
+                    {
+                        extern void ios_dump_ec_dispatch_slots( unsigned long long lr_va, unsigned long long x9 );
+                        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                        uint64_t lr_exec = state.__lr & 0x0000007fffffffffull;
+                        uint64_t lr_mod = 0, lr_va = ios_jit_reverse_translate( lr_exec, &lr_mod );
+                        uint64_t fp_walk;
+                        int fr;
+                        __sync_add_and_fetch(&thunk_probe_shots, 1);
+                        dprintf(STDERR_FILENO,
+                            "[thunk-slot] WEDGE pc=0x%llx lr_exec=0x%llx lr_va=0x%llx (%.32s) "
+                            "x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx x4=0x%llx "
+                            "x8=0x%llx x9=0x%llx x10=0x%llx x11=0x%llx fp=0x%llx\n",
+                            (unsigned long long)fault_pc,
+                            (unsigned long long)lr_exec, (unsigned long long)lr_va,
+                            lr_mod ? ios_pe_module_name(lr_mod) : "?",
+                            (unsigned long long)state.__x[0], (unsigned long long)state.__x[1],
+                            (unsigned long long)state.__x[2], (unsigned long long)state.__x[3],
+                            (unsigned long long)state.__x[4], (unsigned long long)state.__x[8],
+                            (unsigned long long)state.__x[9], (unsigned long long)state.__x[10],
+                            (unsigned long long)state.__x[11], (unsigned long long)state.__fp);
+                        ios_dump_ec_dispatch_slots( lr_va ? lr_va : lr_exec,
+                                                    state.__x[9] );
+                        /* Exec-relative adrp target: adrp sits at lr-0xc;
+                         * its immediate is +0x51 pages, ldr offset 0x480
+                         * (fixed by the thunk's encoding — see disasm of
+                         * arm64ec-windows/ntdll.dll +0x73048). */
+                        {
+                            uint64_t adrp_tgt = ((lr_exec - 0xc) & ~0xFFFULL) + 0x51000 + 0x480;
+                            uint64_t slot_val = 0;
+                            mach_vm_size_t got_sv = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)adrp_tgt, 8,
+                                    (mach_vm_address_t)&slot_val, &got_sv) == KERN_SUCCESS && got_sv == 8)
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] exec-relative slot @0x%llx = 0x%llx\n",
+                                    (unsigned long long)adrp_tgt, (unsigned long long)slot_val);
+                            else
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] exec-relative slot @0x%llx UNREADABLE\n",
+                                    (unsigned long long)adrp_tgt);
+                        }
+                        fp_walk = state.__fp;
+                        for (fr = 0; fr < 16 && fp_walk; fr++)
+                        {
+                            uint64_t frame_buf[2];
+                            mach_vm_size_t got_fw = 0;
+                            uint64_t ret_pc, bt_mod, bt_va;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (mach_vm_address_t)fp_walk, 16,
+                                    (mach_vm_address_t)frame_buf, &got_fw) != KERN_SUCCESS || got_fw != 16)
+                                break;
+                            ret_pc = frame_buf[1] & 0x0000007fffffffffull;
+                            if (ret_pc <= 0x4000) break;
+                            bt_mod = 0;
+                            bt_va = ios_jit_reverse_translate( ret_pc, &bt_mod );
+                            if (bt_va)
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] bt[%d] 0x%llx PE %.32s+0x%llx (base=0x%llx)\n",
+                                    fr, (unsigned long long)ret_pc,
+                                    ios_pe_module_name(bt_mod),
+                                    (unsigned long long)(bt_va - bt_mod),
+                                    (unsigned long long)bt_mod);
+                            else
+                            {
+                                Dl_info di_t;
+                                const char *t_img = "?", *t_sym = "?";
+                                uint64_t t_off = ret_pc;
+                                if (dladdr((void*)(uintptr_t)ret_pc, &di_t))
+                                {
+                                    if (di_t.dli_fname) { t_img = strrchr(di_t.dli_fname, '/'); t_img = t_img ? t_img + 1 : di_t.dli_fname; }
+                                    if (di_t.dli_sname) { t_sym = di_t.dli_sname; t_off = ret_pc - (uint64_t)(uintptr_t)di_t.dli_saddr; }
+                                }
+                                dprintf(STDERR_FILENO,
+                                    "[thunk-slot] bt[%d] 0x%llx %s`%s+0x%llx\n",
+                                    fr, (unsigned long long)ret_pc, t_img, t_sym,
+                                    (unsigned long long)t_off);
+                            }
+                            fp_walk = frame_buf[0];
+                        }
                     }
                     /* One-shot dump: on the first UNHANDLED exec fault, dump the
                      * JIT-pool RW alias contents around the relevant FEX CodeBuffer
@@ -1494,6 +2477,13 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
                         (void *)(uintptr_t)ios_exc_port );
         pthread_detach( handler );
 
+        /* Stale-pointer heal scanner (see ios_stale_va_scanner above). */
+        {
+            pthread_t healer;
+            pthread_create( &healer, NULL, ios_stale_va_scanner, NULL );
+            pthread_detach( healer );
+        }
+
         ios_exc_handler_started = 1;
     }
 
@@ -1649,20 +2639,41 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
  */
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
+    extern int ios_is_arm64ec_cur(void);
     struct syscall_frame *frame = get_syscall_frame();
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
         frame->restore_flags |= CONTEXT_INTEGER;
 
-    if (is_arm64ec() && !is_ec_code( frame->pc ))
+    /* iOS-Mythic diag (Thumper desktop ILL): the crash pc is entered with no
+     * branch/register/immediate trail = a context restore. Log every resume
+     * targeting the FEX tail-carve region (top 128MB of the pool) whose
+     * first word is a data-word/NOP — plus the is_ec_code verdict, since
+     * non-EC resumes get bounced through KiUserEmulationDispatcher. */
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
+        if (rx && psz && frame->pc >= rx + psz / 2 && frame->pc < rx + psz)
+        {
+            uint32_t w = *(uint32_t *)frame->pc;
+            if ((w >> 16) == 0 || w == 0xd503201fu)
+                dprintf(2, "[set-ctx] SUSPICIOUS resume: pc=%p first_insn=0x%08x is_ec=%d lr=%p sp=%p (Pc from context=%p)\n",
+                        (void *)frame->pc, w, is_ec_code( frame->pc ),
+                        (void *)frame->lr, (void *)frame->sp, (void *)context->Pc);
+        }
+    }
+
+    if (ios_is_arm64ec_cur() && !is_ec_code( frame->pc ))   /* owner-aware (X3) */
     {
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
 
         user_context->ContextFlags = CONTEXT_FULL;
         NtGetContextThread( GetCurrentThread(), user_context );
         frame->sp = (ULONG_PTR)user_context;
-        frame->pc = (ULONG_PTR)pKiUserEmulationDispatcher;
+        frame->pc = (ULONG_PTR)IOS_PFUNC(KiUserEmulationDispatcher);
     }
     return status;
 }
@@ -1682,7 +2693,10 @@ void *get_native_context( CONTEXT *context )
  */
 void *get_wow_context( CONTEXT *context )
 {
-    return get_cpu_area( main_image_info.Machine );
+    /* Owner-aware (X3): the CPU area machine follows the current thread's
+     * pseudo-process, not the session's main exe. */
+    extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
+    return get_cpu_area( ios_cur_image_info()->Machine );
 }
 
 
@@ -1698,6 +2712,24 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
 
     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
+
+    /* iOS-Mythic diag: companion to [set-ctx] in signal_set_full_context —
+     * catch cross-thread PC rewrites into the FEX tail carve that land on
+     * data words (suspend/invalidate machinery redirecting threads). */
+    if (flags & CONTEXT_CONTROL)
+    {
+        extern void *ios_jit_rx_base_global;
+        extern size_t ios_jit_pool_size_global;
+        uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+        size_t psz = ios_jit_pool_size_global;
+        if (rx && psz && context->Pc >= rx + psz / 2 && context->Pc < rx + psz)
+        {
+            uint32_t w = *(uint32_t *)context->Pc;
+            if ((w >> 16) == 0 || w == 0xd503201fu)
+                dprintf(2, "[set-ctx] SUSPICIOUS NtSetContextThread: self=%d pc=%p first_insn=0x%08x lr=%p\n",
+                        self, (void *)context->Pc, w, (void *)context->Lr);
+        }
+    }
 
     if (!self)
     {
@@ -2037,11 +3069,46 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context );
 /***********************************************************************
  *           setup_raise_exception
  */
+/* task #24 probe: Thumper's settings page dies via its own ExitProcess(-1)
+ * with the actual failure invisible (handled guest exception / C++ throw /
+ * OutputDebugString we never see). Log every exception dispatched to the
+ * guest: code+address+params. DBG_PRINTEXCEPTION carries the game's own
+ * debug string — print it. 0xE06D7363 = MSVC C++ throw. */
+static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *rec, ULONG64 pc )
+{
+    static volatile int exc_logged = 0;
+    int n = __sync_add_and_fetch(&exc_logged, 1);
+    if (n > 80) return;
+    dprintf(2, "[exc-disp] %s tid=%04x code=%08x flags=%x addr=%p pc=%llx nparams=%u p0=%llx p1=%llx\n",
+            via, (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+            (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags,
+            rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
+            rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
+            rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
+    if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
+        dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
+                (int)(rec->ExceptionInformation[0] > 512 ? 512 : rec->ExceptionInformation[0]),
+                (const char *)rec->ExceptionInformation[1]);
+    if (rec->ExceptionCode == 0x4001000a && rec->NumberParameters >= 2 &&
+        rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_WIDE_C */
+    {
+        const WCHAR *ws = (const WCHAR *)rec->ExceptionInformation[1];
+        char buf[256];
+        int i;
+        for (i = 0; i < 255 && ws[i]; i++) buf[i] = (ws[i] < 128) ? (char)ws[i] : '?';
+        buf[i] = 0;
+        dprintf(2, "[exc-disp]   OutputDebugStringW: \"%s\"\n", buf);
+    }
+}
+
 static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
     NTSTATUS status;
+
+    ios_log_guest_exception( "raise", rec, context->Pc );
 
     status = send_debug_event( rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -2062,7 +3129,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     context_init_empty_xstate( &stack->context, stack->redzone );
 
     SP_sig(sigcontext) = (ULONG_PTR)stack;
-    PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+    PC_sig(sigcontext) = (ULONG_PTR)IOS_PFUNC(KiUserExceptionDispatcher);
     REGn_sig(18, sigcontext) = (ULONG_PTR)NtCurrentTeb();
 #ifdef WINE_IOS
     /* iOS sigreturn zeroes x18 — route through trampoline */
@@ -2081,6 +3148,25 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     CONTEXT context;
 
     rec->ExceptionAddress = (void *)PC_sig(sigcontext);
+#ifdef WINE_IOS
+    /* task#34 guest-exception-DISPATCH: when the faulting pc is inside a
+     * JIT-pool IMAGE COPY, the guest-visible record must carry the PE VA —
+     * handlers compare ExceptionAddress against module bounds and the SEH
+     * machinery resolves unwind info by module. (pcs inside FEX-emitted
+     * code translate to nothing here and are left alone — reconstructing
+     * the guest RIP for those is ResetToConsistentState's job on the PE
+     * side.) The resume context keeps the real host pc. */
+    {
+        extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+        uint64_t pe = ios_jit_reverse_translate( (uint64_t)PC_sig(sigcontext), NULL );
+        if (pe)
+        {
+            rec->ExceptionAddress = (void *)(uintptr_t)pe;
+            ERR( "setup_exception: pool pc %p -> PE ExceptionAddress %p\n",
+                 (void *)PC_sig(sigcontext), rec->ExceptionAddress );
+        }
+    }
+#endif
     save_context( &context, sigcontext );
     setup_raise_exception( sigcontext, rec, &context );
 }
@@ -2118,7 +3204,7 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
     stack->alertable = TRUE;
 
     frame->sp = (ULONG64)stack;
-    frame->pc = (ULONG64)pKiUserApcDispatcher;
+    frame->pc = (ULONG64)IOS_PFUNC(KiUserApcDispatcher);
     frame->restore_flags |= CONTEXT_CONTROL;
     syscall_frame_fixup_for_fastpath( frame );
     return status;
@@ -2141,7 +3227,11 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
 {
     struct syscall_frame *frame = get_syscall_frame();
     struct exc_stack_layout *stack;
-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+    NTSTATUS status;
+
+    ios_log_guest_exception( "dispatch", rec, context->Pc );
+
+    status = NtSetContextThread( GetCurrentThread(), context );
 
     if (status) return status;
     stack = (struct exc_stack_layout *)(context->Sp & ~15) - 1;
@@ -2149,7 +3239,7 @@ NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context
     memmove( &stack->rec, rec, sizeof(*rec) );
     context_init_empty_xstate( &stack->context, stack->redzone );
 
-    frame->pc = (ULONG64)pKiUserExceptionDispatcher;
+    frame->pc = (ULONG64)IOS_PFUNC(KiUserExceptionDispatcher);
     frame->sp = (ULONG64)stack;
     frame->restore_flags |= CONTEXT_CONTROL;
     syscall_frame_fixup_for_fastpath( frame );
@@ -2325,7 +3415,28 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->sp   = frame->sp;
     stack->pc   = frame->pc;
     memcpy( stack->args_data, args, len );
-    return call_user_mode_callback( sp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
+    {
+        /* Thing B (#16) diag: which dispatcher does this thread's callback
+         * resolve to? A SESSION-peb thread resolving to a child's EC
+         * dispatcher is the wedge precursor (explorer executing the child
+         * EC ntdll's exit thunks → blr x16=1). Log the first few callbacks
+         * per boot for context plus EVERY session-thread/child-dispatcher
+         * cross-resolution (should never happen). */
+        extern PEB *peb;
+        void *disp = IOS_PFUNC(KiUserCallbackDispatcher);
+        int cross = (disp != pKiUserCallbackDispatcher) && (NtCurrentTeb()->Peb == peb);
+        static volatile int kcb_logged = 0;
+        if ((kcb_logged < 5 || cross) && kcb_logged < 40)
+        {
+            __sync_add_and_fetch(&kcb_logged, 1);
+            dprintf(2, "[kcb] tid=%04x teb=%p peb=%p id=%u disp=%p session_disp=%p%s\n",
+                    (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                    (void *)NtCurrentTeb(), (void *)NtCurrentTeb()->Peb, id,
+                    disp, pKiUserCallbackDispatcher,
+                    cross ? "  <-- SESSION THREAD, CHILD DISPATCHER (BUG)" : "");
+        }
+        return call_user_mode_callback( sp, ret_ptr, ret_len, disp, NtCurrentTeb() );
+    }
 }
 
 
@@ -2550,9 +3661,18 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * BUT: if the faulting PC is itself in low/unmapped memory (i.e. we
          * jumped to an unrelocated RVA), restoring x18 doesn't help — the
          * next SEGV will fire at the same PC. Fall through to the diagnostic
-         * dump so the real cause is visible. */
+         * dump so the real cause is visible.
+         *
+         * AND (2026-07-06): only retry when the faulting instruction's base
+         * register IS x18 (Rn==18, the same discriminator the Mach handler's
+         * [x18,#imm] emulation uses). A fault with any other base register is
+         * NOT x18-caused — retrying it swallows genuine guest access
+         * violations in an infinite loop (Thumper desktop: `ldrh w7,[x7,...]`
+         * on guest pointer 0x3f800018 = float 1.0 bits spun 6.8M times here
+         * instead of being delivered to the game as an AV). */
         if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
-            && (uintptr_t)pc >= 0x100000000ULL)
+            && (uintptr_t)pc >= 0x100000000ULL
+            && ((*(uint32_t *)pc >> 5) & 31) == 18)
         {
             REGn_sig(18, context) = ios_teb_for_signals;
             return;
@@ -2579,6 +3699,37 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ERR("  fp=%p lr=%p sp=%p\n",
                 (void*)FP_sig(context), (void*)REGn_sig(30, context),
                 (void*)SP_sig(context));
+            /* task #24: settings threads fault in the TSD-275 thunk with a
+             * NULL slot despite start_thread's write. Dump the live slot +
+             * base at fault time, and dladdr any dyld-cache pc/lr so Apple
+             * frames name themselves. */
+            {
+                extern pthread_key_t ios_teb_tls_key;
+                uintptr_t tsd_base_now;
+                __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base_now));
+                tsd_base_now &= ~7ULL;
+                ERR("  [tsd275] base=%p slot275=%p teb_key_val=%p\n",
+                    (void*)tsd_base_now, *(void **)(tsd_base_now + 275 * 8),
+                    pthread_getspecific(ios_teb_tls_key));
+            }
+            {
+                uintptr_t sym_addrs[2] = { (uintptr_t)PC_sig(context), (uintptr_t)REGn_sig(30, context) };
+                int si;
+                for (si = 0; si < 2; si++)
+                {
+                    Dl_info di_s;
+                    const char *img_s;
+                    if (sym_addrs[si] >= 0x180000000ULL && (sym_addrs[si] >> 32) < 0x300 &&
+                        dladdr((void *)sym_addrs[si], &di_s) && di_s.dli_sname)
+                    {
+                        img_s = di_s.dli_fname ? strrchr(di_s.dli_fname, '/') : NULL;
+                        img_s = img_s ? img_s + 1 : (di_s.dli_fname ? di_s.dli_fname : "?");
+                        ERR("  [sym] %s=%s`%s+0x%llx\n", si ? "lr" : "pc", img_s,
+                            di_s.dli_sname,
+                            (unsigned long long)(sym_addrs[si] - (uintptr_t)di_s.dli_saddr));
+                    }
+                }
+            }
             if ((uintptr_t)PC_sig(context) >= 0x100000000ULL)
             {
                 uint32_t *p = (uint32_t*)(uintptr_t)PC_sig(context);
@@ -2904,6 +4055,20 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #ifdef WINE_IOS
     ERR("setup_exception for SEGV at pc=%p addr=%p (virtual_handle_fault failed)\n",
         (void*)PC_sig(context), siginfo->si_addr);
+    /* Steam S3 (task #29): name the native faulting code + the target
+     * memory region so the unhandled-write fault is diagnosable. */
+    {
+        extern void ios_dump_fault_region( void *addr );
+        Dl_info di;
+        uint64_t pcv = (uint64_t)PC_sig(context);
+        if (dladdr( (void *)(uintptr_t)pcv, &di ) && di.dli_fname)
+            dprintf( 2, "[fault-pc] pc=%p = %s`%s+0x%llx (img base %p, slide-relative)\n",
+                     (void *)(uintptr_t)pcv, di.dli_fname,
+                     di.dli_sname ? di.dli_sname : "?",
+                     (unsigned long long)(pcv - (uint64_t)(uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)),
+                     di.dli_fbase );
+        ios_dump_fault_region( siginfo->si_addr );
+    }
 #endif
     setup_exception( context, &rec );
 }
@@ -2960,6 +4125,90 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 frame, (unsigned long long)fp, (unsigned long long)saved_lr);
             if (prev_fp <= fp) break;
             fp = prev_fp;
+        }
+        /* iOS-Mythic 2026-07-06 (Thumper desktop ILL): both crashes were the
+         * FEX dispatcher's ExitFunctionLinker thunk doing `ldr x2,[x28,#0x630];
+         * blr x2` with a corrupted Pointers.ExitFunctionLink (pointed into a
+         * mid-emission block tail instead of the C++ resolver). Dump the
+         * evidence at crash time: x28 (STATE), x1 (link Record ptr), x2 (the
+         * loaded target), the CpuStateFrame Pointers region around +0x630,
+         * and the Record bytes — distinguishes single-field corruption vs
+         * wild-store span vs corrupt Record. */
+        {
+            uint64_t x1  = (uint64_t)REGn_sig(1,  context);
+            uint64_t x2  = (uint64_t)REGn_sig(2,  context);
+            uint64_t x28 = (uint64_t)REGn_sig(28, context);
+            uint64_t x6  = (uint64_t)REGn_sig(6,  context);
+            uint64_t x10 = (uint64_t)REGn_sig(10, context);
+            uint64_t x11 = (uint64_t)REGn_sig(11, context);
+            ERR("ILL diag: x1=0x%llx x2=0x%llx x28=0x%llx\n",
+                (unsigned long long)x1, (unsigned long long)x2, (unsigned long long)x28);
+            /* x6 = guest RIP and x11 = branch target in FEX's inline exit
+             * dispatch (`ret x11`); x10 = dispatcher's CompileBlock-return
+             * target (`br x10`). Whichever equals pc names the faulting
+             * branch. */
+            ERR("ILL diag: x6=0x%llx x10=0x%llx x11=0x%llx (pc==x11? %d pc==x10? %d)\n",
+                (unsigned long long)x6, (unsigned long long)x10, (unsigned long long)x11,
+                x11 == pc, x10 == pc);
+            /* FEX inline L1 exit-dispatch reads {L1Ptr, L1Mask} at STATE+0xa0
+             * and the entry pair {host, guest} at L1Ptr + (rip & mask)<<?.
+             * Dump the entry for x6 so a torn pair is visible at crash time.
+             * Windows-heap frames live at 0x70xxxxxxxx — include them. */
+            if (x28 >= 0x100000000ULL && x28 < 0x8000000000ULL)
+            {
+                uint64_t l1pair[2] = {0, 0}, entry[2] = {0, 0};
+                vm_size_t osz = sizeof(l1pair);
+                if (vm_read_overwrite(mach_task_self(), x28 + 0xa0, sizeof(l1pair),
+                                      (vm_address_t)l1pair, &osz) == KERN_SUCCESS)
+                {
+                    /* mask is pre-shifted per dispatcher code: and x11, mask, rip<<4 */
+                    uint64_t eaddr = l1pair[0] + ((x6 << 4) & l1pair[1]);
+                    ERR("ILL diag: L1ptr=0x%llx L1mask=0x%llx entry@0x%llx\n",
+                        (unsigned long long)l1pair[0], (unsigned long long)l1pair[1],
+                        (unsigned long long)eaddr);
+                    osz = sizeof(entry);
+                    if (l1pair[0] &&
+                        vm_read_overwrite(mach_task_self(), eaddr, sizeof(entry),
+                                          (vm_address_t)entry, &osz) == KERN_SUCCESS)
+                        ERR("ILL diag: L1 entry: host=0x%llx guest=0x%llx (guest==x6? %d host==pc? %d)\n",
+                            (unsigned long long)entry[0], (unsigned long long)entry[1],
+                            entry[1] == x6, entry[0] == pc);
+                }
+            }
+            if (x28 >= 0x100000000ULL && x28 < 0x800000000ULL)
+            {
+                uint64_t words[32];
+                vm_size_t outsz = sizeof(words);
+                if (vm_read_overwrite(mach_task_self(), x28 + 0x5c0, sizeof(words),
+                                      (vm_address_t)words, &outsz) == KERN_SUCCESS)
+                {
+                    for (int w = 0; w < 32; w += 4)
+                        ERR("ILL diag: STATE+0x%03x: %016llx %016llx %016llx %016llx\n",
+                            0x5c0 + w * 8,
+                            (unsigned long long)words[w],   (unsigned long long)words[w+1],
+                            (unsigned long long)words[w+2], (unsigned long long)words[w+3]);
+                }
+                /* State.rip lives in the first 0x100 of the frame */
+                outsz = sizeof(words);
+                if (vm_read_overwrite(mach_task_self(), x28, 0x40,
+                                      (vm_address_t)words, &outsz) == KERN_SUCCESS)
+                    ERR("ILL diag: STATE+0: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                        (unsigned long long)words[0], (unsigned long long)words[1],
+                        (unsigned long long)words[2], (unsigned long long)words[3],
+                        (unsigned long long)words[4], (unsigned long long)words[5],
+                        (unsigned long long)words[6], (unsigned long long)words[7]);
+            }
+            if (x1 >= 0x100000000ULL && x1 < 0x800000000ULL)
+            {
+                uint64_t rec[6];
+                vm_size_t outsz = sizeof(rec);
+                if (vm_read_overwrite(mach_task_self(), x1, sizeof(rec),
+                                      (vm_address_t)rec, &outsz) == KERN_SUCCESS)
+                    ERR("ILL diag: Record@x1: %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                        (unsigned long long)rec[0], (unsigned long long)rec[1],
+                        (unsigned long long)rec[2], (unsigned long long)rec[3],
+                        (unsigned long long)rec[4], (unsigned long long)rec[5]);
+            }
         }
         /* iOS-Mythic: also dump JIT pool here (the Mach UNHANDLED path may not
          * fire for ILL since we deliver via setup_exception). One-shot. */
@@ -3292,6 +4541,20 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
     CONTEXT ctx;
 #ifdef WINE_IOS
+    /* StikDebug protocol BRK #0xf00d with no debugger left to catch it —
+     * e.g. the detach BRK re-executing after StikDebug lets go, on a
+     * TEB-less app thread. Check at ENTRY, before any si_code dispatch:
+     * iOS delivers BRK-derived SIGTRAPs with varying si_code, and letting
+     * this fall into the wine exception path wedges the thread inside
+     * nested fault logging (2026-07-06). Skip the insn, x0=0 (failure). */
+    if (!(PC_sig( context ) & 3) && *(ULONG *)PC_sig( context ) == 0xd43e01a0)
+    {
+        dprintf(2, "[brk-f00d] skipped stray StikDebug BRK at pc=%p (si_code=%d)\n",
+                (void *)PC_sig( context ), siginfo->si_code);
+        REGn_sig( 0, context ) = 0;
+        PC_sig( context ) += 4;
+        return;
+    }
     ios_track_signal( signal, context );
 #endif
 
@@ -3311,6 +4574,17 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             ULONG imm = (*(ULONG *)PC_sig( context ) >> 5) & 0xffff;
             switch (imm)
             {
+            case 0xf00d:
+                /* StikDebug JIT-protocol BRK (detach/prepare_region) with no
+                 * debugger left to catch it — e.g. the detach BRK re-executes
+                 * after StikDebug lets go, on a TEB-less app thread. This is
+                 * an app-side handshake, never a guest exception: skip the
+                 * insn, report failure in x0, and get out before any wine
+                 * exception machinery (which wedged the detach thread inside
+                 * dbg logging, 2026-07-06). */
+                REGn_sig( 0, context ) = 0;
+                PC_sig( context ) += 4;
+                return;
             case 0xf000:
                 ctx.Pc += 4;  /* skip the brk instruction */
                 rec.ExceptionCode = EXCEPTION_BREAKPOINT;
@@ -3650,7 +4924,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     context.X1  = (DWORD64)arg;
     context.X18 = (DWORD64)teb;
     context.Sp  = (DWORD64)teb->Tib.StackBase;
-    context.Pc  = (DWORD64)pRtlUserThreadStart;
+    context.Pc  = (DWORD64)IOS_PFUNC(RtlUserThreadStart);
 
     if ((i386_context = get_cpu_area( IMAGE_FILE_MACHINE_I386 )))
     {
@@ -3693,7 +4967,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     signal_set_full_context( ctx );
 
     frame->sp    = (ULONG64)ctx;
-    frame->pc    = (ULONG64)pLdrInitializeThunk;
+    frame->pc    = (ULONG64)IOS_PFUNC(LdrInitializeThunk);
     frame->x[0]  = (ULONG64)ctx;
     frame->x[18] = (ULONG64)teb;
 
@@ -3781,7 +5055,19 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
      * [x18+offset] reads real TEB data from our mapping.
      * If all mapping approaches fail, the Mach exception handler
      * is the last resort for x18 restoration. */
-    {
+    /* 2026-07-03: attempt the page0 chain ONCE PER PROCESS, not per thread.
+     * Page 0 is process-global (and can only hold one thread's TEB anyway),
+     * so re-running M1-M8 on every new thread only re-fails. Worse, the M8
+     * debugger BRK is FATAL on threads created after the debugger detaches:
+     * with no debugger, the BRK trap unwinds through a handler chain that
+     * (with x18=0 on a fresh thread) calls a raw non-executable ntdll PE
+     * address → undispatchable BUS → NtTerminateProcess. Observed killing
+     * Thumper's worker-thread spawn at ~2:30 (thread 0054, splash wall). */
+    static int ios_page0_attempted = 0;
+    if (ios_page0_attempted) {
+        ERR("page0: already attempted by first thread — skipping (Mach handler covers x18=0)\n");
+    } else {
+        ios_page0_attempted = 1;
         kern_return_t kr;
         int mapped = 0;
         uintptr_t teb_page = (uintptr_t)teb & ~0x3FFFULL;
@@ -4280,12 +5566,129 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                    "ldp x18, x19, [sp, #0x90]\n\t"
-#ifdef WINE_IOS
-                   "msr TPIDR_EL0, x18\n\t"  /* keep TPIDR_EL0 in sync */
-#endif
+                   /* iOS-Mythic 2026-07-04: REMOVED `msr TPIDR_EL0, x18`
+                    * ("keep TPIDR_EL0 in sync"). Nothing of ours reads
+                    * TPIDR_EL0 — every TEB recovery path (dispatchers, x18
+                    * patcher trampolines, Mach handler) uses TPIDRRO_EL0 +
+                    * TSD slot; the patcher header comment claiming
+                    * TPIDR_EL0 was stale. Writing an OS-owned per-thread
+                    * register on every unix-call return is pure risk:
+                    * libsystem_malloc died with corrupted per-thread zone
+                    * state (Metal texture allocs, 3 runs) right after
+                    * UNIXCALL-DIRECT multiplied direct returns. */
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
                    "ret x17" )
 
 #endif  /* __aarch64__ */
+
+/* ============================================================ *
+ * [thread-stacks] all-thread stack sampler — diagnoses wedged wine
+ * threads (S2: explorer main leaves its message pump and blocks
+ * forever; [srv-queues] showed wake_mask=0 with 20 posted messages
+ * pending). Called from an app-side GCD timer (Winios.m) so it keeps
+ * firing even when every wine thread is stuck. Samples WITHOUT
+ * suspending — racy pc/fp reads are acceptable for stuck-thread
+ * triage; a blocked thread's state is stable anyway.
+ * ============================================================ */
+/* Best-effort PE module name from the export directory at pe_base (the
+ * original unix-view image stays mapped). Returns "(exe)" for images
+ * without exports, "?" when headers look wrong. */
+static const char *ios_pe_module_name( uint64_t base )
+{
+    const unsigned char *p = (const unsigned char *)(uintptr_t)base;
+    uint32_t e_lfanew, exp_rva, name_rva;
+
+    if (!base) return "?";
+    if (p[0] != 'M' || p[1] != 'Z') return "?";
+    e_lfanew = *(const uint32_t *)(p + 0x3c);
+    if (e_lfanew == 0 || e_lfanew > 0x1000) return "?";
+    if (memcmp(p + e_lfanew, "PE\0\0", 4)) return "?";
+    exp_rva = *(const uint32_t *)(p + e_lfanew + 0x88);   /* PE32+ export dir RVA */
+    if (!exp_rva || exp_rva > 0x10000000) return "(exe)";
+    name_rva = *(const uint32_t *)(p + exp_rva + 0x0c);
+    if (!name_rva || name_rva > 0x10000000) return "(exe)";
+    return (const char *)(p + name_rva);
+}
+
+void ios_dump_all_thread_stacks(void)
+{
+    thread_act_array_t threads;
+    mach_msg_type_number_t count = 0, i;
+    thread_t self = mach_thread_self();
+
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+    fprintf(stderr, "[thread-stacks] ---- %u threads ----\n", count);
+    for (i = 0; i < count; i++)
+    {
+        arm_thread_state64_t st;
+        mach_msg_type_number_t st_count = ARM_THREAD_STATE64_COUNT;
+        char tname[64] = "";
+        pthread_t pt;
+        Dl_info di;
+        const char *img = "?", *sym = "?";
+        uint64_t off, fp_walk;
+        int fr;
+
+        if (threads[i] == self) goto next;
+        if (thread_get_state(threads[i], ARM_THREAD_STATE64, (thread_state_t)&st, &st_count) != KERN_SUCCESS)
+            goto next;
+
+        pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt) pthread_getname_np(pt, tname, sizeof(tname));
+
+        off = st.__pc;
+        if (dladdr((void*)(uintptr_t)st.__pc, &di))
+        {
+            if (di.dli_fname) { img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname; }
+            if (di.dli_sname) { sym = di.dli_sname; off = st.__pc - (uint64_t)(uintptr_t)di.dli_saddr; }
+        }
+        fprintf(stderr, "[thread-stacks] port=0x%x \"%s\" pc=%s`%s+0x%llx\n",
+                threads[i], tname, img, sym, (unsigned long long)off);
+        {
+            extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+            uint64_t mod = 0, pe_va = ios_jit_reverse_translate(st.__pc, &mod);
+            if (pe_va)
+                fprintf(stderr, "[thread-stacks]   pc is PE code: %.32s+0x%llx (base=0x%llx va=0x%llx)\n",
+                        ios_pe_module_name(mod), (unsigned long long)(pe_va - mod),
+                        (unsigned long long)mod, (unsigned long long)pe_va);
+        }
+
+        fp_walk = st.__fp;
+        for (fr = 0; fr < 14 && fp_walk; fr++)
+        {
+            uint64_t frame_buf[2];
+            mach_vm_size_t got_fw = 0;
+            uint64_t ret_pc;
+
+            if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)fp_walk, 16,
+                                       (mach_vm_address_t)frame_buf, &got_fw) != KERN_SUCCESS || got_fw != 16)
+                break;
+            ret_pc = frame_buf[1] & 0x0000007fffffffffull;   /* strip PAC bits */
+            if (ret_pc <= 0x4000) break;
+            img = "?"; sym = "?"; off = ret_pc;
+            if (dladdr((void*)(uintptr_t)ret_pc, &di))
+            {
+                if (di.dli_fname) { img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname; }
+                if (di.dli_sname) { sym = di.dli_sname; off = ret_pc - (uint64_t)(uintptr_t)di.dli_saddr; }
+            }
+            {
+                extern uint64_t ios_jit_reverse_translate( uint64_t addr, uint64_t *module_base );
+                uint64_t mod = 0, pe_va = ios_jit_reverse_translate(ret_pc, &mod);
+                if (pe_va)
+                    fprintf(stderr, "[thread-stacks]   bt[%d] PE %.32s+0x%llx (va=0x%llx)\n",
+                            fr, ios_pe_module_name(mod), (unsigned long long)(pe_va - mod),
+                            (unsigned long long)pe_va);
+                else
+                    fprintf(stderr, "[thread-stacks]   bt[%d] %s`%s+0x%llx\n", fr, img, sym, (unsigned long long)off);
+            }
+            fp_walk = frame_buf[0];
+        }
+next:
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(*threads));
+    mach_port_deallocate(mach_task_self(), self);
+    fflush(stderr);
+}

@@ -74,6 +74,12 @@ PATCHED_FILES=(
     "class:$WINE_SRC/server/class.c:class.o"
     "region:$WINE_SRC/server/region.c:region.o"
     "queue:$BUILD_DIR/queue_ios.c:queue.o"
+    # S2: virtual-desktop input fix (WSF_VISIBLE + input_desktop + cursor.clip
+    # in create_desktop) lives in the submodule's winstation.c
+    "winstation:$WINE_SRC/server/winstation.c:winstation.o"
+    # task#32 Steam: stop_thread Mach-based context capture (iOS signal
+    # suspend is dead) lives in the submodule's thread.c
+    "thread:$WINE_SRC/server/thread.c:thread.o"
 )
 
 echo "=== Building kill wrapper (without kill macro) ==="
@@ -136,6 +142,8 @@ REPLACEMENTS=(
     "region.o:region.o"
     "queue.o:queue.o"
     "mapping.o:mapping.o"
+    "winstation.o:winstation.o"
+    "thread.o:thread.o"
 )
 
 for entry in "${REPLACEMENTS[@]}"; do

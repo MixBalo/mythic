@@ -895,7 +895,8 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
 
         /* iOS DIAGNOSTIC: log env vars containing "Steam" or known Thumper-relevant keys */
         if (STARTS_WITH(str, "Steam") || STARTS_WITH(str, "SteamAppPath") ||
-            STARTS_WITH(str, "SteamGameId") || STARTS_WITH(str, "SteamAppId"))
+            STARTS_WITH(str, "SteamGameId") || STARTS_WITH(str, "SteamAppId") ||
+            STARTS_WITH(str, "MYTHIC_JIT_WRITE_OFFSET"))
             fprintf(stderr, "[iOS env] processing: %s\n", str);
 
         /* skip Unix special variables and use the Wine variants instead */
@@ -926,7 +927,7 @@ static WCHAR *get_initial_environment( SIZE_T *pos, SIZE_T *size )
         }
 
         ptr += ntdll_umbstowcs( str, strlen(str) + 1, ptr, end - ptr );
-        if (STARTS_WITH(str, "Steam"))
+        if (STARTS_WITH(str, "Steam") || STARTS_WITH(str, "MYTHIC_JIT_WRITE_OFFSET"))
             fprintf(stderr, "[iOS env] INCLUDED: %s\n", str);
     }
     *pos = ptr - env;
@@ -2079,6 +2080,8 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
+    dprintf(2, "[main-exe] load_main_exe = 0x%x Machine=0x%x chars=0x%x\n",
+            (unsigned)status, main_image_info.Machine, main_image_info.ImageCharacteristics);
     if (NT_SUCCESS(status))
     {
         char *loader;
@@ -2087,13 +2090,28 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
         /* if we have to use a different loader, fall back to start.exe */
         if ((loader = get_alternate_wineloader( main_image_info.Machine )))
         {
+            dprintf(2, "[main-exe] get_alternate_wineloader returned '%s' -> forcing start.exe\n", loader);
             free( loader );
             status = STATUS_INVALID_IMAGE_FORMAT;
+        }
+        /* iOS: STATUS_IMAGE_NOT_AT_BASE is informational — the exe is mapped
+         * and already relocated by map_image_into_view. Whether the preferred
+         * base (0x140000000 for mingw exes) is free depends on ASLR vs the
+         * JIT pool, so this fires nondeterministically. Treating it as
+         * failure punts a healthy main exe to start.exe, an aarch64-only
+         * builtin that can never load in an EC session -> c0000135 at boot.
+         * (Same fix existed in the submodule's env.c but this fork is what
+         * builds.) */
+        if (status == STATUS_IMAGE_NOT_AT_BASE)
+        {
+            dprintf(2, "[main-exe] NOT_AT_BASE (relocated) — continuing normally\n");
+            status = STATUS_SUCCESS;
         }
     }
 
     if (status)  /* try launching it through start.exe */
     {
+        dprintf(2, "[main-exe] falling back to start.exe (status=0x%x)\n", (unsigned)status);
         static const char *args[] = { "start.exe", "/exec" };
         free( nt_name.Buffer );
         if (*module) NtUnmapViewOfSection( GetCurrentProcess(), *module );
@@ -2379,6 +2397,18 @@ NTSTATUS WINAPI NtGetNlsSectionPtr( ULONG type, ULONG id, void *unknown, void **
     WCHAR name[32];
     HANDLE handle, file;
     NTSTATUS status;
+
+    /* [nls-getptr probe] Does the x64 CHILD (private EC ntdll) request the
+     * CASEMAP (type=NLS_SECTION_CASEMAP) section? If we only ever see this
+     * called from the SESSION peb and never the child's, the child's
+     * init_locale is skipped and its casemap global stays null (the
+     * upcase_unicode_to_utf8 fault). Match the child peb from the earlier
+     * "[Wine child] child_peb=..." line. */
+    {
+        TEB *cur_teb = NtCurrentTeb();
+        dprintf( 2, "[nls-getptr] type=%u id=%u peb=%p\n",
+                 type, id, cur_teb ? (void *)cur_teb->Peb : NULL );
+    }
 
     if ((status = get_nls_section_name( type, id, name ))) return status;
 

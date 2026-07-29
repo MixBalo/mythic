@@ -4,78 +4,454 @@ import QuartzCore
 import Metal
 import os.log
 
-// UIView whose backing layer is a CAMetalLayer (what DXMT renders into).
-// Also captures touches and forwards them to winios.drv as mouse events.
-final class MetalBackedView: UIView {
+// 2026-07-03 window-hosted Metal layer.
+//
+// The presenting CAMetalLayer must NOT be a SwiftUI-hosted view's backing
+// layer: on iOS 26/27, SwiftUI's hosting intermittently routes such layers
+// through an indirect/snapshot path where direct Metal presentations are
+// silently dropped — presented drawables complete with presentedTime==0
+// (measured), the screen freezes on stale content, and only full-tree
+// re-renders (screenshots) reveal new frames. Which path a given run gets
+// appeared random — the "sometimes rendering starts at present #9,
+// sometimes never" lottery.
+//
+// So the layer now lives in MetalHostView, a raw UIView added directly to
+// the UIWindow (classic game setup, no SwiftUI management). The SwiftUI-
+// hosted MetalBackedView remains as a transparent layout placeholder that
+// tracks geometry and handles touch input. The host view sits on top of
+// the window but has interaction disabled, so touches fall through to the
+// SwiftUI hierarchy (and thus to the placeholder's touch handlers).
+
+/// Raw window-level host for the presenting CAMetalLayer.
+final class MetalHostView: UIView {
+    // Process-lifetime singleton. The CAMetalLayer is registered with DXMT's
+    // swapchain exactly once; if the host were recreated on view teardown
+    // (rotation, re-attach) DXMT would keep presenting to the DEAD layer —
+    // black surface both ways (2026-07-05 landscape regression). One host,
+    // one layer, forever; only its FRAME is re-parented/resized.
+    static let shared = MetalHostView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+
     override class var layerClass: AnyClass { return CAMetalLayer.self }
+    var metalLayer: CAMetalLayer { return layer as! CAMetalLayer }
     override init(frame: CGRect) {
         super.init(frame: frame)
-        self.isMultipleTouchEnabled = false
+        isUserInteractionEnabled = false   // touches fall through to SwiftUI
+        backgroundColor = .black
+        contentScaleFactor = UIScreen.main.scale
+        metalLayer.device = MTLCreateSystemDefaultDevice()
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+        // 2026-07-03 MeloNX trick: displaySyncEnabled is macOS-public but
+        // exists as PRIVATE API on iOS. Disabling it takes our presents out
+        // of the display-sync scheduling machinery — the thing that has been
+        // silently dropping them (presentedTime==0 on all but occasional
+        // frames) at our sub-1Hz game present cadence. MeloNX (shipping
+        // Switch emulator) sets exactly this pair on its layer.
+        let syncSel = NSSelectorFromString("setDisplaySyncEnabled:")
+        if metalLayer.responds(to: syncSel) {
+            metalLayer.perform(syncSel, with: NSNumber(value: false))
+            LogStore.shared.log("MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)")
+        }
+        let fpsSel = NSSelectorFromString("setNominalFramesPerSecond:")
+        if metalLayer.responds(to: fpsSel) {
+            metalLayer.perform(fpsSel, with: 60 as NSNumber)
+        }
+        UIApplication.shared.isIdleTimerDisabled = true
+        // Set once so DXMT's swapchain setup never blocks on a zero-sized
+        // layer. After this, DXMT's setProps is the ONLY drawableSize
+        // writer — per-layout rewrites from the app were a second writer
+        // fighting it (pool churn on every SwiftUI layout pass).
+        metalLayer.drawableSize = CGSize(width: 800, height: 600)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// SwiftUI-hosted placeholder: geometry + touch input only.
+final class MetalBackedView: UIView {
+    private static var layerRegistered = false
+
+    // Hardware keyboard bridge: the view becomes first responder so the iOS
+    // software keyboard appears, and each typed character is forwarded to
+    // Wine as a virtual-key sequence (winios_post_key → send_hardware_message
+    // → WM_KEYDOWN/WM_CHAR). Lets the user type into Windows dialogs (e.g.
+    // Run) directly instead of relying on the browse list.
+    static weak var keyboardTarget: MetalBackedView?
+    override var canBecomeFirstResponder: Bool { true }
+    static func toggleKeyboard() {
+        guard let v = keyboardTarget else { return }
+        if v.isFirstResponder { v.resignFirstResponder() }
+        else { v.becomeFirstResponder() }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        // Multi-touch REQUIRED: with it off, a fast double-tap's second
+        // touch (landing before the first lift is processed) is silently
+        // swallowed — drag-arm never fired (2026-07-06). Two-finger
+        // scroll/right-click need it too.
+        self.isMultipleTouchEnabled = true
         self.isUserInteractionEnabled = true
+        self.backgroundColor = .clear
     }
     required init?(coder: NSCoder) { super.init(coder: coder) }
 
+    // Visibility-stall postmortem (2026-07-03): the intermittent "presents
+    // count but the screen stays black until a bg/fg or screenshot" state
+    // was probed exhaustively — drawable leaks, present pacing, panel idle,
+    // SwiftUI hosting, display-sync, CADisplayLink, transaction nudges and
+    // view re-attach kicks were all eliminated (none changed it; only true
+    // scene-level lifecycle events land pending frames, ~1-2 each). The one
+    // robust correlate is present cadence: 60 FPS content always displays,
+    // ~1 FPS content mostly doesn't. Resolution path: raise game FPS (perf
+    // work), with a steady-rate re-present in DXMT as fallback insurance.
+
+    /// Largest 4:3 rect (the 1024×768 logical surface's aspect) that fits
+    /// centered in our bounds. The window-level host view gets THIS frame,
+    /// not our full bounds — otherwise landscape stretches the game to the
+    /// display edges (2026-07-05). Touch mapping uses the same rect so
+    /// letterboxing never skews input.
+    private func gameRect() -> CGRect {
+        let gw: CGFloat = 1024, gh: CGFloat = 768
+        let scale = min(bounds.width / gw, bounds.height / gh)
+        let w = gw * scale, h = gh * scale
+        return CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
+                      width: max(w, 1), height: max(h, 1))
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard let w = window else { return }   // detach: leave the host be
+        MetalBackedView.keyboardTarget = self  // keyboard button targets the live view
+        // SwiftUI ancestors attach gesture recognizers that can delay or
+        // cancel raw touch delivery (double-tap timing is exactly what
+        // they punish). Defuse them for our subtree.
+        var v: UIView? = self
+        while let s = v {
+            s.gestureRecognizers?.forEach {
+                $0.cancelsTouchesInView = false
+                $0.delaysTouchesBegan = false
+                $0.delaysTouchesEnded = false
+            }
+            v = s.superview
+        }
+        let host = MetalHostView.shared
+        if host.superview !== w {
+            host.removeFromSuperview()
+            w.addSubview(host)
+        }
+        host.frame = convert(gameRect(), to: w)
+        // S2 desktop mode: the winios compositor renders the wine virtual
+        // desktop aspect-fit inside THIS placeholder's area, exactly like
+        // the games' Metal layer — never over the whole phone screen.
+        let full = convert(bounds, to: w)
+        winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
+        if !Self.layerRegistered {
+            Self.layerRegistered = true
+            mythic_display_set_layer(host.metalLayer)
+            LogStore.shared.log("MetalLayer registered with DXMT shim (window-hosted singleton)", level: .success)
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        if let layer = self.layer as? CAMetalLayer {
-            let scale = self.contentScaleFactor
-            let w = max(1, bounds.width * scale)
-            let h = max(1, bounds.height * scale)
-            layer.drawableSize = CGSize(width: w, height: h)
+        if let w = window {
+            MetalHostView.shared.frame = convert(gameRect(), to: w)
+            let full = convert(bounds, to: w)
+            winios_set_compositor_frame(full.minX, full.minY, full.width, full.height)
         }
     }
 
     // Map touch point in view-local UI points to the 1024×768 logical
-    // surface DXMT swapchains use, then post to winios.drv.
+    // surface DXMT swapchains use, then post to winios.drv. Coordinates
+    // are relative to the aspect-fit gameRect (letterbox borders clamp).
     private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
         let p = touch.location(in: self)
-        let w = max(1, bounds.width)
-        let h = max(1, bounds.height)
-        let x = Int32(p.x * 1024 / w)
-        let y = Int32(p.y * 768  / h)
+        let r = gameRect()
+        let x = Int32(min(max((p.x - r.minX) * 1024 / r.width, 0), 1023))
+        let y = Int32(min(max((p.y - r.minY) * 768 / r.height, 0), 767))
         return (x, y)
     }
+
+    // ==================================================================
+    // S2 desktop mode: trackpad-style pointer.
+    //   one finger move       — cursor moves relative (like a laptop pad)
+    //   single tap            — left click
+    //   double tap            — double click (two rapid clicks)
+    //   double tap + hold     — drag (button held while moving), lift = drop
+    //   two-finger drag       — scroll wheel
+    //   two-finger tap        — right click
+    // Cursor position lives here (desktop px); wine + the rendered arrow
+    // follow via winios_pointer / winios_cursor_move.
+    // ==================================================================
+    private static var cursor = CGPoint(x: 480, y: 270)
+    private var lastPanPoint = CGPoint.zero
+    private var touchStartPoint = CGPoint.zero
+    private var touchStartTime: TimeInterval = 0
+    private var movedBeyondSlop = false
+    private var dragActive = false
+    private var dragTouch: UITouch?          // the finger that owns the drag
+    private var touchGeneration = 0          // invalidates pending long-press timers
+    private var twoFingerActive = false
+    private var twoFingerMoved = false
+    private var twoFingerStartTime: TimeInterval = 0
+    private var lastTwoFingerY: CGFloat = 0
+    private var scrollAccum: CGFloat = 0
+
+    private let F_MOVE: UInt32 = 0x1, F_LDOWN: UInt32 = 0x2, F_LUP: UInt32 = 0x4
+    private let F_RDOWN: UInt32 = 0x8, F_RUP: UInt32 = 0x10
+    private let F_WHEEL: UInt32 = 0x800, F_ABS: UInt32 = 0x8000
+
+    private var desktopMode: Bool {
+        guard let v = getenv("MYTHIC_DESKTOP") else { return false }
+        return v.pointee == 49  // '1'
+    }
+    private func envInt(_ name: String, _ def: Int) -> Int {
+        guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
+        return i
+    }
+    private func postPointer(_ flags: UInt32, data: Int32 = 0) {
+        winios_pointer(Int32(Self.cursor.x), Int32(Self.cursor.y), flags, UInt32(bitPattern: data))
+    }
+    private func avgPoint(_ touches: [UITouch]) -> CGPoint {
+        var x: CGFloat = 0, y: CGFloat = 0
+        for t in touches { let p = t.location(in: self); x += p.x; y += p.y }
+        let n = CGFloat(max(touches.count, 1))
+        return CGPoint(x: x / n, y: y / n)
+    }
+    private func activeTouches(_ event: UIEvent?) -> [UITouch] {
+        (event?.allTouches ?? []).filter { $0.phase != .ended && $0.phase != .cancelled }
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_down(x, y)
+            return
+        }
+        let now = Date().timeIntervalSinceReferenceDate
+        let active = activeTouches(event)
+        touchGeneration += 1
+        if active.count >= 2 {
+            twoFingerActive = true
+            twoFingerMoved = false
+            twoFingerStartTime = now
+            lastTwoFingerY = avgPoint(active).y
+            scrollAccum = 0
+            // a drag started by the first finger stays active; harmless
+            return
+        }
         guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        LogStore.shared.log("[swift] touchesBegan x=\(x) y=\(y)", level: .info)
-        winios_post_touch_down(x, y)
+        let p = t.location(in: self)
+        touchStartPoint = p
+        lastPanPoint = p
+        touchStartTime = now
+        movedBeyondSlop = false
+        // long-press → drag: hold still for 0.5s, haptic confirms, then move
+        // the window; release drops. (Replaced double-tap-hold — it raced
+        // Windows' double-click detection: wine saw WM_LBUTTONDBLCLK.)
+        let gen = touchGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.touchGeneration == gen, !self.dragActive,
+                  !self.movedBeyondSlop, !self.twoFingerActive else { return }
+            self.dragActive = true
+            self.dragTouch = t
+            self.postPointer(self.F_LDOWN)
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            fputs("[trackpad] long-press drag armed\n", stderr)
+        }
     }
+
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_move(x, y)
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_move(x, y)
+            return
+        }
+        let active = activeTouches(event)
+        if twoFingerActive {
+            guard active.count >= 2 else { return }
+            let avg = avgPoint(active)
+            let dy = avg.y - lastTwoFingerY
+            lastTwoFingerY = avg.y
+            if abs(dy) > 2 { twoFingerMoved = true }
+            scrollAccum += dy
+            // 14pt of finger travel = one wheel notch; fingers up = wheel up
+            while scrollAccum <= -14 { scrollAccum += 14; postPointer(F_WHEEL, data: 120) }
+            while scrollAccum >= 14 { scrollAccum -= 14; postPointer(F_WHEEL, data: -120) }
+            return
+        }
+        let t: UITouch
+        if dragActive, let d = dragTouch {
+            guard touches.contains(d) else { return }  // only the old tap finger moved
+            t = d
+        } else {
+            guard let f = touches.first else { return }
+            t = f
+        }
+        let p = t.location(in: self)
+        let dx = p.x - lastPanPoint.x, dy = p.y - lastPanPoint.y
+        lastPanPoint = p
+        if hypot(p.x - touchStartPoint.x, p.y - touchStartPoint.y) > 10 { movedBeyondSlop = true }
+        let sens: CGFloat = 2.0   // desktop px per view pt
+        let maxX = CGFloat(envInt("MYTHIC_SCREEN_W", 1024) - 1)
+        let maxY = CGFloat(envInt("MYTHIC_SCREEN_H", 768) - 1)
+        Self.cursor.x = min(max(Self.cursor.x + dx * sens, 0), maxX)
+        Self.cursor.y = min(max(Self.cursor.y + dy * sens, 0), maxY)
+        postPointer(F_MOVE | F_ABS)
     }
+
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_up(x, y)
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_up(x, y)
+            return
+        }
+        let now = Date().timeIntervalSinceReferenceDate
+        if twoFingerActive {
+            if activeTouches(event).isEmpty {
+                if !twoFingerMoved && now - twoFingerStartTime < 0.40 {
+                    postPointer(F_RDOWN)
+                    postPointer(F_RUP)
+                }
+                twoFingerActive = false
+            }
+            return
+        }
+        touchGeneration += 1   // cancel any pending long-press
+        if dragActive {
+            if let d = dragTouch, !touches.contains(d) {
+                fputs("[trackpad] ended: non-drag finger up (drag continues)\n", stderr)
+                return
+            }
+            fputs("[trackpad] ended: drag drop\n", stderr)
+            postPointer(F_LUP)
+            dragActive = false
+            dragTouch = nil
+            return
+        }
+        // stationary release before the 0.5s drag threshold = click
+        if !movedBeyondSlop && now - touchStartTime < 0.5 {
+            fputs("[trackpad] ended: click\n", stderr)
+            postPointer(F_LDOWN)
+            postPointer(F_LUP)
+        }
     }
+
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let t = touches.first else { return }
-        let (x, y) = mapTouch(t)
-        winios_post_touch_up(x, y)
+        guard desktopMode else {
+            guard let t = touches.first else { return }
+            let (x, y) = mapTouch(t)
+            winios_post_touch_up(x, y)
+            return
+        }
+        fputs("[trackpad] CANCELLED (dragActive=\(dragActive))\n", stderr)
+        touchGeneration += 1
+        if dragActive { postPointer(F_LUP); dragActive = false }
+        dragTouch = nil
+        twoFingerActive = false
     }
 }
 
-// SwiftUI wrapper that publishes its CAMetalLayer to the DXMT shim.
+/// Arrow-key button with press/hold/release semantics. DragGesture with
+/// zero minimum distance fires onChanged at touch-down (key down once)
+/// and onEnded at lift (key up) — unlike Button, which only taps.
+struct HoldKeyView: View {
+    let label: String
+    let vk: Int32
+    var big = false   // landscape D-pad: thumb-sized
+    @State private var isDown = false
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: big ? 22 : 14, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white)
+            .frame(minWidth: big ? 56 : 34, minHeight: big ? 56 : 30)
+            .background(Color.white.opacity(isDown ? 0.35 : 0.15))
+            .cornerRadius(big ? 12 : 6)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        if !isDown {
+                            isDown = true
+                            winios_post_key(vk, 1)
+                        }
+                    }
+                    .onEnded { _ in
+                        isDown = false
+                        winios_post_key(vk, 0)
+                    }
+            )
+    }
+}
+
+// SwiftUI wrapper around the placeholder view.
+// iOS software-keyboard → Wine key events. Each character is mapped to a
+// US-layout virtual-key (+ shift where needed) and posted as a down/up pair;
+// the message queue's ToUnicode then produces the right WM_CHAR. Paths need
+// the full symbol set (":" "\" "-" "." "_"), so the table is comprehensive.
+extension MetalBackedView: UIKeyInput {
+    var hasText: Bool { false }
+
+    // US-keyboard VK + shift for a character. Returns nil for chars we can't map.
+    private static func vkForChar(_ ch: Character) -> (Int32, Bool)? {
+        if ch == "\n" || ch == "\r" { return (0x0D, false) }   // VK_RETURN
+        if ch == "\t" { return (0x09, false) }                 // VK_TAB
+        if ch == " " { return (0x20, false) }                  // VK_SPACE
+        if ch.isLetter, let up = ch.uppercased().first?.asciiValue, up >= 0x41, up <= 0x5A {
+            return (Int32(up), ch.isUppercase)                 // VK_A..VK_Z
+        }
+        if let a = ch.asciiValue, a >= 0x30, a <= 0x39 {
+            return (Int32(a), false)                           // VK_0..VK_9 (unshifted)
+        }
+        let table: [Character: (Int32, Bool)] = [
+            "!": (0x31, true), "@": (0x32, true), "#": (0x33, true), "$": (0x34, true),
+            "%": (0x35, true), "^": (0x36, true), "&": (0x37, true), "*": (0x38, true),
+            "(": (0x39, true), ")": (0x30, true),
+            "-": (0xBD, false), "_": (0xBD, true),
+            "=": (0xBB, false), "+": (0xBB, true),
+            "[": (0xDB, false), "{": (0xDB, true),
+            "]": (0xDD, false), "}": (0xDD, true),
+            "\\": (0xDC, false), "|": (0xDC, true),
+            ";": (0xBA, false), ":": (0xBA, true),
+            "'": (0xDE, false), "\"": (0xDE, true),
+            ",": (0xBC, false), "<": (0xBC, true),
+            ".": (0xBE, false), ">": (0xBE, true),
+            "/": (0xBF, false), "?": (0xBF, true),
+            "`": (0xC0, false), "~": (0xC0, true),
+        ]
+        return table[ch]
+    }
+
+    func insertText(_ text: String) {
+        for ch in text {
+            guard let (vk, shift) = MetalBackedView.vkForChar(ch) else { continue }
+            if shift { winios_post_key(0x10, 1) }   // VK_SHIFT down
+            winios_post_key(vk, 1)
+            winios_post_key(vk, 0)
+            if shift { winios_post_key(0x10, 0) }    // VK_SHIFT up
+        }
+    }
+
+    func deleteBackward() {
+        winios_post_key(0x08, 1)   // VK_BACK down
+        winios_post_key(0x08, 0)
+    }
+
+    // Traits: keep iOS from rewriting path characters.
+    var keyboardType: UIKeyboardType { get { .asciiCapable } set {} }
+    var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
+    var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
+    var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
+    var smartDashesType: UITextSmartDashesType { get { .no } set {} }
+    var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+}
+
 struct MythicMetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MetalBackedView {
-        let v = MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
-        v.backgroundColor = .black
-        v.contentScaleFactor = UIScreen.main.scale
-        if let layer = v.layer as? CAMetalLayer {
-            layer.device = MTLCreateSystemDefaultDevice()
-            layer.pixelFormat = .bgra8Unorm
-            layer.framebufferOnly = true
-            // Explicit drawableSize — otherwise CAMetalLayer.nextDrawable
-            // blocks until bounds are non-zero, and DXMT's swapchain setup
-            // deadlocks before SwiftUI gets a chance to lay the view out.
-            layer.drawableSize = CGSize(width: 800, height: 600)
-            mythic_display_set_layer(layer)
-            LogStore.shared.log("MetalLayer registered with DXMT shim", level: .success)
-        }
-        return v
+        return MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
     }
     func updateUIView(_ uiView: MetalBackedView, context: Context) {}
 }
@@ -85,6 +461,9 @@ struct ContentView: View {
     @State private var jitStatus: JITStatus = .unknown
     @State private var entitlements: EntitlementStatus?
     @State private var showSetupGuide = false
+    @State private var debuggerAttached = isDebuggerAttached()
+    /// .compact = iPhone landscape: game surface expands, arrow keys appear.
+    @Environment(\.verticalSizeClass) private var vSizeClass
 
     enum JITStatus {
         case unknown
@@ -96,38 +475,20 @@ struct ContentView: View {
 
     var body: some View {
         NavigationView {
-            VStack(spacing: 0) {
-                // Status header
-                statusHeader
-
-                // Entitlement status
-                if let ents = entitlements {
-                    entitlementBadges(ents)
+            Group {
+                if vSizeClass == .compact {
+                    landscapeBody
+                } else {
+                    portraitBody
                 }
-
-                Divider()
-
-                // Metal render surface for DXMT output, with FPS overlay top-right.
-                ZStack(alignment: .topTrailing) {
-                    MythicMetalView()
-                        .frame(height: 240)
-                        .background(Color.black)
-                    FPSOverlay()
-                        .padding(8)
-                }
-
-                Divider()
-
-                // Action buttons
-                actionButtons
-
-                Divider()
-
-                // Log console
-                logConsole
             }
+            // Rotation destroys/recreates the UIViewRepresentable across
+            // this if/else (two SwiftUI identities) — HARMLESS since
+            // 2026-07-05: MetalHostView is a process-lifetime singleton;
+            // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Mythic")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationBarHidden(vSizeClass == .compact)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { showSetupGuide = true }) {
@@ -144,6 +505,87 @@ struct ContentView: View {
                 logEntitlementStatus()
             }
         }
+    }
+
+    /// Portrait: classic tooling layout — header, badges, 240pt game strip,
+    /// key row, action buttons, log console.
+    private var portraitBody: some View {
+        VStack(spacing: 0) {
+            statusHeader
+            if let ents = entitlements {
+                entitlementBadges(ents)
+            }
+            Divider()
+            // Game surface strip. NOTE: the surface itself is a raw
+            // window-level view positioned over this placeholder
+            // (MetalHostView.shared) — SwiftUI content laid "on top" of the
+            // strip would be covered. Overlay + key row live BELOW.
+            MythicMetalView()
+                .frame(height: 240)
+                .background(Color.black)
+            HStack(spacing: 6) {
+                keyButton("⏎", vk: 0x0D)   // VK_RETURN
+                keyButton("␣", vk: 0x20)   // VK_SPACE
+                keyButton("Esc", vk: 0x1B) // VK_ESCAPE
+                Button { MetalBackedView.toggleKeyboard() } label: {
+                    Text("⌨").font(.system(size: 20))
+                        .frame(minWidth: 40, minHeight: 32)
+                        .background(Color.secondary.opacity(0.25))
+                        .cornerRadius(6)
+                }
+                Spacer()
+                FPSOverlay()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            Divider()
+            actionButtons
+            Divider()
+            logConsole
+        }
+    }
+
+    /// Landscape: game mode. Full-height 4:3 surface centered (aspect-fit
+    /// happens in MetalBackedView); ALL controls live in the pillarbox
+    /// bars left/right of the game — the window-level surface would cover
+    /// anything drawn over the game area itself. No header/log/nav chrome.
+    private var landscapeBody: some View {
+        GeometryReader { geo in
+            let gameW = min(geo.size.width, geo.size.height * 4.0 / 3.0)
+            let barW = max((geo.size.width - gameW) / 2.0, 44)
+            ZStack {
+                Color.black
+                MythicMetalView()
+                HStack(spacing: 0) {
+                    // Left bar: D-pad (hold semantics — Thumper's turns
+                    // are held keys).
+                    VStack(spacing: 12) {
+                        Spacer()
+                        holdKeyButton("▲", vk: 0x26, big: true)
+                        HStack(spacing: 16) {
+                            holdKeyButton("◀", vk: 0x25, big: true)
+                            holdKeyButton("▶", vk: 0x27, big: true)
+                        }
+                        holdKeyButton("▼", vk: 0x28, big: true)
+                        Spacer()
+                    }
+                    .frame(width: barW)
+                    Spacer(minLength: 0)
+                    // Right bar: FPS readout (compact) + menu keys.
+                    VStack(spacing: 12) {
+                        FPSOverlay(compact: true)
+                        Spacer()
+                        keyButton("⏎", vk: 0x0D)
+                        keyButton("␣", vk: 0x20)
+                        keyButton("Esc", vk: 0x1B)
+                        Spacer()
+                    }
+                    .frame(width: barW)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .background(Color.black)
     }
 
     private var statusHeader: some View {
@@ -173,15 +615,44 @@ struct ContentView: View {
         .padding()
     }
 
+    /// Hold-to-press key: VK down on touch, VK up on release — for keys
+    /// games treat as held (arrows). Same winios queue as keyButton.
+    private func holdKeyButton(_ label: String, vk: Int32, big: Bool = false) -> some View {
+        HoldKeyView(label: label, vk: vk, big: big)
+    }
+
+    /// Small on-screen key: posts VK down, then up 60ms later, through the
+    /// winios input queue (same path as touch→mouse).
+    private func keyButton(_ label: String, vk: Int32) -> some View {
+        Button(action: {
+            winios_post_key(vk, 1)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) {
+                winios_post_key(vk, 0)
+            }
+        }) {
+            Text(label)
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white)
+                .frame(minWidth: 34, minHeight: 30)
+                .background(Color.white.opacity(0.15))
+                .cornerRadius(6)
+        }
+    }
+
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
         HStack(spacing: 8) {
-            entitlementBadge("JIT", granted: ents.jitAllowed)
+            // Live debugger/JIT state, not the (macOS-only, never granted on
+            // iOS) allow-jit entitlement the old badge checked.
+            entitlementBadge("JIT", granted: debuggerAttached)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
             Spacer()
         }
         .padding(.horizontal)
         .padding(.bottom, 8)
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            debuggerAttached = isDebuggerAttached()
+        }
     }
 
     private func entitlementBadge(_ label: String, granted: Bool) -> some View {
@@ -222,6 +693,7 @@ struct ContentView: View {
 
                 Button("Run Wine") {
                     setenv("MYTHIC_EXE", "cube.exe", 1)
+                    unsetenv("MYTHIC_DESKTOP")
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
@@ -234,10 +706,164 @@ struct ContentView: View {
                     setenv("MYTHIC_EXE",
                            "C:\\Program Files\\Thumper\\THUMPER_win10.exe", 1)
                     unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
+
+                Button("Run Net Test (HTTPS)") {
+                    // Steam S0 smoke test: plain HTTP then HTTPS+certs via
+                    // winhttp -> ws2_32/schannel/bcrypt/crypt32 unixlibs.
+                    setenv("MYTHIC_EXE", "winhttp-test.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button("Run Proc Test (CreateProcess)") {
+                    // Steam S1 smoke test: proc-test.exe spawns
+                    // child-test.exe as a pseudo-process (thread group with
+                    // its own ntdll copy), waits, checks exit code 42.
+                    setenv("MYTHIC_EXE", "proc-test.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
+                Button("Run Desktop (explorer)") {
+                    // Steam S2 round 2: explorer creates the virtual desktop,
+                    // then spawns winemine as a pseudo-process INSIDE it.
+                    // No pixels yet (nulldrv) — validates child windows
+                    // joining the desktop tree + WM_PAINT flow.
+                    // /desktop=shell → wine explorer's REAL taskbar + Start
+                    // menu (EnableShell defaults on for the magic name
+                    // "shell" — same environment Winlator/Mobox show).
+                    // 960x540 landscape matches the presentation area.
+                    let deskW = 960, deskH = 540
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\winemine.exe", 1)
+                    // enables GDI window-surface compositing in the driver
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    // diagnostic: PNG-dump window surfaces to Documents/surfdump/
+                    setenv("MYTHIC_DUMP_SURFACES", "1", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.purple)
+
+                Button("Run x64 proc tree") {
+                    // X1 ladder rung 1: x86-64 parent (EC session, the
+                    // known-good Thumper config) spawns an x86-64 CHILD
+                    // pseudo-process — isolates FEX/EC child machinery
+                    // from mixed-session and GUI variables.
+                    setenv("MYTHIC_EXE", "proc-test-x64.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+
+                Button("Run rpcss (R1 boot test)") {
+                    // S3-pre R1: boot rpcss.exe standalone as a pseudo-process
+                    // to prove it comes up, binds its epmapper named-pipe
+                    // endpoint (\\.\pipe\lrpc\epmapper via wineserver), and
+                    // idles alive — de-risks the COM server before wiring the
+                    // launch trigger (R2) and re-adding actxprxy (R3).
+                    setenv("MYTHIC_EXE", "rpcss.exe", 1)
+                    unsetenv("MYTHIC_ARGS")
+                    unsetenv("MYTHIC_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                Button("Run Desktop + services (R2v2)") {
+                    // S3-pre R2v2: raw rpcss.exe CANNOT run standalone —
+                    // its wmain unconditionally StartServiceCtrlDispatcherW's
+                    // (rpcss_main.c:282), which RPCs back to the SCM; without
+                    // services.exe it raised + wedged in
+                    // service_run_main_thread, and explorer's
+                    // CoRegisterClassObject wedged behind it (seq-3680 run).
+                    // Proper bootstrap: explorer's cmdline child = services.exe
+                    // (SCM host, windows-subsystem = no console). It creates
+                    // \pipe\svcctl early, runs auto-start services (MountMgr/
+                    // Eventlog/NDIS/nsiproxy/PlugPlay — winedevice/plugplay
+                    // are bundled; failures tolerated), and combase's
+                    // start_rpcss then demand-starts RpcSs through the SCM
+                    // with a 30s start-pending wait → rpcss runs as services'
+                    // child (3-deep tree, proven depth) with a proper
+                    // dispatcher connection → epmapper up → real COM.
+                    // Known risk: if shellwindows_init beats services.exe's
+                    // RPC_Init, OpenSCManager fails → watch whether that
+                    // fails fast or hits the RaiseException→CS wedge again.
+                    let deskW = 960, deskH = 540
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
+
+                Button("🎮 Run Steam (S3 smoke test)") {
+                    // Steam S3 first boot: virtual desktop (Steam needs a
+                    // window manager) + services.exe (SCM → rpcss for Steam's
+                    // COM, the chain proven in the rpcss milestone) + steam.exe
+                    // itself, all launched by C:\steam-launch.bat (pushed to
+                    // the prefix). Batch avoids quote-escaping hell; combase's
+                    // 5s OpenSCManager retry covers the services-vs-steam race.
+                    // Steam install = CrossOver copy at C:\Program Files (x86)\
+                    // Steam (all boot binaries verified x86-64; steamwebhelper
+                    // /libcef = 209MB → watch pool: first webhelper may fit,
+                    // multiples need .text sharing). Flags: -no-cef-sandbox
+                    // (sandbox can't work in Wine), -cef-disable-gpu (software
+                    // render), -console (Steam's own log → our stderr). Steam
+                    // WILL try to self-update through our GnuTLS stack — that
+                    // attempt is itself an informative S0 re-test.
+                    let deskW = 1024, deskH = 768
+                    setenv("MYTHIC_EXE", "explorer.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
+                    setenv("MYTHIC_DESKTOP", "1", 1)
+                    setenv("MYTHIC_SCREEN_W", String(deskW), 1)
+                    setenv("MYTHIC_SCREEN_H", String(deskH), 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+
+                Button("Run cmd /c proc tree") {
+                    // Steam S1 ladder: wine's cmd runs the full test tree —
+                    // cmd → proc-test → child(depth 1) → grandchild(depth 0).
+                    // Four processes, three pseudo-process spawns; exit 0
+                    // bubbles up from proc-test's PASS.
+                    setenv("MYTHIC_EXE", "cmd.exe", 1)
+                    setenv("MYTHIC_ARGS",
+                           "/c C:\\windows\\system32\\proc-test.exe", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
+                Button("Continue Net Test") {
+                    // VPN gate: the test PE pauses before the Steam stage
+                    // (all TLS code already JIT-compiled by then) so the
+                    // JIT debugger can be detached and VPNs switched.
+                    // This drops C:\mythic-continue.flag to resume it.
+                    _ = mythic_write_continue_flag()
+                }
+                .buttonStyle(.bordered)
+                .tint(.teal)
 
                 Button("Run x64 Hello (FEX/ARM64EC)") {
                     setenv("MYTHIC_EXE", "hello-x64.exe", 1)
@@ -581,8 +1207,33 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             // Step 1: Allocate JIT pool (BRK suspends entire process)
             // 128 MB was enough for cube but Thumper exhausts it (more PE
-            // copies + larger FEX block cache). 256 MB gives headroom.
-            let poolSizeMB = 256
+            // copies + larger FEX block cache). Desktop mode holds the
+            // session's aarch64 image set AND every child's x64 set AND the
+            // FEX code buffers in ONE pool: Thumper-under-desktop hit 199MB
+            // of image copies alone (2026-07-06), leaving the FEX tail carve
+            // colliding with the head. 384 MB fits both plus slack; the pool
+            // is dual-map + NO_FOOTPRINT so unwritten pages cost nothing.
+            //
+            // 2026-07-10 (Steam S3): 384 MB is VIRTUAL-exhausted by Steam's
+            // pseudo-process fan-out — steam.exe + services + rpcss + cmd +
+            // conhost + steamerrorreporter64 each copy their whole DLL set
+            // (owner-keyed, no .text sharing yet) → 138 image copies hit
+            // ~365 MB and the crash reporter's ntdll can't fit → the load
+            // fails and execution BUS-faults on the un-committed image. Since
+            // the pool is jetsam-exempt + demand-committed (unwritten pages
+            // cost nothing), raising the VIRTUAL cap is a cheap, safe unblock.
+            // 640 MB clears the current fan-out with headroom to reach the
+            // ole32 delay-load (FEX riprel probe) and beyond. The real fix for
+            // the PHYSICAL duplication is .text sharing (deferred project).
+            //
+            // 2026-07-10 pm (task #34 / CEF): 896 MB — libcef.dll's 212MB
+            // pool copy EXHAUSTED 640 (bump 412MB + no contiguous 212MB →
+            // libcef load degraded → init CHECK). Pure-x64 skip-copy was
+            // trialed and reverted (broke x18-trampoline layout, ml68);
+            // until skip-copy or .text sharing lands, buy headroom. Virtual
+            // is jetsam-exempt; the copy itself is ~212MB real RSS when
+            // written.
+            let poolSizeMB = 896
             logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
             let t0 = CFAbsoluteTimeGetCurrent()
             let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
@@ -618,11 +1269,54 @@ struct ContentView: View {
             // to let FMOD finish init before debugger detach; otherwise main
             // game loop never engages because Present is gated on audio ready.
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 1200.0  // safety cap (bumped from 300s — Thumper's allocator-heavy init churns ~336K times across cache/config/resource tables; 5 min was cutting it off mid-init)
+            // 2026-07-03 early detach: attached-mode runs the whole guest
+            // ~2x slower (measured 1.2s → 0.74s per present at detach) and
+            // on iOS 27 presented frames only reliably reach glass after
+            // detach. Post-detach is safe now: trap-mode JIT writes go via
+            // the Mach emulator (no debugger), pool pages are pre-executable
+            // (dual map), page0 runs once on the first thread, and a
+            // post-detach compile was observed working (real_compiles
+            // 7093→7094, no faults). So: detach once the game is actually
+            // presenting (present #2 = first post-splash frame) plus a
+            // settle window, instead of waiting out the full 1200s cap.
+            let maxWait = 1200.0  // hard safety cap (unchanged)
+            // 2026-07-03 second iteration: detach on present #1 (splash shown)
+            // instead of #2. The 3-minute splash-hold is the game loading —
+            // running it detached should roughly halve it. Riskier than #2
+            // (thousands of load-time compiles + worker-thread spawns happen
+            // post-detach) but all known dependencies are covered: trap-mode
+            // writes, pre-executable pool, page0 once-guard.
+            let settleAfterFirstPresent = 20.0
+            var presentingSince: CFAbsoluteTime? = nil
             let pollStart = CFAbsoluteTimeGetCurrent()
+            var lastHeartbeat = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
-                if CFAbsoluteTimeGetCurrent() - pollStart > maxWait {
+                let now = CFAbsoluteTimeGetCurrent()
+                // Diagnostic heartbeat: 2026-07-03's detach-at-#1 run never
+                // triggered despite presents visibly counting — log what this
+                // loop actually observes so that can't happen silently again.
+                if now - lastHeartbeat > 30 {
+                    lastHeartbeat = now
+                    logStore.log("detach-wait: presents=\(mythic_get_present_count()) running=\(wine_process_is_running()) elapsed=\(Int(now - pollStart))s")
+                }
+                // Task #25: the present heuristic is meaningless in desktop
+                // mode — ANY child presenting (cube, a game window) trips it
+                // mid-session, and later program launches still need the
+                // attached-debugger facilities. Desktop sessions stay
+                // attached until the desktop exits (or the safety cap).
+                let isDesktopSession = getenv("MYTHIC_DESKTOP").map { $0.pointee == 49 } ?? false
+                if !isDesktopSession {
+                    if presentingSince == nil && mythic_get_present_count() >= 1 {
+                        presentingSince = now
+                        logStore.log("Game is presenting (#1, splash) — early detach in \(Int(settleAfterFirstPresent))s")
+                    }
+                    if let t = presentingSince, now - t > settleAfterFirstPresent {
+                        logStore.log("Early detach: game presenting and settled", level: .success)
+                        break
+                    }
+                }
+                if now - pollStart > maxWait {
                     logStore.log("Wine still running after \(Int(maxWait))s, proceeding with detach", level: .error)
                     break
                 }

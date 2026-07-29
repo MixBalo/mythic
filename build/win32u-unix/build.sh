@@ -23,9 +23,12 @@ SUCCEEDED=0
 FAILED=0
 FAILED_FILES=""
 
+FREETYPE_DIR="$REPO_ROOT/build/freetype-ios"
+
 compile_one() {
     local src=$1
     local name=$2
+    shift 2
     echo -n "  $name... "
 
     if xcrun -sdk iphoneos clang \
@@ -50,6 +53,7 @@ compile_one() {
         -USONAME_LIBVULKAN \
         -USONAME_LIBGNUTLS \
         -UHAVE_FT2BUILD_H \
+        "$@" \
         -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
         echo "OK"
         SUCCEEDED=$((SUCCEEDED + 1))
@@ -77,6 +81,10 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
 
     # Per-file iOS overrides (analogous to ntdll-unix's pattern).
     case "$name" in
+        class)
+            compile_one "$BUILD_DIR/class_ios.c" "class"
+            continue
+            ;;
         winstation)
             compile_one "$BUILD_DIR/winstation_ios.c" "winstation"
             continue
@@ -95,6 +103,15 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             ;;
         message)
             compile_one "$BUILD_DIR/message_ios.c" "message"
+            continue
+            ;;
+        freetype)
+            # Statically-linked freetype (build/freetype-ios). The wrapper
+            # re-defines HAVE_FT2BUILD_H itself; config_ios.h's #undefs win
+            # for every other TU.
+            compile_one "$BUILD_DIR/freetype_ios.c" "freetype" \
+                -I"$FREETYPE_DIR/build/include" \
+                -I"$REPO_ROOT/research/freetype/include"
             continue
             ;;
     esac
@@ -117,6 +134,15 @@ fi
 echo ""
 echo "=== Building libwin32u_unix.a ==="
 ar rcs "$OBJ_DIR/libwin32u_unix.a" "$OBJ_DIR"/*.o
+
+# Merge the static freetype so the app link needs no project changes.
+if [ -f "$FREETYPE_DIR/build/libfreetype.a" ]; then
+    libtool -static -o "$OBJ_DIR/libwin32u_unix.a" \
+        "$OBJ_DIR/libwin32u_unix.a" "$FREETYPE_DIR/build/libfreetype.a" 2>/dev/null
+    echo "merged libfreetype.a"
+else
+    echo "WARNING: no libfreetype.a — fonts will be disabled"
+fi
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libwin32u_unix.a" "$APP_LIB"

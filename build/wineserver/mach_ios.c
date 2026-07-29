@@ -70,6 +70,12 @@ static void mach_set_error(kern_return_t mach_error)
 
 static mach_port_t get_process_port( struct process *process )
 {
+    /* NOTE (task #32): NOT changed to mach_task_self() on iOS. The cross-thread
+     * context capture (ios_fill_thread_context) uses mach_task_self() directly,
+     * so it doesn't need this. Making this return our task would additionally
+     * ACTIVATE read/write_process_memory (they early-out on !process_port),
+     * which regressed Steam boot into a guest SEGV + loader-lock deadlock —
+     * some caller depends on the old ACCESS_DENIED no-op. Leave as-is. */
     return process->trace_data;
 }
 
@@ -394,6 +400,158 @@ int send_thread_signal( struct thread *thread, int sig )
         fprintf( stderr, "%04x: *sent signal* signal=%d\n", thread->id, sig );
     return (ret != -1);
 }
+
+#ifdef WINE_IOS
+/* iOS cross-thread context capture (task #32).
+ *
+ * POSIX signal suspend (SIGUSR1 via __pthread_kill) does NOT deliver on iOS —
+ * __pthread_kill returns success but usr1_handler never runs, so the upstream
+ * "target thread fills its own context in wait_suspend" mechanism is dead and
+ * SuspendThread+GetThreadContext hung forever (Steam's watchdog wedged boot).
+ *
+ * Instead the SERVER captures the target's context via native Mach:
+ *   - thread_suspend() halts the target for a coherent snapshot,
+ *   - thread_get_state(ARM_THREAD_STATE64) gives the native ARM64 regs,
+ *   - the guest x86-64 regs are read from the target's last-synced CPU-area
+ *     context (TEB->ChpeV2CpuAreaInfo->ContextAmd64, an AMD64 CONTEXT laid out
+ *     binary-compatibly), reachable by a same-task read,
+ *   - thread_resume() lets it run again (momentary halt — no lasting suspend,
+ *     so no lock-holder deadlock window).
+ * Fills both context_data sides; thread.c's stop_thread sets status + signals
+ * the context sync so the client's GetThreadContext returns without PENDING.
+ *
+ * The guest RIP is FEX's last block-boundary sync value — exactly what Steam's
+ * hang-detection watchdog samples; a progressing thread shows an advancing RIP.
+ * Returns 1 if at least the native context was captured. */
+
+/* TEB / CPU-area / AMD64 CONTEXT field offsets (see winternl.h / winnt.h). */
+#define IOS_TEB_CHPE_CPUAREA_OFF   0x1788   /* TEB.ChpeV2CpuAreaInfo */
+#define IOS_CPUAREA_CTX64_OFF      0x18     /* CHPE_V2_CPU_AREA_INFO.ContextAmd64 */
+#define IOS_A64_SEGCS   0x38
+#define IOS_A64_SEGDS   0x3a
+#define IOS_A64_SEGES   0x3c
+#define IOS_A64_SEGFS   0x3e
+#define IOS_A64_SEGGS   0x40
+#define IOS_A64_SEGSS   0x42
+#define IOS_A64_EFLAGS  0x44
+#define IOS_A64_RAX     0x78
+#define IOS_A64_RCX     0x80
+#define IOS_A64_RDX     0x88
+#define IOS_A64_RBX     0x90
+#define IOS_A64_RSP     0x98
+#define IOS_A64_RBP     0xa0
+#define IOS_A64_RSI     0xa8
+#define IOS_A64_RDI     0xb0
+#define IOS_A64_R8      0xb8
+#define IOS_A64_R9      0xc0
+#define IOS_A64_R10     0xc8
+#define IOS_A64_R11     0xd0
+#define IOS_A64_R12     0xd8
+#define IOS_A64_R13     0xe0
+#define IOS_A64_R14     0xe8
+#define IOS_A64_R15     0xf0
+#define IOS_A64_RIP     0xf8
+#define IOS_A64_FLTSAVE 0x100
+#define IOS_A64_CTXLEN  0x4d0            /* full AMD64 CONTEXT */
+
+static int ios_safe_read( uint64_t addr, void *buf, unsigned int size )
+{
+    mach_vm_size_t got = 0;
+    if (!addr) return 0;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)addr,
+                                (mach_vm_size_t)size, (mach_vm_address_t)buf, &got ))
+        return 0;
+    return got == size;
+}
+
+int ios_fill_thread_context( struct thread *thread,
+                             struct context_data *native,
+                             struct context_data *wow )
+{
+    mach_msg_type_name_t type;
+    mach_port_t port;
+    arm_thread_state64_t arm;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    kern_return_t kr;
+    int have_native = 0;
+
+    if (thread->unix_pid == -1 || thread->unix_tid == (unsigned int)-1) return 0;
+    if (mach_port_extract_right( mach_task_self(), thread->unix_tid,
+                                 MACH_MSG_TYPE_COPY_SEND, &port, &type ))
+        return 0;
+
+    if (thread_suspend( port )) { mach_port_deallocate( mach_task_self(), port ); return 0; }
+
+    /* --- native ARM64 context --- */
+    kr = thread_get_state( port, ARM_THREAD_STATE64, (thread_state_t)&arm, &count );
+    if (!kr)
+    {
+        unsigned int i;
+        native->flags |= SERVER_CTX_CONTROL | SERVER_CTX_INTEGER;
+        native->ctl.arm64_regs.sp     = arm.__sp;
+        native->ctl.arm64_regs.pc     = arm.__pc;
+        native->ctl.arm64_regs.pstate = arm.__cpsr;
+        for (i = 0; i < 29; i++) native->integer.arm64_regs.x[i] = arm.__x[i];
+        native->integer.arm64_regs.x[29] = arm.__fp;
+        native->integer.arm64_regs.x[30] = arm.__lr;
+        have_native = 1;
+    }
+
+    /* --- guest x86-64 context from TEB->ChpeV2CpuAreaInfo->ContextAmd64 --- */
+    if (wow)
+    {
+        uint64_t cpuarea = 0, ctx64 = 0;
+        unsigned char ctx[IOS_A64_CTXLEN];
+        /* Tag the WOW side with the guest machine unconditionally so the
+         * get_thread_context handler's native/WOW split always routes an
+         * AMD64 request correctly, even if the CPU-area read fails for an
+         * early / pure-native thread (then flags stay 0 → empty x64 ctx). */
+        wow->machine = thread->process->machine;   /* IMAGE_FILE_MACHINE_AMD64 */
+        if (thread->teb &&
+            ios_safe_read( (uint64_t)thread->teb + IOS_TEB_CHPE_CPUAREA_OFF, &cpuarea, 8 ) && cpuarea &&
+            ios_safe_read( cpuarea + IOS_CPUAREA_CTX64_OFF, &ctx64, 8 ) && ctx64 &&
+            ios_safe_read( ctx64, ctx, sizeof(ctx) ))
+        {
+            wow->flags |= SERVER_CTX_CONTROL | SERVER_CTX_INTEGER | SERVER_CTX_SEGMENTS |
+                          SERVER_CTX_FLOATING_POINT;
+            wow->ctl.x86_64_regs.rip   = *(uint64_t *)(ctx + IOS_A64_RIP);
+            wow->ctl.x86_64_regs.rsp   = *(uint64_t *)(ctx + IOS_A64_RSP);
+            wow->ctl.x86_64_regs.cs    = *(uint16_t *)(ctx + IOS_A64_SEGCS);
+            wow->ctl.x86_64_regs.ss    = *(uint16_t *)(ctx + IOS_A64_SEGSS);
+            wow->ctl.x86_64_regs.flags = *(uint32_t *)(ctx + IOS_A64_EFLAGS);
+            /* AMD64 CONTEXT memory order (Rax,Rcx,Rdx,Rbx,Rsp,Rbp,Rsi,Rdi,R8..)
+             * differs from context_data.integer field order (rax,rbx,rcx,rdx,
+             * rbp,rsi,rdi,r8..; no rsp) — map each register explicitly. */
+            wow->integer.x86_64_regs.rax = *(uint64_t *)(ctx + IOS_A64_RAX);
+            wow->integer.x86_64_regs.rbx = *(uint64_t *)(ctx + IOS_A64_RBX);
+            wow->integer.x86_64_regs.rcx = *(uint64_t *)(ctx + IOS_A64_RCX);
+            wow->integer.x86_64_regs.rdx = *(uint64_t *)(ctx + IOS_A64_RDX);
+            wow->integer.x86_64_regs.rbp = *(uint64_t *)(ctx + IOS_A64_RBP);
+            wow->integer.x86_64_regs.rsi = *(uint64_t *)(ctx + IOS_A64_RSI);
+            wow->integer.x86_64_regs.rdi = *(uint64_t *)(ctx + IOS_A64_RDI);
+            wow->integer.x86_64_regs.r8  = *(uint64_t *)(ctx + IOS_A64_R8);
+            wow->integer.x86_64_regs.r9  = *(uint64_t *)(ctx + IOS_A64_R9);
+            wow->integer.x86_64_regs.r10 = *(uint64_t *)(ctx + IOS_A64_R10);
+            wow->integer.x86_64_regs.r11 = *(uint64_t *)(ctx + IOS_A64_R11);
+            wow->integer.x86_64_regs.r12 = *(uint64_t *)(ctx + IOS_A64_R12);
+            wow->integer.x86_64_regs.r13 = *(uint64_t *)(ctx + IOS_A64_R13);
+            wow->integer.x86_64_regs.r14 = *(uint64_t *)(ctx + IOS_A64_R14);
+            wow->integer.x86_64_regs.r15 = *(uint64_t *)(ctx + IOS_A64_R15);
+            wow->seg.x86_64_regs.ds = *(uint16_t *)(ctx + IOS_A64_SEGDS);
+            wow->seg.x86_64_regs.es = *(uint16_t *)(ctx + IOS_A64_SEGES);
+            wow->seg.x86_64_regs.fs = *(uint16_t *)(ctx + IOS_A64_SEGFS);
+            wow->seg.x86_64_regs.gs = *(uint16_t *)(ctx + IOS_A64_SEGGS);
+            memcpy( wow->fp.x86_64_regs.fpregs, ctx + IOS_A64_FLTSAVE,
+                    sizeof(wow->fp.x86_64_regs.fpregs) );
+        }
+    }
+
+    thread_resume( port );
+    mach_port_deallocate( mach_task_self(), port );
+
+    return have_native;
+}
+#endif  /* WINE_IOS */
 
 /* read data from a process memory space */
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )

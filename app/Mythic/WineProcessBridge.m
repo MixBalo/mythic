@@ -5,14 +5,22 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <pthread.h>
+/* AVFoundation: AVAudioSession activation for the Tier-2 audio driver
+ * (audio_null_ios.c RemoteIO backend). AudioToolbox: pulls the framework
+ * in via autolink — the static-lib driver code can't autolink itself. */
+#import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <setjmp.h>
+#include <stdlib.h>
+#include <errno.h>
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
 #include "PrefixExtractor.h"
+#include "FEXBridge.h"  // fex_get_jit_write_offset()
 
 // Thread-local globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
 // Each Wine "process" thread has its own jmpbuf so child processes can exit independently.
@@ -20,6 +28,7 @@ _Thread_local jmp_buf wine_ios_exit_jmpbuf;
 _Thread_local volatile int wine_ios_exit_code = 0;
 _Thread_local pthread_t wine_ios_main_thread;
 _Thread_local int wine_ios_exit_initialized = 0;
+
 
 static os_log_t wine_proc_log(void) {
     static os_log_t log;
@@ -42,6 +51,11 @@ static char *g_prefix_path = NULL;
 
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
+        /* Perf: the guest main thread runs ON this pthread. Promote to
+         * USER_INTERACTIVE so it schedules on P-cores with minimal kernel
+         * timer coalescing (same rationale as start_thread in
+         * thread_ios.c — default QoS costs tens of ms of sleep leeway). */
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         LOG("Wine process thread started");
 
         // Seed prefix from bundled template on first launch (Proton-style).
@@ -89,8 +103,34 @@ static void *wine_process_thread(void *arg) {
             LOG("WINEDLLPATH=%{public}s", bundlePath.UTF8String);
         }
 
-        // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
+        /* Wine trace channels.
+         *
+         * 2026-05-19 perf pivot: the verbose default (err+all, fixme+all,
+         * warn+module, warn+file, trace+process, trace+module, trace+loaddll,
+         * trace+loadorder, trace+win, trace+user32, trace+syscall, trace+file)
+         * was generating ~220 KB/sec of log writes — the dominant source of
+         * the 1.35s-per-frame menu rendering. trace+syscall + trace+file alone
+         * are likely 90%+ of the volume (every Nt* call writes 3-5 log lines).
+         *
+         * Default is now PERF: only err+all (so we still see real failures).
+         * For debugging, set MYTHIC_DEBUG_VERBOSE=1 in the environment to
+         * restore the full trace channel set. */
+        {
+            const char *verbose = getenv("MYTHIC_DEBUG_VERBOSE");
+            if (verbose && *verbose && *verbose != '0') {
+                setenv("WINEDEBUG", "err+all,fixme+all,warn+module,warn+file,trace+process,trace+module,trace+loaddll,trace+loadorder,trace+win,trace+user32,trace+syscall,trace+file", 1);
+                LOG("WINEDEBUG = verbose (MYTHIC_DEBUG_VERBOSE set)");
+            } else {
+                /* err+all keeps real failure messages, but subtract err+virtual
+                 * because our iOS virtual_ios.c uses ERR() for informational
+                 * traces ("iOS vm_protect RW+COPY OK", "iOS JIT: pool size",
+                 * "iOS JIT: copied image"). Those produce thousands of lines
+                 * per boot. Real failures in virtual_ios.c use distinctive
+                 * FATAL/FAIL prefixes our app surfaces via other paths. */
+                setenv("WINEDEBUG", "err+all,err-virtual", 1);
+                LOG("WINEDEBUG = err+all,err-virtual (perf default — set MYTHIC_DEBUG_VERBOSE=1 for full trace)");
+            }
+        }
 
         // Phase 3D investigation: re-enabled. Investigation C concluded
         // wineserver dispatch is fine; the `ws_log drops at high rate`
@@ -98,6 +138,50 @@ static void *wine_process_thread(void *arg) {
         // get_desktop_window's returned HWND fails get_user_object lookup
         // when create_window receives it as req->parent.
         setenv("MYTHIC_WIN32U", "1", 1);
+
+        /* 2026-07-05 quiet/release mode: disables the heavyweight
+         * diagnostics — the PROF sampler (thread_suspends the game thread
+         * ~500x/s), per-present log lines (100+/s at RAW rates), winios
+         * poll heartbeat. Counters (present count for the FPS overlay,
+         * machexc, srvw) keep ticking; ERR-level and boot logging are
+         * untouched. Worth a few %% of frame time and, more importantly,
+         * HEAT — thermals are what cap ProMotion at 60. COMMENT THIS OUT
+         * for diagnostic/profiling sessions. */
+        setenv("MYTHIC_QUIET", "1", 1);
+
+        /* 2026-07-05 audio: activate the AVAudioSession before Wine boots
+         * so the RemoteIO unit in the mmdevapi driver can start. Playback
+         * category = ignores silent switch (it's a game). */
+        {
+            NSError *aerr = nil;
+            AVAudioSession *session = [AVAudioSession sharedInstance];
+            [session setCategory:AVAudioSessionCategoryPlayback error:&aerr];
+            if (aerr) LOG("AVAudioSession setCategory failed: %{public}s",
+                          aerr.localizedDescription.UTF8String);
+            aerr = nil;
+            [session setActive:YES error:&aerr];
+            if (aerr) LOG("AVAudioSession setActive failed: %{public}s",
+                          aerr.localizedDescription.UTF8String);
+            else LOG("AVAudioSession active: rate=%.0f latency=%.1fms",
+                     session.sampleRate, session.outputLatency * 1000.0);
+        }
+
+        /* 2026-07-04 BISECT RESULT: arm A (this env set, all handler fixes
+         * on) booted to menu at 17-18 FPS with the x18-access emulator
+         * firing 135K+ times cleanly — handler fixes EXONERATED. The
+         * libsystem_malloc death is specific to UNIXCALL-DIRECT. Env
+         * removed; next crash run carries an fp-walk backtrace + malloc
+         * prologue dump to name the Metal call handing free() a garbage
+         * pointer. */
+
+        /* 2026-07-04: MYTHIC_HEAL retried with XLATE-HOOK-REV in place and
+         * STILL fatal — same C000001D libplatform (os_unfair_lock abort)
+         * seconds after healing the ntdll dispatch-thunk VA at boot. One of
+         * the rewritten slots has a consumer doing identity/offset math on
+         * the PE VA, which no unwinder fix helps. Blanket healing is dead;
+         * the fault-latency attack needs slot-level forensics (which slot
+         * is the pure branch-feeder) or a writer-side fix. Healer stays
+         * opt-in-off. */
 
         /* Steam game vars — Thumper queries SteamAppPath dozens of times in init
          * and uses it as base path for asset loading. Prior comment claimed
@@ -109,6 +193,26 @@ static void *wine_process_thread(void *arg) {
         setenv("SteamAppId",  "356400", 1);
         LOG("setenv check: SteamAppPath=%{public}s SteamGameId=%{public}s",
             getenv("SteamAppPath"), getenv("SteamGameId"));
+
+        /* iOS-Mythic 2026-07-02: publish the TRUE JIT-pool RX->RW offset to
+         * xtajit64.dll (its own FEXCore copy reads this via getenv in
+         * ProcessInit). Set HERE — beside SteamAppPath, the point where
+         * Wine snapshots the environment — so it forwards reliably; setting
+         * it in FEXBridge.mm::jit_pool_init was too early and did not reach
+         * Wine's GetEnvironmentVariableW. jit_pool_init has already run by
+         * now (fex_initialize is a prerequisite for launching the guest),
+         * so the offset is available. */
+        {
+            int64_t jit_off = fex_get_jit_write_offset();
+            if (jit_off != 0) {
+                char off_str[32];
+                snprintf(off_str, sizeof(off_str), "0x%llx", (unsigned long long)jit_off);
+                setenv("MYTHIC_JIT_WRITE_OFFSET", off_str, 1);
+                LOG("setenv MYTHIC_JIT_WRITE_OFFSET=%{public}s", off_str);
+            } else {
+                LOG("WARNING: fex_get_jit_write_offset() returned 0 — JIT pool not initialized?");
+            }
+        }
 
         /* iOS-Mythic: TSO stays ENABLED (default). The unaligned LDAR/LDAPR/
          * STLR backpatch is now in signal_arm64_ios.c's Mach handler, which
@@ -135,6 +239,19 @@ static void *wine_process_thread(void *arg) {
             LOG("Wine log file: %{public}s", logPath.UTF8String);
             /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
             setenv("MYTHIC_DOCS_DIR", docs.UTF8String, 1);
+        }
+
+        // Steam S0: root CA trust. iOS has no API to enumerate system
+        // roots, so crypt32's unix rootstore (crypt32_unixlib_ios.c)
+        // reads the bundled Mozilla CA set from this path instead.
+        {
+            NSString *caPath = [[NSBundle mainBundle] pathForResource:@"cacert" ofType:@"pem"];
+            if (caPath) {
+                setenv("MYTHIC_CA_BUNDLE", caPath.UTF8String, 1);
+                LOG("CA bundle: %{public}s", caPath.UTF8String);
+            } else {
+                LOG("WARNING: cacert.pem missing from bundle — HTTPS cert verification will fail");
+            }
         }
 
         // Redirect stderr AND stdout to log file so Wine debug output (WINEDEBUG)
@@ -192,6 +309,70 @@ static void *wine_process_thread(void *arg) {
             LOG("Symlinked %d DLLs from %{public}s to %{public}s", linked, bundle_subdir, sys32Dir.UTF8String);
             dprintf(STDERR_FILENO, "[WineProc] Symlinked %d DLLs from %s -> sys32\n", linked, bundle_subdir);
 
+            // X3 mixed-mode: also link NON-COLLIDING files from the other
+            // bundle arch so cross-arch child exes resolve by Win32 path
+            // (e.g. proc-test-x64.exe in an aarch64 desktop session).
+            // Canonical DLL names (ntdll.dll, ...) already link to the
+            // session's set above and are skipped here; children load their
+            // system DLLs arch-correctly via WINEDLLPATH + pe_dir probing.
+            {
+                const char *other_subdir = use_arm64ec ? "aarch64-windows" : "arm64ec-windows";
+                NSString *otherSource = [bundlePath stringByAppendingPathComponent:[NSString stringWithUTF8String:other_subdir]];
+                NSArray *others = [fm contentsOfDirectoryAtPath:otherSource error:nil];
+                int crossLinked = 0;
+                for (NSString *f in others) {
+                    NSString *dst = [sys32Dir stringByAppendingPathComponent:f];
+                    // fileExistsAtPath FOLLOWS symlinks: YES means the session
+                    // (main) pass already linked this name to a resolvable
+                    // file — that arch wins, leave it.
+                    if ([fm fileExistsAtPath:dst]) continue;
+                    // NO means absent OR a stale/dangling symlink left by a
+                    // previous install (bundle UUID changed on reinstall).
+                    // createSymbolicLink fails with EEXIST on a dangling link
+                    // that still occupies the path — which silently left the
+                    // -x64 files pointing at a dead bundle, so they vanished
+                    // from Wine's dir enumeration. Clear then recreate, like
+                    // the main pass does.
+                    [fm removeItemAtPath:dst error:nil];
+                    NSString *src = [otherSource stringByAppendingPathComponent:f];
+                    if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                        crossLinked++;
+                }
+                dprintf(STDERR_FILENO, "[WineProc] Cross-linked %d non-colliding files from %s -> sys32\n",
+                        crossLinked, other_subdir);
+            }
+
+            // X3c mixed-mode: full per-arch DLL farms. A cross-arch child's
+            // private ntdll retries C:\windows\sysx64 (SysWOW64-style) when a
+            // system32 name resolves to the session arch's binary — colliding
+            // names (ucrtbase, kernel32, ...) always do. sysaa64 is the
+            // mirror for the future inverse case (aarch64 child in an EC
+            // session, e.g. rpcss under Steam).
+            {
+                struct { const char *farm; const char *arch; } farms[] = {
+                    { "sysx64",  "arm64ec-windows" },
+                    { "sysaa64", "aarch64-windows" },
+                };
+                for (int i = 0; i < 2; i++) {
+                    NSString *farmDir = [prefix stringByAppendingPathComponent:
+                        [NSString stringWithFormat:@"drive_c/windows/%s", farms[i].farm]];
+                    NSString *archSource = [bundlePath stringByAppendingPathComponent:
+                        [NSString stringWithUTF8String:farms[i].arch]];
+                    [fm createDirectoryAtPath:farmDir withIntermediateDirectories:YES attributes:nil error:nil];
+                    NSArray *files = [fm contentsOfDirectoryAtPath:archSource error:nil];
+                    int farmLinked = 0;
+                    for (NSString *f in files) {
+                        NSString *dst = [farmDir stringByAppendingPathComponent:f];
+                        [fm removeItemAtPath:dst error:nil];  // self-heal stale links on reinstall
+                        NSString *src = [archSource stringByAppendingPathComponent:f];
+                        if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                            farmLinked++;
+                    }
+                    dprintf(STDERR_FILENO, "[WineProc] Farm %s: %d links -> %s\n",
+                            farms[i].farm, farmLinked, farms[i].arch);
+                }
+            }
+
             // Layer Microsoft's real VC++ Runtime DLLs ON TOP of the ARM64EC
             // bundle (only for x86_64 guests). These overwrite Wine's stub
             // builtins — Wine then loads the real MS x86_64 implementation
@@ -206,6 +387,17 @@ static void *wine_process_thread(void *arg) {
                 NSArray *vcrtDlls = [fm contentsOfDirectoryAtPath:vcrtSource error:nil];
                 int vcrtLinked = 0, vcrtSkipped = 0;
                 for (NSString *dll in vcrtDlls) {
+                    /* NOTE 2026-07-03 (late): retried lifting BOTH exemptions
+                     * below after the fast-write bisect, hoping trap-mode had
+                     * fixed the corruption class (and to keep hot CRT calls
+                     * like memcpy inside the JIT — they cost a full x64→EC
+                     * round trip as ARM64EC builtins, a large share of the
+                     * 57ms menu frame). Result: guest RIP jumped to junk
+                     * (0x600000010xx, lr=0xa59696ff...) right after
+                     * MSVCP140/VCRUNTIME140 loaded x86_64, before present #1.
+                     * So the x86→EC SEH/transition corruption is NOT the
+                     * fast-write bug — it's still unfixed, and these
+                     * exemptions must stay until it is. */
                     /* Keep vcruntime140.dll as the ARM64EC builtin: its
                      * __C_specific_handler is invoked by Wine's SEH dispatch,
                      * and routing that through FEX corrupts x86 RSP (SEH
@@ -214,6 +406,19 @@ static void *wine_process_thread(void *arg) {
                      * directly in ARM64 — no FEX bridging on the exception
                      * path. Other vcruntime/msvcp/concrt DLLs still overlay. */
                     if ([[dll lowercaseString] isEqualToString:@"vcruntime140.dll"]) {
+                        vcrtSkipped++;
+                        continue;
+                    }
+                    /* msvcp140.dll: same exemption as vcruntime140, found
+                     * 2026-07-03. The MS x86_64 msvcp140 throws a C++
+                     * exception during its own DllMain; the x86 throw-record
+                     * builder calls RtlPcToFileHeader cross-arch and the
+                     * exception-path exit thunk corrupts guest RSP — the
+                     * returned module base lands in the return-address slot
+                     * and RIP jumps to the MZ header (NoExec loop, no
+                     * splash). Keep the ARM64EC builtin so msvcp140's EH
+                     * runs natively, like vcruntime140. */
+                    if ([[dll lowercaseString] isEqualToString:@"msvcp140.dll"]) {
                         vcrtSkipped++;
                         continue;
                     }
@@ -333,6 +538,19 @@ static void *wine_process_thread(void *arg) {
         wineserver_stop();
 
         dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
+
+        // Steam S0: this thread's TEB was mirrored into pthread TSD slot
+        // 275 (FEX's hardcoded 0x898) which we don't own via
+        // pthread_key_create. Returning from a pthread runs foreign key
+        // destructors on whatever's in the slot -> objc_release(TEB)
+        // crash wedged the app after every net-test run. Clear it, same
+        // as ntdll's pthread_exit_wrapper does for Wine worker threads.
+        {
+            uintptr_t tsd_base;
+            __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+            tsd_base &= ~7ULL;
+            *(void **)(tsd_base + 275 * 8) = NULL;
+        }
     }
     return NULL;
 }
@@ -393,4 +611,18 @@ int wine_process_start(const char *prefix_path) {
 
 int wine_process_is_running(void) {
     return g_wine_running;
+}
+
+int mythic_write_continue_flag(void) {
+    if (!g_prefix_path) return -1;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/drive_c/mythic-continue.flag", g_prefix_path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        LOG("continue flag write FAILED: %{public}s errno=%d", path, errno);
+        return -1;
+    }
+    close(fd);
+    LOG("continue flag written: %{public}s", path);
+    return 0;
 }

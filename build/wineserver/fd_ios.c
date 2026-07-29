@@ -21,7 +21,26 @@
 
 #include "config.h"
 #include <os/log.h>
+#include <mach/mach_time.h>
+#include <mach/mach_init.h>
+#include <mach/semaphore.h>
+#include <mach/task.h>
 #include "wine_log_ios.h"
+
+/* iOS-Mythic 2026-07-05: in-process request-wake semaphore. The iOS
+ * server loop can't block in poll/kqueue (AF_UNIX invisible in the
+ * sandbox), so it slept a fixed 1ms tick — meaning every client request
+ * waited avg ~0.5ms (worst 1ms+) just to be NOTICED. Thumper does 8
+ * zero-timeout WaitForSingleObject polls per frame; each paid ~1.15ms
+ * of pure pickup+round-trip latency = the 55-vs-60 FPS gap. Clients
+ * (ntdll's server_call_unlocked, same process) signal this semaphore
+ * right after writing a request; the loop sleeps in semaphore_timedwait
+ * and wakes instantly. Extra signals just cause cheap extra scans. */
+semaphore_t ios_srv_wake_sem = 0;
+void ios_wineserver_wake(void)
+{
+    if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
+}
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
 
@@ -664,7 +683,10 @@ static inline void set_fd_epoll_events( struct fd *fd, int user, int events )
 {
     struct kevent ev[2];
 
-    if (kqueue_fd == -1) { ws_log("[wineserver-fd] set_fd_epoll_events: kqueue_fd=-1, skipping"); return; }
+    /* iOS-Mythic 2026-07-05: log line removed — kqueue is always skipped
+     * on iOS (poll fallback) and this fired per fd-event change: 3,234
+     * lines of pure noise in one gameplay run. */
+    if (kqueue_fd == -1) return;
 
     EV_SET( &ev[0], fd->unix_fd, EVFILT_READ, 0, NOTE_LOWAT, 1, (void *)(long)user );
     EV_SET( &ev[1], fd->unix_fd, EVFILT_WRITE, 0, NOTE_LOWAT, 1, (void *)(long)user );
@@ -1000,6 +1022,43 @@ static int get_next_timeout( struct timespec *ts )
 }
 
 /* server main poll() loop */
+/* iOS-Mythic 2026-07-05 (Steam S0): the sandbox poll() limitation is
+ * specific to the AF_UNIX master socketpair — real INET sockets (TCP/
+ * UDP) are fully kernel-pollable on iOS. wineserver's sock.c depends on
+ * true poll semantics (POLLOUT edge = connect completed, POLLERR/HUP =
+ * failure); the synthesized events below (unconditional POLLOUT) made
+ * every nonblocking connect look complete-but-unwritable → WSAEWOULDBLOCK
+ * loops in winhttp. So INET fds get a real zero-timeout poll() each
+ * iteration; pipes and the AF_UNIX pair keep the legacy synthesis.
+ * Family is cached per (user,fd) — getsockname once per socket. */
+static signed char ios_fd_is_inet( int user, int fd )
+{
+    static int *cache_fd;
+    static signed char *cache_val;
+    static int cache_size;
+
+    if (user >= cache_size)
+    {
+        int newsize = (user + 64) & ~63;
+        int *nfd = realloc( cache_fd, newsize * sizeof(*nfd) );
+        signed char *nval = realloc( cache_val, newsize );
+        if (!nfd || !nval) return 0;
+        memset( nfd + cache_size, 0xff, (newsize - cache_size) * sizeof(*nfd) );
+        cache_fd = nfd; cache_val = nval; cache_size = newsize;
+    }
+    if (cache_fd[user] != fd)
+    {
+        struct sockaddr_storage ss;
+        socklen_t slen = sizeof(ss);
+        cache_fd[user] = fd;
+        if (getsockname( fd, (struct sockaddr *)&ss, &slen ) == -1)
+            cache_val[user] = 0;
+        else
+            cache_val[user] = (ss.ss_family == AF_INET || ss.ss_family == AF_INET6);
+    }
+    return cache_val[user];
+}
+
 void main_loop(void)
 {
     int i, ret, timeout;
@@ -1040,6 +1099,7 @@ void main_loop(void)
         static int ios_events_fired = 0;
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
+        unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
         extern volatile int g_injected_client_fd;
@@ -1049,6 +1109,12 @@ void main_loop(void)
         extern volatile int g_wineserver_should_stop;
 
         ws_log("[wineserver-fd] iOS poll loop: master_fd=%d nb_users=%d active=%d", pollfd[0].fd, nb_users, active_users);
+        {
+            kern_return_t skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem,
+                                                  SYNC_POLICY_FIFO, 0 );
+            ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
+            if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
+        }
         while (active_users)
         {
             /* Check stop flag */
@@ -1058,8 +1124,14 @@ void main_loop(void)
                 break;
             }
 
-            /* Process expired timers */
-            timeout = get_next_timeout( NULL );
+            /* Process expired timers (also computes the next deadline) */
+            {
+                struct timespec next_ts;
+                timeout = get_next_timeout( &next_ts );
+                ios_next_timer_ns = (timeout >= 0)
+                    ? (unsigned long long)next_ts.tv_sec * 1000000000ull + next_ts.tv_nsec
+                    : ~0ull;
+            }
             if (!active_users) { ws_log("[wineserver-fd] LOOP EXIT: active_users=0 at iter=%d", ios_iter); break; }
 
             ios_iter++;
@@ -1067,6 +1139,29 @@ void main_loop(void)
             if (ios_iter % 50000 == 0)
             {
                 ws_log("[wineserver-fd] iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
+            }
+
+            /* [srv-queues] desktop-mode diagnostic: dump every thread's
+             * message-queue state every ~10s (SendMessage stall triage) */
+            {
+                static int qdump_on = -1;
+                static struct timespec qdump_last;
+                if (qdump_on < 0)
+                {
+                    const char *d = getenv("MYTHIC_DESKTOP");
+                    qdump_on = (d && *d == '1');
+                }
+                if (qdump_on)
+                {
+                    struct timespec now;
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec - qdump_last.tv_sec >= 10)
+                    {
+                        extern void ios_dump_msg_queues(void);
+                        qdump_last = now;
+                        ios_dump_msg_queues();
+                    }
+                }
             }
 
             /* Check for injected client fd (socketpair bypass) */
@@ -1090,18 +1185,82 @@ void main_loop(void)
                 }
             }
 
-            usleep( 1000 );  /* 1ms polling interval */
+            /* iOS-Mythic 2026-07-05: deadline-aware, REQUEST-INTERRUPTIBLE
+             * sleep (was a fixed usleep(1000)). Duration = min(1ms tick,
+             * next timer deadline) so timer wakes are exact (~50us); and
+             * the sleep is a semaphore_timedwait so a client signaling
+             * ios_srv_wake_sem after writing a request wakes the loop
+             * IMMEDIATELY — request pickup drops from avg ~0.5ms to ~50us.
+             * Thumper's 8 zero-timeout polls/frame each paid the old
+             * pickup latency: the 55-vs-60 FPS gap. */
+            {
+                unsigned long long sleep_ns = 1000000ull;
+                if (ios_next_timer_ns < sleep_ns) sleep_ns = ios_next_timer_ns;
+                if (sleep_ns > 0)
+                {
+                    if (ios_srv_wake_sem)
+                    {
+                        mach_timespec_t wts;
+                        wts.tv_sec = (unsigned int)(sleep_ns / 1000000000ull);
+                        wts.tv_nsec = (int)(sleep_ns % 1000000000ull);
+                        semaphore_timedwait( ios_srv_wake_sem, wts );
+                    }
+                    else
+                    {
+                        static mach_timebase_info_data_t ios_tb;
+                        unsigned long long deadline;
+                        if (!ios_tb.denom) mach_timebase_info( &ios_tb );
+                        deadline = mach_absolute_time()
+                                 + sleep_ns * ios_tb.denom / ios_tb.numer;
+                        mach_wait_until( deadline );
+                    }
+                }
+            }
             set_current_time();
+
+            /* Real sockets first: zero-timeout poll() gives true INET
+             * event semantics (connect completion, errors, data). See
+             * ios_fd_is_inet comment. Dispatch re-checks fd identity —
+             * fd_poll_event may remove/reuse later poll users. */
+            {
+                struct pollfd rp[64];
+                int rp_user[64];
+                int nrp = 0, k;
+
+                for (i = 1; i < nb_users && nrp < 64; i++)
+                {
+                    if (pollfd[i].fd < 0 || !pollfd[i].events) continue;
+                    if (!ios_fd_is_inet( i, pollfd[i].fd )) continue;
+                    rp[nrp].fd = pollfd[i].fd;
+                    rp[nrp].events = pollfd[i].events;
+                    rp[nrp].revents = 0;
+                    rp_user[nrp++] = i;
+                }
+                if (nrp && poll( rp, nrp, 0 ) > 0)
+                {
+                    for (k = 0; k < nrp; k++)
+                    {
+                        int u = rp_user[k];
+                        if (!rp[k].revents) continue;
+                        if (pollfd[u].fd != rp[k].fd) continue;  /* user removed mid-dispatch */
+                        ios_events_fired++;
+                        fd_poll_event( poll_users[u], rp[k].revents );
+                    }
+                }
+            }
 
             /* Check non-master fds for events.
              * Init fds (signal pipes, files): use ioctl(FIONREAD) — works for pipes/files.
              * Client fds (socketpair, request pipe): always try non-blocking read —
-             * ioctl(FIONREAD) is broken for AF_UNIX sockets on iOS. */
+             * ioctl(FIONREAD) is broken for AF_UNIX sockets on iOS.
+             * INET sockets: handled by the real poll() above — skip here. */
             for (i = 1; i < nb_users; i++)
             {
                 if (pollfd[i].fd >= 0 && pollfd[i].events)
                 {
                     short revents = 0;
+
+                    if (ios_fd_is_inet( i, pollfd[i].fd )) continue;
 
                     if (pollfd[i].events & POLLIN)
                     {

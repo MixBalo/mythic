@@ -469,8 +469,12 @@ int send_client_fd( struct process *process, int fd, obj_handle_t handle )
     struct cmsghdr *cmsg;
     int ret;
 
-    ws_log("[wineserver] send_client_fd: fd=%d handle=0x%x msg_fd_unix=%d",
-           fd, handle, get_unix_fd( process->msg_fd ));
+    /* task #24: include requester identity — the settings-freeze loop
+     * resends the same handle forever; tid names the retrying thread and
+     * process id disambiguates which pseudo-process's msg socket this is. */
+    ws_log("[wineserver] send_client_fd: fd=%d handle=0x%x msg_fd_unix=%d proc=%04x tid=%04x",
+           fd, handle, get_unix_fd( process->msg_fd ), process->id,
+           current ? current->id : 0);
 
     msghdr.msg_name    = NULL;
     msghdr.msg_namelen = 0;

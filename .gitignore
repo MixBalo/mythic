@@ -57,10 +57,9 @@ build/dxmt-tests/out/
 
 # Wineboot subprocesses — dormant while Phase 3+ uses a pre-seeded prefix
 # and skips wineboot. Rebuilt from the wine submodule if needed (requires
-# bison 3.x + llvm-dlltool).
-app/Mythic/aarch64-windows/services.exe
+# bison 3.x + llvm-dlltool). services.exe + rpcss.exe graduated to tracked
+# with the 2026-07-07 rpcss milestone (SCM + COM are live now).
 app/Mythic/aarch64-windows/plugplay.exe
-app/Mythic/aarch64-windows/rpcss.exe
 app/Mythic/aarch64-windows/svchost.exe
 app/Mythic/aarch64-windows/winedevice.exe
 
@@ -90,3 +89,11 @@ wine-ios-build/
 
 # StikDebug scripts (reference only)
 MeloNX.js
+build/gnutls-ios/src/
+build/gnutls-ios/obj/
+
+# Reference/scratch material — not build inputs
+research/
+*.bak
+photorec.se2
+.DS_Store

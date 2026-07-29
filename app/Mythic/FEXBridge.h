@@ -26,6 +26,13 @@ typedef void (*fex_log_callback_t)(const char *message);
 // Set a log callback for FEX operations
 void fex_set_log_callback(fex_log_callback_t callback);
 
+// Returns the runtime RX->RW distance of the dual-mapped JIT pool
+// (g_jit_rw_base - g_jit_rx_base), or 0 if the pool is not yet initialized.
+// Published to xtajit64.dll via the MYTHIC_JIT_WRITE_OFFSET env var so its
+// own FEXCore copy uses the true offset (the RW alias is placed with
+// VM_FLAGS_ANYWHERE and is NOT guaranteed to sit at RX+0x10000000).
+int64_t fex_get_jit_write_offset(void);
+
 #ifdef __cplusplus
 }
 #endif

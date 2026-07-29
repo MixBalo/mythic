@@ -55,9 +55,11 @@ void mythic_display_set_layer(CAMetalLayer *layer) {
 
 // --- macdrv_* implementations ---
 
-// We return the same sentinel win_data for every HWND. DXMT treats all of
-// the pointers as opaque and only dereferences client_cocoa_view via our
-// macdrv_view_* functions, so we never need real Wine win_data.
+// DXMT only dereferences client_cocoa_view (passing it straight back to
+// macdrv_view_create_metal_view), so we use that field to carry the HWND
+// through: desktop mode needs it to pick the right window's layer. One
+// static struct suffices — DXMT's get/create/release sequence is not
+// concurrent per-process, and the value is consumed before release.
 static struct macdrv_win_data g_fake_win_data = {
     .hwnd              = NULL,
     .cocoa_window      = NULL,
@@ -66,13 +68,27 @@ static struct macdrv_win_data g_fake_win_data = {
 };
 
 static struct macdrv_win_data *my_get_win_data(HWND hwnd) {
-    (void)hwnd;
+    g_fake_win_data.hwnd = hwnd;
+    g_fake_win_data.client_cocoa_view = (macdrv_view)hwnd;
     return &g_fake_win_data;
 }
 
 static void my_release_win_data(struct macdrv_win_data *data) {
     (void)data;
 }
+
+static int mythic_desktop_mode(void) {
+    static int desk = -1;
+    if (desk < 0) {
+        const char *d = getenv("MYTHIC_DESKTOP");
+        desk = d && *d == '1';
+    }
+    return desk;
+}
+
+// Winios.m compositor: per-window CAMetalLayer inside the window's
+// compositor layer (desktop mode only).
+extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
 
 static macdrv_metal_device my_create_metal_device(void) {
     // DXMT also has a separate code path that creates its own MTLDevice;
@@ -86,9 +102,21 @@ static void my_release_metal_device(macdrv_metal_device d) {
 }
 
 // The critical two: return a "view" handle that maps to the CAMetalLayer.
-// We pack the layer pointer directly.
+// We pack the layer pointer directly. `v` carries the swapchain's HWND
+// (see my_get_win_data). Desktop mode: per-window layer in the desktop
+// compositor. Game mode: the fullscreen singleton, exactly as before.
 static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
-    (void)v; (void)d;
+    (void)d;
+    if (mythic_desktop_mode()) {
+        CAMetalLayer *layer = winios_metal_layer_for_hwnd((void *)v);
+        if (!layer) {
+            NSLog(@"[mythic-display] desktop metal layer creation failed for hwnd=%p", (void *)v);
+            return NULL;
+        }
+        fprintf(stderr, "[mythic-display] desktop metal view for hwnd=%p layer=%p\n", (void *)v, layer);
+        fflush(stderr);
+        return (macdrv_metal_view)CFBridgingRetain(layer);
+    }
     pthread_mutex_lock(&g_lock);
     CAMetalLayer *layer = g_layer;
     pthread_mutex_unlock(&g_lock);

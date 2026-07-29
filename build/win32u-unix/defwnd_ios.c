@@ -719,6 +719,8 @@ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
 
     TRACE( "hwnd %p command %04x, hittest %d, pos %d,%d\n",
            hwnd, syscommand, hittest, pt.x, pt.y );
+    fprintf( stderr, "[winios-move] enter hwnd=%p cmd=%04x hittest=%u pt=(%d,%d)\n",
+             hwnd, syscommand, hittest, (int)pt.x, (int)pt.y );
 
     if (syscommand == SC_MOVE)
     {
@@ -799,12 +801,19 @@ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
 
     send_message( hwnd, WM_ENTERSIZEMOVE, 0, 0 );
     set_capture_window( hwnd, GUI_INMOVESIZE, NULL );
+    fprintf( stderr, "[winios-move] loop start (captured)\n" );
 
     for (;;)
     {
         int dx = 0, dy = 0;
 
         if (!NtUserGetMessage( &msg, 0, 0, 0 )) break;
+        {
+            static unsigned mvcnt;
+            if (mvcnt++ < 12)
+                fprintf( stderr, "[winios-move] msg=0x%x pt=(%d,%d)\n",
+                         (unsigned)msg.message, (int)msg.pt.x, (int)msg.pt.y );
+        }
         if (NtUserCallMsgFilter( &msg, MSGF_SIZE )) continue;
 
         /* Exit on button-up, Return, or Esc */
@@ -913,6 +922,8 @@ static void sys_command_size_move( HWND hwnd, WPARAM wparam )
     if (moved && !drag_full_windows)
         draw_moving_frame( parent, hdc, &sizing_rect, thickframe );
 
+    fprintf( stderr, "[winios-move] exit moved=%d last_msg=0x%x\n",
+             moved, (unsigned)msg.message );
     set_capture_window( 0, GUI_INMOVESIZE, NULL );
     NtUserReleaseDC( parent, hdc );
     if (parent) map_window_points( 0, parent, (POINT *)&sizing_rect, 2, get_thread_dpi() );
